@@ -18,6 +18,15 @@ from tqdm import tqdm
 
 SUPPORTED_EXTENSIONS = {".fif", ".edf", ".bdf", ".vhdr"}
 
+# Standard sleep stage string normalization map
+STAGE_NORM_MAP = {
+    "sleep stage w": "W", "stage w": "W", "wake": "W", "0": "W",
+    "sleep stage n1": "N1", "stage 1": "N1", "n1": "N1", "1": "N1",
+    "sleep stage n2": "N2", "stage 2": "N2", "n2": "N2", "2": "N2",
+    "sleep stage n3": "N3", "stage 3": "N3", "stage 4": "N3", "n3": "N3", "3": "N3", "4": "N3",
+    "sleep stage r": "REM", "stage rem": "REM", "rem": "REM", "5": "REM"
+}
+
 
 def load_raw_eeg(file_path: Path) -> mne.io.BaseRaw:
     """Loads raw EEG recording using MNE."""
@@ -34,14 +43,43 @@ def load_raw_eeg(file_path: Path) -> mne.io.BaseRaw:
         raise ValueError(f"Unsupported file format: {ext}")
 
 
+def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: float = 30.0) -> List[str]:
+    """
+    Parses MNE raw annotations and maps each window to its corresponding sleep stage.
+    """
+    if len(raw.annotations) == 0:
+        return ["UNKNOWN"] * num_windows
+
+    stages = []
+    annotations = raw.annotations
+
+    for idx in range(num_windows):
+        t_mid = (idx * window_sec) + (window_sec / 2.0)
+        stage_label = "UNKNOWN"
+
+        # Find annotation overlapping the midpoint of this window
+        for ann in annotations:
+            ann_start = ann["onset"]
+            ann_end = ann_start + ann["duration"]
+            if ann_start <= t_mid < ann_end:
+                raw_desc = str(ann["description"]).strip().lower()
+                stage_label = STAGE_NORM_MAP.get(raw_desc, ann["description"])
+                break
+
+        stages.append(stage_label)
+
+    return stages
+
+
 def slice_strategy_a_macro(
     raw: mne.io.BaseRaw, window_sec: float = 30.0
-) -> Tuple[np.ndarray, List[Dict]]:
+) -> Tuple[np.ndarray, List[Dict], List[str]]:
     """
-    Strategy A: Standard 30-second contiguous epoch slicing.
+    Strategy A: Standard 30-second contiguous epoch slicing with stage extraction.
     Returns:
-        tensor: [Num_Windows, Channels, Window_Samples] (e.g. [N, 64, 6000])
+        tensor: [Num_Windows, Channels, Window_Samples]
         metadata: List of window timestamps and indices.
+        stages: List of sleep stage labels matching window count.
     """
     sfreq = raw.info["sfreq"]
     data = raw.get_data()  # Shape: [Channels, Time_Samples]
@@ -70,10 +108,14 @@ def slice_strategy_a_macro(
         })
 
     if len(slices) == 0:
-        return np.empty((0, len(ch_names), samples_per_window)), []
+        return np.empty((0, len(ch_names), samples_per_window)), [], []
 
     tensor = np.stack(slices, axis=0)  # Shape: [N, C, T]
-    return tensor, metadata
+    
+    # Extract stages matching epoch boundaries
+    stages = extract_epoch_stages(raw, num_windows=num_windows, window_sec=window_sec)
+
+    return tensor, metadata, stages
 
 
 def slice_strategy_b_micro(
@@ -81,13 +123,9 @@ def slice_strategy_b_micro(
     crop_duration_sec: float = 3.0, 
     freq_band: Tuple[float, float] = (11.0, 16.0),
     threshold_std: float = 1.5
-) -> Tuple[np.ndarray, List[Dict]]:
+) -> Tuple[np.ndarray, List[Dict], List[str]]:
     """
-    Strategy B: Event-centered 2-4 second candidate spindle crops.
-    Uses YASA if installed; falls back to 11-16 Hz bandpass envelope thresholding.
-    Returns:
-        tensor: [Num_Events, Channels, Crop_Samples]
-        metadata: List of event timestamps and channels.
+    Strategy B: Event-centered candidate spindle crops.
     """
     sfreq = raw.info["sfreq"]
     crop_samples = int(round(crop_duration_sec * sfreq))
@@ -98,7 +136,6 @@ def slice_strategy_b_micro(
     metadata = []
 
     if HAS_YASA:
-        # Use YASA algorithm for spindle detection across central/parietal channels
         try:
             sp = yasa.spindles_detect(raw, verbose=False)
             if sp is not None:
@@ -110,7 +147,6 @@ def slice_strategy_b_micro(
                     start_s = peak_sample - half_crop
                     end_s = peak_sample + half_crop
                     
-                    # Ensure boundaries are within array length
                     if start_s >= 0 and end_s <= raw.n_samples:
                         crop_data = raw.get_data(start=start_s, stop=end_s)
                         if crop_data.shape[1] == crop_samples:
@@ -123,25 +159,20 @@ def slice_strategy_b_micro(
                                 "type": "event_crop_yasa"
                             })
         except Exception:
-            pass  # Fallback to thresholding if YASA detection yields empty or fails
+            pass
 
-    # Fallback to Envelope Bandpass Peak Detection if YASA not used or no spindles found
     if len(slices) == 0:
-        # Filter raw in spindle band (11-16 Hz)
         raw_filtered = raw.copy().filter(l_freq=freq_band[0], h_freq=freq_band[1], verbose=False)
         data_filt = raw_filtered.get_data()
         
-        # Calculate envelope Hilbert amplitude across channels
         analytic_signal = mne.filter.filter_data(data_filt, sfreq, freq_band[0], freq_band[1], verbose=False)
         envelope = np.abs(analytic_signal)
         mean_env = np.mean(envelope)
         std_env = np.std(envelope)
         threshold = mean_env + (threshold_std * std_env)
 
-        # Detect candidate peak samples above threshold
         peak_indices = np.where(np.max(envelope, axis=0) > threshold)[0]
         
-        # Non-maximum suppression / refractory period (min 1.5 seconds between candidates)
         refractory_samples = int(1.5 * sfreq)
         selected_peaks = []
         last_p = -refractory_samples
@@ -166,10 +197,12 @@ def slice_strategy_b_micro(
                 })
 
     if len(slices) == 0:
-        return np.empty((0, len(ch_names), crop_samples)), []
+        return np.empty((0, len(ch_names), crop_samples)), [], []
 
     tensor = np.stack(slices, axis=0)
-    return tensor, metadata
+    stages = extract_epoch_stages(raw, num_windows=len(slices), window_sec=crop_duration_sec)
+
+    return tensor, metadata, stages
 
 
 def process_subject_slicing_worker(
@@ -195,13 +228,13 @@ def process_subject_slicing_worker(
         raw = load_raw_eeg(src_file)
 
         if strategy.lower() == "macro":
-            tensor, meta = slice_strategy_a_macro(raw, window_sec=window_sec)
+            tensor, meta, stages = slice_strategy_a_macro(raw, window_sec=window_sec)
         elif strategy.lower() == "micro":
-            tensor, meta = slice_strategy_b_micro(raw, crop_duration_sec=window_sec)
+            tensor, meta, stages = slice_strategy_b_micro(raw, crop_duration_sec=window_sec)
         else:
             raise ValueError(f"Unknown slicing strategy: {strategy}")
 
-        # Save binary matrix and JSON metadata
+        # Save binary matrix and JSON metadata WITH top-level stages key
         np.save(output_npy, tensor)
         with open(output_meta, "w") as f:
             json.dump({
@@ -211,6 +244,7 @@ def process_subject_slicing_worker(
                 "channel_names": raw.ch_names,
                 "sampling_freq": raw.info["sfreq"],
                 "num_slices": len(meta),
+                "stages": stages,  # Top-level array consumed by 09_clinical_inference.py
                 "slices": meta
             }, f, indent=2)
 
@@ -274,7 +308,6 @@ def run_slicing_pipeline(
 
 
 def valid_regex(pattern_string):
-    # This only runs if the user actually provides the argument
     try:
         return re.compile(pattern_string)
     except re.error:
@@ -283,11 +316,11 @@ def valid_regex(pattern_string):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="EEG Window Slicing Script")
-    parser.add_argument("--src_dir", type=str, required=True, help="Input directory containing 200Hz resampled files")
+    parser.add_argument("--src_dir", type=str, required=True, help="Input directory containing resampled files")
     parser.add_argument("--dst_dir", type=str, required=True, help="Output destination directory")
     parser.add_argument("--pattern", type=valid_regex, default=None, help="Optional regex pattern to match subject id")
-    parser.add_argument("--strategy", type=str, choices=["macro", "micro"], default="macro", help="Slicing strategy: 'macro' (30s) or 'micro' (2-4s event crops)")
-    parser.add_argument("--window_sec", type=float, default=30.0, help="Window duration in seconds (30.0 for macro, 3.0 for micro)")
+    parser.add_argument("--strategy", type=str, choices=["macro", "micro"], default="macro", help="Slicing strategy: 'macro' (30s) or 'micro'")
+    parser.add_argument("--window_sec", type=float, default=30.0, help="Window duration in seconds")
     parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="CPU worker count")
     parser.add_argument("--force", action="store_true", help="Force reprocessing")
 
