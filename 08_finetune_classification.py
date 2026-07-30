@@ -35,12 +35,17 @@ class RealSleepEEGDataset(Dataset):
     def _index_dataset(self):
         print(f"Indexing samples from manifest: {self.manifest_csv.name}...")
         for _, row in self.df.iterrows():
+            subject_id = row["subject_id"]
             npy_path = Path(row["npy_path"])
             num_slices = int(row["num_slices"])
             label = int(row["label"])
             
             if not npy_path.exists():
-                print(f"  [Warning] Missing tensor file: {npy_path}, skipping...")
+                print(f"  [Warning] Subject {subject_id} missing tensor file: {npy_path}, skipping...")
+                continue
+
+            if label == -1:
+                print(f"  [Warning] Subject {subject_id} missing label, skipping...")
                 continue
                 
             for idx in range(num_slices):
