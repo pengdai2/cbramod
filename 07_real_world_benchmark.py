@@ -1,3 +1,4 @@
+from typing import Tuple
 import argparse
 import time
 import numpy as np
