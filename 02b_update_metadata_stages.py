@@ -89,7 +89,7 @@ def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str
         target_ch = select_best_eeg_channel(eeg_chs)
 
         sls = yasa.SleepStaging(raw, eeg_name=target_ch)
-        stages = list(sls.predict())
+        stages = list(sls.predict().hypno)
 
         # Align predicted length with target window count
         if len(stages) < num_windows:
