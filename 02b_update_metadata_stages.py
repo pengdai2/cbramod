@@ -61,19 +61,32 @@ def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: floa
     return stages
 
 
+def select_best_eeg_channel(eeg_chs: List[str]) -> str:
+    """
+    Selects the optimal central EEG channel using exact word-boundary matching.
+    Avoids false positive substring matches like FC4 or CP4.
+    """
+    # Priority list of central channels
+    preferences = ["C4", "C3", "CZ"]
+
+    for pref in preferences:
+        # \b ensures exact word boundary match (e.g. matches "C4", "C4-M1", "C4_A1", but NOT "FC4")
+        pattern = re.compile(rf"\b{pref}\b", re.IGNORECASE)
+        for ch in eeg_chs:
+            if pattern.search(ch):
+                return ch
+
+    # Fallback: Return first available channel if no central channels match
+    return eeg_chs[0]
+
+
 def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str]:
     """Uses YASA to predict sleep stages for unannotated recordings."""
     try:
         eeg_chs = raw.copy().pick_types(eeg=True).ch_names
         if not eeg_chs:
             eeg_chs = raw.ch_names
-        
-        target_ch = eeg_chs[0]
-        for pref in ["C4", "C3", "CZ", "C4-M1", "C3-M2"]:
-            matched = [ch for ch in eeg_chs if pref in ch.upper()]
-            if matched:
-                target_ch = matched[0]
-                break
+        target_ch = select_best_eeg_channel(eeg_chs)
 
         sls = yasa.SleepStaging(raw, eeg_name=target_ch)
         stages = list(sls.predict())
