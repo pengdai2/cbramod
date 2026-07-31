@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
 import mne
+import yasa
 import numpy as np
 
 try:
@@ -71,6 +72,47 @@ def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: floa
     return stages
 
 
+def select_best_eeg_channel(eeg_chs: List[str]) -> str:
+    """
+    Selects the optimal central EEG channel using exact word-boundary matching.
+    Avoids false positive substring matches like FC4 or CP4.
+    """
+    # Priority list of central channels
+    preferences = ["C4", "C3", "CZ"]
+
+    for pref in preferences:
+        # \b ensures exact word boundary match (e.g. matches "C4", "C4-M1", "C4_A1", but NOT "FC4")
+        pattern = re.compile(rf"\b{pref}\b", re.IGNORECASE)
+        for ch in eeg_chs:
+            if pattern.search(ch):
+                return ch
+
+    # Fallback: Return first available channel if no central channels match
+    return eeg_chs[0]
+
+
+def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str]:
+    """Uses YASA to predict sleep stages for unannotated recordings."""
+    try:
+        eeg_chs = raw.copy().pick_types(eeg=True).ch_names
+        if not eeg_chs:
+            eeg_chs = raw.ch_names
+        target_ch = select_best_eeg_channel(eeg_chs)
+
+        sls = yasa.SleepStaging(raw, eeg_name=target_ch)
+        stages = list(sls.predict().hypno)
+
+        # Align predicted length with target window count
+        if len(stages) < num_windows:
+            stages.extend(["UNKNOWN"] * (num_windows - len(stages)))
+        elif len(stages) > num_windows:
+            stages = stages[:num_windows]
+
+        return stages
+    except Exception as e:
+        return ["UNKNOWN"] * num_windows
+
+
 def slice_strategy_a_macro(
     raw: mne.io.BaseRaw, window_sec: float = 30.0
 ) -> Tuple[np.ndarray, List[Dict], List[str]]:
@@ -112,8 +154,13 @@ def slice_strategy_a_macro(
 
     tensor = np.stack(slices, axis=0)  # Shape: [N, C, T]
     
-    # Extract stages matching epoch boundaries
-    stages = extract_epoch_stages(raw, num_windows=num_windows, window_sec=window_sec)
+    # Check if raw has native annotations; if not, use YASA predictor
+    if len(raw.annotations) > 0:
+        # Native annotation extraction
+        stages = extract_epoch_stages(raw, num_windows=num_windows, window_sec=window_sec)
+    else:
+        # Automated prediction via YASA
+        stages = predict_epoch_stages_yasa(raw, num_windows=num_windows)
 
     return tensor, metadata, stages
 
@@ -200,7 +247,14 @@ def slice_strategy_b_micro(
         return np.empty((0, len(ch_names), crop_samples)), [], []
 
     tensor = np.stack(slices, axis=0)
-    stages = extract_epoch_stages(raw, num_windows=len(slices), window_sec=crop_duration_sec)
+
+    # Check if raw has native annotations; if not, use YASA predictor
+    if len(raw.annotations) > 0:
+        # Native annotation extraction
+        stages = extract_epoch_stages(raw, num_windows=num_windows, window_sec=window_sec)
+    else:
+        # Automated prediction via YASA
+        stages = predict_epoch_stages_yasa(raw, num_windows=num_windows)
 
     return tensor, metadata, stages
 
