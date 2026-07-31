@@ -6,6 +6,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
 import mne
+import yasa
 from tqdm import tqdm
 
 SUPPORTED_EXTENSIONS = {".fif", ".edf", ".bdf", ".vhdr"}
@@ -60,6 +61,34 @@ def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: floa
     return stages
 
 
+def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str]:
+    """Uses YASA to predict sleep stages for unannotated recordings."""
+    try:
+        eeg_chs = raw.copy().pick_types(eeg=True).ch_names
+        if not eeg_chs:
+            eeg_chs = raw.ch_names
+        
+        target_ch = eeg_chs[0]
+        for pref in ["C4", "C3", "CZ", "C4-M1", "C3-M2"]:
+            matched = [ch for ch in eeg_chs if pref in ch.upper()]
+            if matched:
+                target_ch = matched[0]
+                break
+
+        sls = yasa.SleepStaging(raw, eeg_name=target_ch)
+        stages = list(sls.predict())
+
+        # Align predicted length with target window count
+        if len(stages) < num_windows:
+            stages.extend(["UNKNOWN"] * (num_windows - len(stages)))
+        elif len(stages) > num_windows:
+            stages = stages[:num_windows]
+
+        return stages
+    except Exception as e:
+        return ["UNKNOWN"] * num_windows
+
+
 def process_metadata_update_worker(
     args_tuple: Tuple[Path, Path, re.Pattern, float, bool]
 ) -> Dict[str, Union[str, int]]:
@@ -103,7 +132,14 @@ def process_metadata_update_worker(
 
         # Load raw file and extract annotations
         raw = load_raw_eeg(src_file)
-        stages = extract_epoch_stages(raw, num_windows=num_slices, window_sec=window_sec)
+
+        # Check if raw has native annotations; if not, use YASA predictor
+        if len(raw.annotations) > 0:
+            # Native annotation extraction
+            stages = extract_epoch_stages(raw, num_windows=num_slices, window_sec=window_sec)
+        else:
+            # Automated prediction via YASA
+            stages = predict_epoch_stages_yasa(raw, num_windows=num_slices)
 
         # Inject stages key into top level of JSON
         meta_data["stages"] = stages
