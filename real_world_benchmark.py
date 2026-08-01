@@ -1,7 +1,8 @@
 from typing import Tuple
-import mne
+import numpy as np
 import torch
 import torch.nn as nn
+import mne
 from mne.datasets.sleep_physionet import age
 
 # Import CBraMod architecture from braindecode if available
