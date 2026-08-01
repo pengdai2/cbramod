@@ -18,7 +18,7 @@ from sklearn.metrics import (
 from tqdm import tqdm
 
 # Import architecture from benchmark module
-from 07b_real_world_benchmark import CBraModRealWorldBenchmark
+from 07_real_world_benchmark import CBraModRealWorldBenchmark
 
 
 def top_k_percentile_pooling(
