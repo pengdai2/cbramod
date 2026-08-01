@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import torch
@@ -108,6 +108,7 @@ def run_subject_inference(
 def evaluate_clinical_cohort(
     checkpoint_path: Path,
     test_manifest_path: Path,
+    data_dir: Optional[Path] = None,
     num_channels: int = 64,
     num_classes: int = 2,
     filter_stage: str = "N2",
@@ -120,6 +121,8 @@ def evaluate_clinical_cohort(
     """
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
     print(f"=== Running Clinical Inference Pipeline ({num_classes}-Class) on [{device}] ===")
+    if data_dir:
+        print(f"Data Root Directory: {data_dir}")
 
     # 1. Load Test Manifest
     if not test_manifest_path.exists():
@@ -141,10 +144,26 @@ def evaluate_clinical_cohort(
     
     # 3. Patient-Level Inference Loop
     for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Processing Subjects"):
-        subject_id = row.get("subject_id", Path(row["npy_path"]).stem)
-        npy_path = Path(row["npy_path"])
-        meta_path = Path(row.get("meta_path", npy_path.with_suffix(".json")))
+        raw_npy_path = Path(row["npy_path"])
         ground_truth_label = int(row["label"])
+
+        # Resolve relative npy_path against data_dir if provided
+        if data_dir and not raw_npy_path.is_absolute():
+            npy_path = data_dir / raw_npy_path
+        else:
+            npy_path = raw_npy_path
+
+        subject_id = row.get("subject_id", raw_npy_path.stem)
+
+        # Resolve relative meta_path against data_dir if provided
+        if "meta_path" in row and pd.notna(row["meta_path"]):
+            raw_meta_path = Path(row["meta_path"])
+            if data_dir and not raw_meta_path.is_absolute():
+                meta_path = data_dir / raw_meta_path
+            else:
+                meta_path = raw_meta_path
+        else:
+            meta_path = npy_path.with_suffix(".json")
 
         if not npy_path.exists():
             print(f"[Warning] Subject {subject_id} missing tensor file: {npy_path}, skipping...")
@@ -261,6 +280,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Patient-Level Clinical Inference & Top-10% Pooling")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to best fine-tuned model state dict (.pt)")
     parser.add_argument("--test_manifest", type=str, required=True, help="Path to test_manifest.csv")
+    parser.add_argument("--data_dir", type=str, default=None, help="Top-level root directory where relative tensor/meta files reside")
     parser.add_argument("--num_channels", type=int, default=64, help="EEG Channels count")
     parser.add_argument("--num_classes", type=int, default=2, help="Number of target classes")
     parser.add_argument("--filter_stage", type=str, default=None, help="Optional sleep stage filter (e.g. N2)")
@@ -268,9 +288,12 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    data_dir = Path(args.data_dir) if args.data_dir else None
+
     evaluate_clinical_cohort(
         checkpoint_path=Path(args.checkpoint),
         test_manifest_path=Path(args.test_manifest),
+        data_dir=data_dir,
         num_channels=args.num_channels,
         num_classes=args.num_classes,
         filter_stage=args.filter_stage,
