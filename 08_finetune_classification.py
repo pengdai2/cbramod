@@ -161,10 +161,12 @@ def run_fine_tuning_pipeline(
     val_ds = RealSleepEEGDataset(val_manifest, data_dir=data_dir)
 
     train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=True, persistent_workers=True, prefetch_factor=2
     )
     val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=True, persistent_workers=True, prefetch_factor=2
     )
 
     # 2. Instantiate CBraMod Architecture
