@@ -149,10 +149,12 @@ def run_fine_tuning_pipeline(
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     best_model_path = checkpoint_dir / "cbramod_best_finetuned.pt"
+    latest_model_path = checkpoint_dir / "cbramod_latest.pt"
 
     print(f"\n=== Initializing CBraMod Real-Data Fine-Tuning on [{device}] ===")
+    print(f"Checkpoint Directory: {checkpoint_dir}")
     if data_dir:
-        print(f"Data Root Directory: {data_dir}")
+        print(f"Data Root Directory:  {data_dir}")
 
     # 1. Instantiate Datasets & DataLoaders from Manifests
     train_ds = RealSleepEEGDataset(train_manifest, data_dir=data_dir)
@@ -169,7 +171,6 @@ def run_fine_tuning_pipeline(
     model = CBraModRealWorldBenchmark(num_channels=num_channels, num_classes=num_classes).to(device)
 
     # 3. Configure Differential Learning Rates
-    # Lower LR for pre-trained backbone; higher LR for classification head
     backbone_params = []
     head_params = []
 
@@ -187,13 +188,34 @@ def run_fine_tuning_pipeline(
     criterion = nn.CrossEntropyLoss()
     early_stopper = EarlyStopping(patience=5)
 
+    start_epoch = 1
     best_val_f1 = 0.0
 
-    print(f"Backbone LR: {lr_backbone} | Head LR: {lr_head} | Epochs: {epochs} | Batch Size: {batch_size}")
+    # --- AUTO-RESUME CHECKPOINT LOGIC ---
+    if latest_model_path.exists():
+        print(f"\n[AUTO-RESUME] Found existing checkpoint: {latest_model_path}")
+        checkpoint = torch.load(latest_model_path, map_location=device)
+        
+        model.load_state_dict(checkpoint["model_state_dict"])
+        if "optimizer_state_dict" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        
+        start_epoch = checkpoint.get("epoch", 0) + 1
+        best_val_f1 = checkpoint.get("best_val_f1", checkpoint.get("val_f1", 0.0))
+        
+        # Restore early stopping state if available
+        if "early_stop_counter" in checkpoint:
+            early_stopper.counter = checkpoint["early_stop_counter"]
+        if "early_stop_best_score" in checkpoint:
+            early_stopper.best_score = checkpoint["early_stop_best_score"]
+
+        print(f"[AUTO-RESUME] Resuming training at Epoch {start_epoch} (Best Val F1 so far: {best_val_f1:.4f})")
+
+    print(f"Backbone LR: {lr_backbone} | Head LR: {lr_head} | Target Epochs: {epochs} | Batch Size: {batch_size}")
     print("=" * 70)
 
     # 4. Training & Validation Loop
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         start_time = time.time()
         
         # --- TRAINING PHASE ---
@@ -252,6 +274,7 @@ def run_fine_tuning_pipeline(
         )
 
         # --- CHECKPOINT SAVING ---
+        # 1. Update overall best model checkpoint
         if epoch_val_f1 > best_val_f1:
             best_val_f1 = epoch_val_f1
             torch.save({
@@ -261,7 +284,19 @@ def run_fine_tuning_pipeline(
                 "val_f1": best_val_f1,
                 "val_acc": epoch_val_acc
             }, best_model_path)
-            print(f"  --> [SAVED CHECKPOINT] New best Val F1: {best_val_f1:.4f} saved to {best_model_path}")
+            print(f"  --> [SAVED BEST MODEL] New best Val F1: {best_val_f1:.4f} saved to {best_model_path}")
+
+        # 2. Always save latest state for auto-resumption
+        torch.save({
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "best_val_f1": best_val_f1,
+            "val_f1": epoch_val_f1,
+            "val_acc": epoch_val_acc,
+            "early_stop_counter": early_stopper.counter,
+            "early_stop_best_score": early_stopper.best_score
+        }, latest_model_path)
 
         # --- EARLY STOPPING CHECK ---
         if early_stopper(epoch_val_f1):
@@ -277,7 +312,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CBraMod Fine-Tuning Pipeline with Real Preprocessed Data")
     parser.add_argument("--manifest_dir", type=str, required=True, help="Path to directory containing train_manifest.csv and val_manifest.csv")
     parser.add_argument("--data_dir", type=str, default=None, help="Top-level root directory where relative tensor/meta files reside")
-    parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
+    parser.add_argument("--checkpoint_dir", type=str, default="./checkpoints", help="Directory where checkpoints are saved and resumed from")
+    parser.add_argument("--epochs", type=int, default=20, help="Number of target training epochs")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--num_channels", type=int, default=64, help="EEG Channel count")
     parser.add_argument("--num_classes", type=int, default=2, help="Number of target classes (2 for binary, 5 for sleep staging)")
@@ -289,6 +325,7 @@ if __name__ == "__main__":
 
     manifest_dir = Path(args.manifest_dir)
     data_dir = Path(args.data_dir) if args.data_dir else None
+    checkpoint_dir = Path(args.checkpoint_dir)
     train_csv = manifest_dir / "train_manifest.csv"
     val_csv = manifest_dir / "val_manifest.csv"
 
@@ -296,6 +333,7 @@ if __name__ == "__main__":
         train_manifest=train_csv,
         val_manifest=val_csv,
         data_dir=data_dir,
+        checkpoint_dir=checkpoint_dir,
         num_channels=args.num_channels,
         num_classes=args.num_classes,
         batch_size=args.batch_size,
