@@ -44,7 +44,7 @@ class RealSleepEEGDataset(Dataset):
         for _, row in self.df.iterrows():
             subject_id = row["subject_id"]
             raw_path = Path(row["npy_path"])
-            num_slices = int(row["num_slices"])
+            num_slices_manifest = int(row["num_slices"])
             label = int(row["label"])
             
             # Resolve relative path against data_dir if provided
@@ -60,10 +60,31 @@ class RealSleepEEGDataset(Dataset):
             if label == -1:
                 print(f"  [Warning] Subject {subject_id} missing label, skipping...")
                 continue
+
+            # Safely verify actual slice count on disk without loading full tensor into RAM
+            try:
+                if self.memory_map:
+                    mmap_data = np.load(npy_path, mmap_mode="r")
+                    actual_slices = mmap_data.shape[0]
+                else:
+                    data = np.load(npy_path)
+                    actual_slices = data.shape[0]
+            except Exception as e:
+                print(f"  [Warning] Subject {subject_id} failed to read array shape from {npy_path}: {e}, skipping...")
+                continue
+
+            # Warn and clamp to actual size if there is a mismatch
+            if actual_slices != num_slices_manifest:
+                print(
+                    f"  [Warning] Subject {subject_id} slice count mismatch! "
+                    f"Manifest lists {num_slices_manifest}, but tensor file {npy_path} has {actual_slices}. Clamping."
+                )
+
+            valid_slices = min(num_slices_manifest, actual_slices)
                 
-            for idx in range(num_slices):
+            for idx in range(valid_slices):
                 self.samples.append((npy_path, idx, label))
-                
+
         print(f"  -> Total index entries loaded: {len(self.samples)} windows across {len(self.df)} subjects.")
 
     def __len__(self) -> int:
