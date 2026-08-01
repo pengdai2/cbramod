@@ -12,7 +12,7 @@ from sklearn.metrics import classification_report, f1_score, accuracy_score
 from tqdm import tqdm
 
 # Import model architecture setup from benchmark module
-from 07_real_world_benchmark import CBraModRealWorldBenchmark
+from real_world_benchmark import CBraModRealWorldBenchmark
 
 
 class RealSleepEEGDataset(Dataset):

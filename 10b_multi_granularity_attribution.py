@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAS_CAPTUM = False
 
-from 07_real_world_benchmark import CBraModRealWorldBenchmark
+from real_world_benchmark import CBraModRealWorldBenchmark
 
 
 def compute_multi_granularity_attributions(

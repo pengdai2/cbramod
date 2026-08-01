@@ -16,7 +16,7 @@ except ImportError:
     HAS_CAPTUM = False
 
 # Import model architecture setup from our benchmark module
-from 07_real_world_benchmark import CBraModRealWorldBenchmark
+from real_world_benchmark import CBraModRealWorldBenchmark
 
 
 def compute_integrated_gradients(
