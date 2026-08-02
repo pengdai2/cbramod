@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from sklearn.metrics import classification_report, f1_score, accuracy_score
 from tqdm import tqdm
 
@@ -130,6 +130,54 @@ class EarlyStopping:
         return self.early_stop
 
 
+def get_balanced_train_loader(
+    train_ds: RealSleepEEGDataset,
+    batch_size: int = 16,
+    num_workers: int = 4
+) -> DataLoader:
+    """
+    Class imbalance in the training set leads to "majority class collapse".
+    E.g., the prediction from the resulting model exhibit a natural tendency
+    to skew towards the class with the most samples. To avoid it, use a
+    weighted random sampler to compensate for the imbalance. 
+    """
+    # 1. Extract target labels from training samples
+    train_labels = np.array([sample[2] for sample in train_ds.samples])
+
+    # 2. Count occurrences of each class index (0 to K-1)
+    # class_counts[c] = number of samples belonging to class c
+    class_counts = np.bincount(train_labels)
+
+    print("\n--- Multi-Class Epoch Distribution ---")
+    for class_id, count in enumerate(class_counts):
+        pct = (count / len(train_labels)) * 100.0
+        print(f"  Class {class_id}: {count:,} samples ({pct:.2f}%)")
+
+    # 3. Calculate inverse frequency weights per class
+    # Use np.maximum to prevent division by zero if a class has 0 samples
+    class_weights = 1.0 / np.maximum(class_counts, 1)
+
+    # 4. Map per-class weight to every individual sample in the dataset
+    sample_weights = class_weights[train_labels]
+    sample_weights_tensor = torch.from_numpy(sample_weights).double()
+
+    # 5. Instantiate WeightedRandomSampler
+    # Draws batches where every class has an equal ~1/K selection probability
+    sampler = WeightedRandomSampler(
+        weights=sample_weights_tensor,
+        num_samples=len(sample_weights_tensor),
+        replacement=True
+    )
+
+    # 6. DataLoader configuration (Must pass sampler and set shuffle=False)
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers,
+        pin_memory=True, persistent_workers=True, prefetch_factor=2
+    )
+
+    return train_loader
+
+
 def run_fine_tuning_pipeline(
     train_manifest: Path,
     val_manifest: Path,
@@ -160,10 +208,7 @@ def run_fine_tuning_pipeline(
     train_ds = RealSleepEEGDataset(train_manifest, data_dir=data_dir)
     val_ds = RealSleepEEGDataset(val_manifest, data_dir=data_dir)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
-        pin_memory=True, persistent_workers=True, prefetch_factor=2
-    )
+    train_loader = get_balanced_train_loader(train_ds, batch_size=batch_size, num_workers=num_workers)
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
         pin_memory=True, persistent_workers=True, prefetch_factor=2
