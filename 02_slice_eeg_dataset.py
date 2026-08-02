@@ -6,8 +6,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
 import mne
-import yasa
 import numpy as np
+from tqdm import tqdm
 
 try:
     import yasa
@@ -15,9 +15,19 @@ try:
 except ImportError:
     HAS_YASA = False
 
-from tqdm import tqdm
-
 SUPPORTED_EXTENSIONS = {".fif", ".edf", ".bdf", ".vhdr"}
+
+# Standard CBraMod 64-channel 10-20 spatial layout
+CBRMOD_STANDARD_64 = [
+    'FP1', 'FPZ', 'FP2', 'AF8', 'AF4', 'AFZ', 'AF3', 'AF7',
+    'F7', 'F5', 'F3', 'F1', 'FZ', 'F2', 'F4', 'F6',
+    'F8', 'FT8', 'FC6', 'FC4', 'FC2', 'FCZ', 'FC1', 'FC3',
+    'FC5', 'FT7', 'T7', 'C5', 'C3', 'C1', 'CZ', 'C2',
+    'C4', 'C6', 'T8', 'TP8', 'CP6', 'CP4', 'CP2', 'CPZ',
+    'CP1', 'CP3', 'CP5', 'TP7', 'P7', 'P5', 'P3', 'P1',
+    'PZ', 'P2', 'P4', 'P6', 'P8', 'PO8', 'PO4', 'POZ',
+    'PO3', 'PO7', 'O1', 'OZ', 'O2', 'CB1', 'CB2', 'IZ'
+]
 
 # Standard sleep stage string normalization map
 STAGE_NORM_MAP = {
@@ -27,6 +37,80 @@ STAGE_NORM_MAP = {
     "sleep stage n3": "N3", "stage 3": "N3", "stage 4": "N3", "n3": "N3", "3": "N3", "4": "N3",
     "sleep stage r": "REM", "stage rem": "REM", "rem": "REM", "5": "REM"
 }
+
+
+def clean_ch_name(name: str) -> str:
+    """Standardizes channel naming for robust string matching."""
+    return name.upper().replace('.', '').replace('-', '').replace('EEG', '').strip()
+
+
+def apply_eeg_referencing(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
+    """
+    Cleansing Step 1: Applies linked-earlobe referencing (A1/A2) if present,
+    else falls back to Common Average Referencing (CAR).
+    """
+    ch_clean = [clean_ch_name(ch) for ch in raw.ch_names]
+    if "A1" in ch_clean and "A2" in ch_clean:
+        a1_ch = raw.ch_names[ch_clean.index("A1")]
+        a2_ch = raw.ch_names[ch_clean.index("A2")]
+        raw.set_eeg_reference(ref_channels=[a1_ch, a2_ch], projection=False, verbose=False)
+    else:
+        try:
+            raw.set_eeg_reference(ref_channels="average", projection=False, verbose=False)
+        except Exception:
+            pass
+    return raw
+
+
+def harmonize_channels_to_cbramod(data_uV: np.ndarray, orig_ch_names: List[str]) -> np.ndarray:
+    """
+    Cleansing Step 2: Filters auxiliary channels (STATUS, EMG, EOG), aligns 
+    matching scalp channels, and zero-pads missing channels to output [64, Time_Samples].
+    """
+    clean_orig = [clean_ch_name(ch) for ch in orig_ch_names]
+    clean_target = [clean_ch_name(ch) for ch in CBRMOD_STANDARD_64]
+    
+    num_samples = data_uV.shape[1]
+    harmonized = np.zeros((len(CBRMOD_STANDARD_64), num_samples), dtype=np.float32)
+    
+    for t_idx, t_ch in enumerate(clean_target):
+        if t_ch in clean_orig:
+            s_idx = clean_orig.index(t_ch)
+            harmonized[t_idx, :] = data_uV[s_idx, :]
+            
+    return harmonized
+
+
+def process_and_normalize_slice(
+    slice_64: np.ndarray, min_std: float = 0.5, max_std: float = 150.0
+) -> Tuple[np.ndarray, bool, str]:
+    """
+    Cleansing Step 3: Screens active channels for flatlines and extreme artifacts.
+    Always maintains array shape [64, T]. Zero-fills invalid slices and flags them.
+    """
+    nonzero_mask = np.abs(slice_64).sum(axis=-1) > 1e-8
+    
+    # Check for unpopulated/missing channel data
+    if not np.any(nonzero_mask):
+        return np.zeros_like(slice_64, dtype=np.float32), False, "EMPTY_CHANNEL_DATA"
+        
+    active_stds = slice_64[nonzero_mask].std(axis=-1)
+    
+    # Check for flatlines (< min_std uV)
+    if np.any(active_stds < min_std):
+        return np.zeros_like(slice_64, dtype=np.float32), False, "FLATLINE_DETECTED"
+        
+    # Check for unrecoverable pop/movement artifacts (> max_std uV)
+    if np.any(active_stds > max_std):
+        return np.zeros_like(slice_64, dtype=np.float32), False, "EXTREME_ARTIFACT"
+        
+    # Valid window: Perform Z-score normalization on active channels
+    normalized = slice_64.copy()
+    means = normalized[nonzero_mask].mean(axis=-1, keepdims=True)
+    stds = normalized[nonzero_mask].std(axis=-1, keepdims=True)
+    
+    normalized[nonzero_mask] = (normalized[nonzero_mask] - means) / (stds + 1e-8)
+    return normalized, True, "OK"
 
 
 def load_raw_eeg(file_path: Path) -> mne.io.BaseRaw:
@@ -45,9 +129,7 @@ def load_raw_eeg(file_path: Path) -> mne.io.BaseRaw:
 
 
 def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: float = 30.0) -> List[str]:
-    """
-    Parses MNE raw annotations and maps each window to its corresponding sleep stage.
-    """
+    """Parses MNE raw annotations and maps each window to its corresponding sleep stage."""
     if len(raw.annotations) == 0:
         return ["UNKNOWN"] * num_windows
 
@@ -58,7 +140,6 @@ def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: floa
         t_mid = (idx * window_sec) + (window_sec / 2.0)
         stage_label = "UNKNOWN"
 
-        # Find annotation overlapping the midpoint of this window
         for ann in annotations:
             ann_start = ann["onset"]
             ann_end = ann_start + ann["duration"]
@@ -73,21 +154,15 @@ def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: floa
 
 
 def select_best_eeg_channel(eeg_chs: List[str]) -> str:
-    """
-    Selects the optimal central EEG channel using exact word-boundary matching.
-    Avoids false positive substring matches like FC4 or CP4.
-    """
-    # Priority list of central channels
+    """Selects the optimal central EEG channel using exact word-boundary matching."""
     preferences = ["C4", "C3", "CZ"]
 
     for pref in preferences:
-        # \b ensures exact word boundary match (e.g. matches "C4", "C4-M1", "C4_A1", but NOT "FC4")
         pattern = re.compile(rf"\b{pref}\b", re.IGNORECASE)
         for ch in eeg_chs:
             if pattern.search(ch):
                 return ch
 
-    # Fallback: Return first available channel if no central channels match
     return eeg_chs[0]
 
 
@@ -102,14 +177,13 @@ def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str
         sls = yasa.SleepStaging(raw, eeg_name=target_ch)
         stages = list(sls.predict().hypno)
 
-        # Align predicted length with target window count
         if len(stages) < num_windows:
             stages.extend(["UNKNOWN"] * (num_windows - len(stages)))
         elif len(stages) > num_windows:
             stages = stages[:num_windows]
 
         return stages
-    except Exception as e:
+    except Exception:
         return ["UNKNOWN"] * num_windows
 
 
@@ -117,51 +191,64 @@ def slice_strategy_a_macro(
     raw: mne.io.BaseRaw, window_sec: float = 30.0
 ) -> Tuple[np.ndarray, List[Dict], List[str]]:
     """
-    Strategy A: Standard 30-second contiguous epoch slicing with stage extraction.
-    Returns:
-        tensor: [Num_Windows, Channels, Window_Samples]
-        metadata: List of window timestamps and indices.
-        stages: List of sleep stage labels matching window count.
+    Strategy A: Contiguous 30-second epoch slicing. 
+    Unconditionally appends all slices to ensure 1-to-1 temporal indexing alignment.
     """
     sfreq = raw.info["sfreq"]
-    data = raw.get_data()  # Shape: [Channels, Time_Samples]
-    ch_names = raw.ch_names
-    
+    orig_ch_names = raw.ch_names
     samples_per_window = int(round(window_sec * sfreq))
-    total_samples = data.shape[1]
+    total_samples = raw.n_samples
     num_windows = total_samples // samples_per_window
+
+    # 1. Stage extraction prior to data mutation
+    if len(raw.annotations) > 0:
+        raw_stages = extract_epoch_stages(raw, num_windows=num_windows, window_sec=window_sec)
+    else:
+        raw_stages = predict_epoch_stages_yasa(raw, num_windows=num_windows)
+
+    # 2. Referencing
+    raw = apply_eeg_referencing(raw)
+
+    # 3. Unit Conversion (SI Volts -> Microvolts uV)
+    data_uV = raw.get_data() * 1e6
+
+    # 4. Winsorization / Hard-Clipping (+/- 500 uV)
+    data_clipped = np.clip(data_uV, -500.0, 500.0)
+
+    # 5. Channel Harmonization (Filters aux, aligns scalp, zero-pads to 64 channels)
+    data_harmonized = harmonize_channels_to_cbramod(data_clipped, orig_ch_names)
 
     slices = []
     metadata = []
+    stages = []
 
     for idx in range(num_windows):
         start_sample = idx * samples_per_window
         end_sample = start_sample + samples_per_window
         
-        window_data = data[:, start_sample:end_sample]
-        slices.append(window_data)
+        window_raw = data_harmonized[:, start_sample:end_sample]
+        
+        # 6. Quality Screening & Normalization
+        window_norm, is_valid, quality_status = process_and_normalize_slice(window_raw)
+
+        # Unconditionally append every window to keep window_idx == tensor[idx]
+        slices.append(window_norm)
+        stages.append(raw_stages[idx])
         
         metadata.append({
-            "window_idx": idx,
+            "window_idx": idx,          # Directly matches array index tensor[idx]
             "start_sec": start_sample / sfreq,
             "end_sec": end_sample / sfreq,
             "samples": samples_per_window,
+            "is_valid": is_valid,       # Read by 03_create_manifests.py
+            "quality_status": quality_status,
             "type": "macro_30s"
         })
 
     if len(slices) == 0:
-        return np.empty((0, len(ch_names), samples_per_window)), [], []
+        return np.empty((0, 64, samples_per_window)), [], []
 
-    tensor = np.stack(slices, axis=0)  # Shape: [N, C, T]
-    
-    # Check if raw has native annotations; if not, use YASA predictor
-    if len(raw.annotations) > 0:
-        # Native annotation extraction
-        stages = extract_epoch_stages(raw, num_windows=num_windows, window_sec=window_sec)
-    else:
-        # Automated prediction via YASA
-        stages = predict_epoch_stages_yasa(raw, num_windows=num_windows)
-
+    tensor = np.stack(slices, axis=0)  # Shape: [num_windows, 64, samples_per_window]
     return tensor, metadata, stages
 
 
@@ -177,10 +264,15 @@ def slice_strategy_b_micro(
     sfreq = raw.info["sfreq"]
     crop_samples = int(round(crop_duration_sec * sfreq))
     half_crop = crop_samples // 2
-    ch_names = raw.ch_names
+    orig_ch_names = raw.ch_names
 
-    slices = []
-    metadata = []
+    raw_ref = apply_eeg_referencing(raw.copy())
+    data_uV = raw_ref.get_data() * 1e6
+    data_clipped = np.clip(data_uV, -500.0, 500.0)
+    data_harmonized = harmonize_channels_to_cbramod(data_clipped, orig_ch_names)
+
+    candidate_crops = []
+    meta_candidates = []
 
     if HAS_YASA:
         try:
@@ -194,11 +286,11 @@ def slice_strategy_b_micro(
                     start_s = peak_sample - half_crop
                     end_s = peak_sample + half_crop
                     
-                    if start_s >= 0 and end_s <= raw.n_samples:
-                        crop_data = raw.get_data(start=start_s, stop=end_s)
+                    if start_s >= 0 and end_s <= data_harmonized.shape[1]:
+                        crop_data = data_harmonized[:, start_s:end_s]
                         if crop_data.shape[1] == crop_samples:
-                            slices.append(crop_data)
-                            metadata.append({
+                            candidate_crops.append(crop_data)
+                            meta_candidates.append({
                                 "event_channel": row["Channel"],
                                 "peak_sec": peak_sec,
                                 "duration_sec": row["Duration"],
@@ -208,7 +300,7 @@ def slice_strategy_b_micro(
         except Exception:
             pass
 
-    if len(slices) == 0:
+    if len(candidate_crops) == 0:
         raw_filtered = raw.copy().filter(l_freq=freq_band[0], h_freq=freq_band[1], verbose=False)
         data_filt = raw_filtered.get_data()
         
@@ -225,38 +317,41 @@ def slice_strategy_b_micro(
         last_p = -refractory_samples
         for p in peak_indices:
             if p - last_p >= refractory_samples:
-                if p - half_crop >= 0 and p + half_crop <= raw.n_samples:
+                if p - half_crop >= 0 and p + half_crop <= data_harmonized.shape[1]:
                     selected_peaks.append(p)
                     last_p = p
 
-        data_raw = raw.get_data()
         for idx, peak in enumerate(selected_peaks):
             start_s = peak - half_crop
             end_s = peak + half_crop
-            crop_data = data_raw[:, start_s:end_s]
+            crop_data = data_harmonized[:, start_s:end_s]
             if crop_data.shape[1] == crop_samples:
-                slices.append(crop_data)
-                metadata.append({
+                candidate_crops.append(crop_data)
+                meta_candidates.append({
                     "event_idx": idx,
                     "peak_sec": peak / sfreq,
                     "duration_sec": crop_duration_sec,
                     "type": "event_crop_bandpass"
                 })
 
+    slices = []
+    metadata = []
+    valid_stages = []
+
+    for crop, meta in zip(candidate_crops, meta_candidates):
+        norm_crop, is_valid, quality_status = process_and_normalize_slice(crop)
+        if is_valid:
+            slices.append(norm_crop)
+            meta["is_valid"] = True
+            meta["quality_status"] = quality_status
+            metadata.append(meta)
+            valid_stages.append("EVENT")
+
     if len(slices) == 0:
-        return np.empty((0, len(ch_names), crop_samples)), [], []
+        return np.empty((0, 64, crop_samples)), [], []
 
     tensor = np.stack(slices, axis=0)
-
-    # Check if raw has native annotations; if not, use YASA predictor
-    if len(raw.annotations) > 0:
-        # Native annotation extraction
-        stages = extract_epoch_stages(raw, num_windows=num_windows, window_sec=window_sec)
-    else:
-        # Automated prediction via YASA
-        stages = predict_epoch_stages_yasa(raw, num_windows=num_windows)
-
-    return tensor, metadata, stages
+    return tensor, metadata, valid_stages
 
 
 def process_subject_slicing_worker(
@@ -288,17 +383,17 @@ def process_subject_slicing_worker(
         else:
             raise ValueError(f"Unknown slicing strategy: {strategy}")
 
-        # Save binary matrix and JSON metadata WITH top-level stages key
+        # Save binary matrix and JSON metadata with standard 64-channel topology
         np.save(output_npy, tensor)
         with open(output_meta, "w") as f:
             json.dump({
                 "subject_id": subject_id,
                 "strategy": strategy,
-                "num_channels": len(raw.ch_names),
-                "channel_names": raw.ch_names,
+                "num_channels": 64,
+                "channel_names": CBRMOD_STANDARD_64,
                 "sampling_freq": raw.info["sfreq"],
                 "num_slices": len(meta),
-                "stages": stages,  # Top-level array consumed by 09_clinical_inference.py
+                "stages": stages,
                 "slices": meta
             }, f, indent=2)
 
@@ -369,7 +464,7 @@ def valid_regex(pattern_string):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="EEG Window Slicing Script")
+    parser = argparse.ArgumentParser(description="EEG Window Slicing Pipeline with Cleansing & Quality Tracking")
     parser.add_argument("--src_dir", type=str, required=True, help="Input directory containing resampled files")
     parser.add_argument("--dst_dir", type=str, required=True, help="Output destination directory")
     parser.add_argument("--pattern", type=valid_regex, default=None, help="Optional regex pattern to match subject id")
