@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Post-Mortem Subject Gatekeeper & Training Manifest Generator.
 
@@ -7,6 +6,7 @@ and outputs a training manifest pointing only to valid windows from accepted sub
 """
 
 import json
+import argparse
 from pathlib import Path
 import pandas as pd
 
@@ -65,7 +65,7 @@ def evaluate_subject_gatekeeping(
     }
 
 
-def generate_manifest(meta_dir: Path, output_csv: Path):
+def generate_manifest(meta_dir: Path, output_dir: Path):
     """Scans all JSON files and outputs a cohort gatekeeping report."""
     results = []
     json_files = list(meta_dir.glob("*.json"))
@@ -75,7 +75,7 @@ def generate_manifest(meta_dir: Path, output_csv: Path):
         results.append(res)
 
     report_df = pd.DataFrame(results)
-    report_df.to_csv(output_csv, index=False)
+    report_df.to_csv(output_dir / "subject_manifest.csv, index=False)
 
     total_subjs = len(report_df)
     accepted_subjs = report_df['accepted'].sum()
@@ -90,4 +90,9 @@ def generate_manifest(meta_dir: Path, output_csv: Path):
     print("=" * 60)
 
 if __name__ == "__main__":
-    generate_manifest(Path("./sliced_output/metadata"), Path("./cohort_manifest.csv"))
+    parser = argparse.ArgumentParser(description="Data Quality Screening and Subject Gatekeeping")
+    parser.add_argument("--sliced_dir", type=str, required=True, help="Directory containing sliced .npy and _meta.json files")
+    parser.add_argument("--output_dir", type=str, default=".", help="Output directory for CSV manifests")
+
+    args = parser.parse_args()
+    generate_manifest(Path(args.sliced_dir), Path(args.output_dir))
