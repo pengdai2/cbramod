@@ -75,7 +75,7 @@ def generate_manifest(meta_dir: Path, output_dir: Path):
         results.append(res)
 
     report_df = pd.DataFrame(results)
-    report_df.to_csv(output_dir / "subject_manifest.csv, index=False)
+    report_df.to_csv(output_dir / "subject_manifest.csv", index=False)
 
     total_subjs = len(report_df)
     accepted_subjs = report_df['accepted'].sum()
