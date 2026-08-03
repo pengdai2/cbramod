@@ -6,7 +6,7 @@ Spherical Spline Interpolation, and Full Debug Logging for Channel & Window Reje
 Architecture Pipeline:
 1. Load Raw File -> Read continuous time-series recording (.edf, .fif, .bdf, .vhdr).
 2. Dynamic Discovery -> Identify recorded scalp channels matching CBraMod layout at runtime.
-3. Channel Selection -> Crop away non-EEG/trigger channels to protect square pulses from FIR ringing.
+3. Channel Selection -> Crop away non-EEG/trigger channels using `inst.pick()`.
 4. Continuous Filtering -> Apply single-pass 0.3-35.0 Hz zero-phase FIR bandpass filter globally.
 5. Referencing -> Apply linked-earlobe (A1/A2) or CAR referencing.
 6. Neighborhood Spatial Validation & Interpolation (LOGGED) -> 
@@ -14,7 +14,7 @@ Architecture Pipeline:
    and interpolate isolated bad channels via spherical splines.
 7. CBraMod Harmonization -> Map cleaned physical signals into 64-channel matrix; zero-pad unrecorded positions (0.0 uV).
 8. Window-Level Slicing, Normalization & Quality Screening (LOGGED) -> 
-   Epoch continuous data, evaluate active channels for residual window artifacts/flatlines with detailed 
+   Epoch continuous data using `raw.n_times`, evaluate active channels for residual window artifacts/flatlines with detailed 
    debug logs, and apply per-window Z-score normalization.
 """
 
@@ -243,7 +243,8 @@ def prepare_clean_raw_eeg(
 
     logger.debug(f"Discovered {len(recorded_eeg_chs)} valid scalp EEG channels.")
 
-    raw_eeg = raw_orig.copy().pick_channels(recorded_eeg_chs, ordered=True)
+    # Modern MNE syntax: replace deprecated raw.pick_channels(...) with raw.pick(...)
+    raw_eeg = raw_orig.copy().pick(recorded_eeg_chs)
 
     logger.debug(f"Applying zero-phase FIR bandpass filter ({l_freq} Hz - {h_freq} Hz)...")
     raw_eeg.filter(
@@ -366,7 +367,7 @@ def select_best_eeg_channel(eeg_chs: List[str]) -> str:
 def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str]:
     """YASA fallback predictor."""
     try:
-        eeg_chs = raw.copy().pick_types(eeg=True).ch_names
+        eeg_chs = raw.copy().pick('eeg').ch_names
         if not eeg_chs:
             eeg_chs = raw.ch_names
         target_ch = select_best_eeg_channel(eeg_chs)
@@ -395,7 +396,9 @@ def slice_strategy_a_macro(
     """Strategy A: 30-second continuous macro window slicing with detailed quality logging."""
     sfreq = raw_clean_eeg.info["sfreq"]
     samples_per_window = int(round(window_sec * sfreq))
-    total_samples = raw_clean_eeg.n_samples
+    
+    # Modern MNE property: replace non-existent raw.n_samples with raw.n_times
+    total_samples = raw_clean_eeg.n_times
     num_windows = total_samples // samples_per_window
 
     if len(raw_orig.annotations) > 0:
