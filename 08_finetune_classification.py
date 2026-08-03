@@ -348,8 +348,9 @@ def run_fine_tuning_pipeline(
         val_preds = []
         val_targets = []
 
+        val_pbar = tqdm(val_loader, desc=f"Epoch {epoch:02d}/{epochs:02d} [Val]  ", leave=False)
         with torch.no_grad():
-            for x_batch, y_batch in val_loader:
+            for x_batch, y_batch in val_pbar:
                 x_batch, y_batch = x_batch.to(device), y_batch.to(device)
                 logits = model(x_batch)
                 loss = criterion(logits, y_batch)
@@ -359,6 +360,8 @@ def run_fine_tuning_pipeline(
 
                 val_preds.extend(preds.cpu().numpy())
                 val_targets.extend(y_batch.cpu().numpy())
+
+                val_pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
         epoch_val_loss = val_loss / len(val_targets) if len(val_targets) > 0 else 0.0
         epoch_val_acc = accuracy_score(val_targets, val_preds) * 100.0 if len(val_targets) > 0 else 0.0
