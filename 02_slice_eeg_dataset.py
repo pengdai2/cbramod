@@ -162,6 +162,22 @@ def validate_spatial_neighborhood(
         return True
 
 
+def standardize_mne_channel_names(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
+    """Renames raw channels to match standard MNE 10-20 casing (e.g., 'FP1' -> 'Fp1', 'CZ' -> 'Cz')."""
+    montage_1020 = mne.channels.make_standard_montage("standard_1020")
+    montage_map = {clean_ch_name(ch): ch for ch in montage_1020.ch_names}
+    
+    rename_dict = {}
+    for ch in raw.ch_names:
+        cleaned = clean_ch_name(ch)
+        if cleaned in montage_map and ch != montage_map[cleaned]:
+            rename_dict[ch] = montage_map[cleaned]
+            
+    if rename_dict:
+        raw.rename_channels(rename_dict)
+    return raw
+
+
 def detect_and_interpolate_bad_channels(
     raw: mne.io.BaseRaw,
     recorded_ch_names: List[str],
@@ -171,15 +187,26 @@ def detect_and_interpolate_bad_channels(
     max_bad_neighbors: int = 1,
     subject_id: str = ""
 ) -> Tuple[mne.io.BaseRaw, List[str], bool]:
-    """Evaluates channel quality, spatial neighborhood adjacency, and interpolates bad channels."""
+    """Evaluates channel quality, spatial neighborhood adjacency, and interpolates bad channels safely."""
     tag = f"[Subj: {subject_id}] " if subject_id else ""
     n_recorded = len(recorded_ch_names)
     if n_recorded == 0:
         logger.error(f"{tag}No valid recorded EEG channels found.")
         return raw, [], False
 
+    # 1. Standardize channel casing to match MNE's standard 10-20 montage
+    raw = standardize_mne_channel_names(raw)
     montage = mne.channels.make_standard_montage("standard_1020")
     raw.set_montage(montage, on_missing="ignore")
+
+    # 2. Audit channels for valid 3D coordinates (non-NaN / non-zero)
+    valid_pos_chs = set()
+    for ch in raw.info['chs']:
+        loc = ch['loc'][:3]
+        if not np.isnan(loc).any() and not np.all(loc == 0):
+            valid_pos_chs.add(ch['ch_name'])
+        else:
+            logger.warning(f"{tag}Channel '{ch['ch_name']}' lacks valid 3D spatial coordinates (NaN location).")
 
     data_uV = raw.get_data() * 1e6
     ch_stds = np.std(data_uV, axis=-1)
@@ -198,7 +225,7 @@ def detect_and_interpolate_bad_channels(
             reason = "FLATLINE" if val < min_std_uV else "HIGH_VARIANCE/NOISE"
             logger.debug(f"{tag}  └─ Bad Channel '{raw.ch_names[i]}': std = {val:.2f} uV ({reason})")
 
-    # 1. Reject if total bad channel ratio exceeds limit
+    # Reject if total bad channel ratio exceeds limit
     if bad_ratio > max_bad_ratio:
         logger.warning(
             f"{tag}[REJECT - HIGH BAD RATIO] Subject has {bad_count}/{n_recorded} bad channels "
@@ -206,7 +233,7 @@ def detect_and_interpolate_bad_channels(
         )
         return raw, bad_ch_names, False
 
-    # 2. Reject if bad channels form spatial clusters
+    # Reject if bad channels form spatial clusters
     if bad_count > 1:
         is_spatially_isolated = validate_spatial_neighborhood(
             raw, bad_ch_names, max_bad_neighbors=max_bad_neighbors, subject_id=subject_id
@@ -214,16 +241,31 @@ def detect_and_interpolate_bad_channels(
         if not is_spatially_isolated:
             return raw, bad_ch_names, False
 
-    # 3. Interpolate isolated bad channels
+    # 3. Interpolate isolated bad channels with coordinate safety check
     if bad_count > 0:
-        clean_count = n_recorded - bad_count
-        logger.info(
-            f"{tag}[INTERPOLATION] Reconstructing {bad_count} isolated bad channels {bad_ch_names} "
-            f"using {clean_count} clean spatial anchors via spherical splines."
-        )
-        raw.info['bads'] = bad_ch_names
-        raw.interpolate_bads(reset_bads=True, mode='accurate', verbose=False)
-        logger.debug(f"{tag}Interpolation successfully applied.")
+        # Keep only bad channels that have valid 3D spatial locations
+        interpolatable_bads = [ch for ch in bad_ch_names if ch in valid_pos_chs]
+        
+        if len(interpolatable_bads) < bad_count:
+            skipped = set(bad_ch_names) - set(interpolatable_bads)
+            logger.warning(f"{tag}Skipping interpolation for bad channels missing 3D coordinates: {skipped}")
+
+        if interpolatable_bads:
+            clean_count = n_recorded - len(interpolatable_bads)
+            logger.info(
+                f"{tag}[INTERPOLATION] Reconstructing {len(interpolatable_bads)} isolated bad channels {interpolatable_bads} "
+                f"using {clean_count} clean spatial anchors via spherical splines."
+            )
+            raw.info['bads'] = interpolatable_bads
+            try:
+                raw.interpolate_bads(reset_bads=True, mode='accurate', verbose=False)
+                logger.debug(f"{tag}Interpolation successfully applied.")
+            except Exception as e:
+                logger.error(
+                    f"{tag}[REJECT - INTERPOLATION FAILURE] Spherical spline interpolation failed: {e}. "
+                    f"Marking subject as unrecoverable."
+                )
+                return raw, bad_ch_names, False
     else:
         logger.debug(f"{tag}No bad channels detected. All recorded channels are clean.")
 
