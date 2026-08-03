@@ -9,13 +9,13 @@ Architecture Pipeline:
 3. Channel Selection -> Crop away non-EEG/trigger channels using `inst.pick()`.
 4. Continuous Filtering -> Apply single-pass 0.3-35.0 Hz zero-phase FIR bandpass filter globally.
 5. Referencing -> Apply linked-earlobe (A1/A2) or CAR referencing.
-6. Neighborhood Spatial Validation & Interpolation (LOGGED) -> 
+6. Neighborhood Spatial Validation & Interpolation (LOGGED WITH SUBJ ID) -> 
    Detect flatlines/high-variance noise, check spatial adjacency (reject spatial clusters of bad channels), 
    and interpolate isolated bad channels via spherical splines.
 7. CBraMod Harmonization -> Map cleaned physical signals into 64-channel matrix; zero-pad unrecorded positions (0.0 uV).
-8. Window-Level Slicing, Normalization & Quality Screening (LOGGED) -> 
+8. Window-Level Slicing, Normalization & Quality Screening (LOGGED WITH SUBJ ID) -> 
    Epoch continuous data using `raw.n_times`, evaluate active channels for residual window artifacts/flatlines with detailed 
-   debug logs, and apply per-window Z-score normalization.
+   debug logs tagged by subject ID, and apply per-window Z-score normalization.
 """
 
 import argparse
@@ -107,32 +107,35 @@ def load_raw_eeg(file_path: Path) -> mne.io.BaseRaw:
         raise ValueError(f"Unsupported file format: {ext}")
 
 
-def apply_eeg_referencing(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
+def apply_eeg_referencing(raw: mne.io.BaseRaw, subject_id: str = "") -> mne.io.BaseRaw:
     """Applies linked-earlobe referencing (A1/A2) if present, else CAR."""
     ch_clean = [clean_ch_name(ch) for ch in raw.ch_names]
+    tag = f"[Subj: {subject_id}] " if subject_id else ""
     if "A1" in ch_clean and "A2" in ch_clean:
         a1_ch = raw.ch_names[ch_clean.index("A1")]
         a2_ch = raw.ch_names[ch_clean.index("A2")]
         raw.set_eeg_reference(ref_channels=[a1_ch, a2_ch], projection=False, verbose=False)
-        logger.debug(f"Referencing: Applied Linked-Earlobe (ref={a1_ch},{a2_ch}).")
+        logger.debug(f"{tag}Referencing: Applied Linked-Earlobe (ref={a1_ch},{a2_ch}).")
     else:
         try:
             raw.set_eeg_reference(ref_channels="average", projection=False, verbose=False)
-            logger.debug("Referencing: Applied Common Average Reference (CAR).")
+            logger.debug(f"{tag}Referencing: Applied Common Average Reference (CAR).")
         except Exception as e:
-            logger.warning(f"Referencing warning: {e}")
+            logger.warning(f"{tag}Referencing warning: {e}")
     return raw
 
 
 def validate_spatial_neighborhood(
     raw: mne.io.BaseRaw, 
     bad_ch_names: List[str], 
-    max_bad_neighbors: int = 1
+    max_bad_neighbors: int = 1,
+    subject_id: str = ""
 ) -> bool:
     """Evaluates physical adjacency of bad channels using the 10-20 topology matrix."""
     if len(bad_ch_names) <= 1:
         return True
 
+    tag = f"[Subj: {subject_id}] " if subject_id else ""
     try:
         adjacency_matrix, ch_names = mne.channels.find_ch_adjacency(raw.info, ch_type='eeg')
         adj_dense = adjacency_matrix.toarray()
@@ -147,15 +150,15 @@ def validate_spatial_neighborhood(
             
             if len(bad_neighbors) > max_bad_neighbors:
                 logger.warning(
-                    f"[REJECT - SPATIAL CLUSTER] Bad channel '{bad_ch_name}' has {len(bad_neighbors)} bad "
+                    f"{tag}[REJECT - SPATIAL CLUSTER] Bad channel '{bad_ch_name}' has {len(bad_neighbors)} bad "
                     f"adjacent neighbors ({bad_neighbors}), exceeding limit of {max_bad_neighbors}."
                 )
                 return False
                 
-        logger.debug("Spatial Neighborhood Check PASSED: All bad channels are spatially isolated.")
+        logger.debug(f"{tag}Spatial Neighborhood Check PASSED: All bad channels are spatially isolated.")
         return True
     except Exception as e:
-        logger.debug(f"Adjacency check skipped/failed ({e}); assuming spatially safe.")
+        logger.debug(f"{tag}Adjacency check skipped/failed ({e}); assuming spatially safe.")
         return True
 
 
@@ -165,12 +168,14 @@ def detect_and_interpolate_bad_channels(
     min_std_uV: float = 0.5,
     max_std_uV: float = 150.0,
     max_bad_ratio: float = 0.15,
-    max_bad_neighbors: int = 1
+    max_bad_neighbors: int = 1,
+    subject_id: str = ""
 ) -> Tuple[mne.io.BaseRaw, List[str], bool]:
     """Evaluates channel quality, spatial neighborhood adjacency, and interpolates bad channels."""
+    tag = f"[Subj: {subject_id}] " if subject_id else ""
     n_recorded = len(recorded_ch_names)
     if n_recorded == 0:
-        logger.error("No valid recorded EEG channels found.")
+        logger.error(f"{tag}No valid recorded EEG channels found.")
         return raw, [], False
 
     montage = mne.channels.make_standard_montage("standard_1020")
@@ -187,16 +192,16 @@ def detect_and_interpolate_bad_channels(
     bad_ratio = bad_count / float(n_recorded)
 
     if bad_count > 0:
-        logger.debug(f"Detected {bad_count}/{n_recorded} suspicious channels ({bad_ratio:.1%}): {bad_ch_names}")
+        logger.debug(f"{tag}Detected {bad_count}/{n_recorded} suspicious channels ({bad_ratio:.1%}): {bad_ch_names}")
         for i in bad_indices:
             val = ch_stds[i]
             reason = "FLATLINE" if val < min_std_uV else "HIGH_VARIANCE/NOISE"
-            logger.debug(f"  └─ Bad Channel '{raw.ch_names[i]}': std = {val:.2f} uV ({reason})")
+            logger.debug(f"{tag}  └─ Bad Channel '{raw.ch_names[i]}': std = {val:.2f} uV ({reason})")
 
     # 1. Reject if total bad channel ratio exceeds limit
     if bad_ratio > max_bad_ratio:
         logger.warning(
-            f"[REJECT - HIGH BAD RATIO] Subject has {bad_count}/{n_recorded} bad channels "
+            f"{tag}[REJECT - HIGH BAD RATIO] Subject has {bad_count}/{n_recorded} bad channels "
             f"({bad_ratio:.1%}), exceeding limit of {max_bad_ratio:.1%}."
         )
         return raw, bad_ch_names, False
@@ -204,48 +209,50 @@ def detect_and_interpolate_bad_channels(
     # 2. Reject if bad channels form spatial clusters
     if bad_count > 1:
         is_spatially_isolated = validate_spatial_neighborhood(
-            raw, bad_ch_names, max_bad_neighbors=max_bad_neighbors
+            raw, bad_ch_names, max_bad_neighbors=max_bad_neighbors, subject_id=subject_id
         )
         if not is_spatially_isolated:
             return raw, bad_ch_names, False
 
-    # 3. Interpolate isolated bad channels (reset_bads=True clears raw.info['bads'] after interpolation)
+    # 3. Interpolate isolated bad channels
     if bad_count > 0:
         clean_count = n_recorded - bad_count
         logger.info(
-            f"[INTERPOLATION] Reconstructing {bad_count} isolated bad channels {bad_ch_names} "
+            f"{tag}[INTERPOLATION] Reconstructing {bad_count} isolated bad channels {bad_ch_names} "
             f"using {clean_count} clean spatial anchors via spherical splines."
         )
         raw.info['bads'] = bad_ch_names
         raw.interpolate_bads(reset_bads=True, mode='accurate', verbose=False)
-        logger.debug("Interpolation successfully applied.")
+        logger.debug(f"{tag}Interpolation successfully applied.")
     else:
-        logger.debug("No bad channels detected. All recorded channels are clean.")
+        logger.debug(f"{tag}No bad channels detected. All recorded channels are clean.")
 
     return raw, bad_ch_names, True
 
 
 def prepare_clean_raw_eeg(
     file_path: Path, 
+    subject_id: str = "",
     l_freq: float = 0.3, 
     h_freq: float = 35.0,
     max_bad_ratio: float = 0.15,
     max_bad_neighbors: int = 1
 ) -> Tuple[mne.io.BaseRaw, mne.io.BaseRaw, List[str], List[str], bool]:
     """Top-level continuous data preparation pipeline."""
-    logger.debug(f"Processing raw file: {file_path.name}")
+    tag = f"[Subj: {subject_id}] " if subject_id else ""
+    logger.debug(f"{tag}Processing raw file: {file_path.name}")
     raw_orig = load_raw_eeg(file_path)
 
     recorded_eeg_chs = discover_cbramod_channels(raw_orig)
     if len(recorded_eeg_chs) == 0:
-        logger.error(f"Zero matching CBraMod channels found in {file_path.name}")
+        logger.error(f"{tag}Zero matching CBraMod channels found in {file_path.name}")
         return raw_orig, raw_orig, [], [], False
 
-    logger.debug(f"Discovered {len(recorded_eeg_chs)} valid scalp EEG channels.")
+    logger.debug(f"{tag}Discovered {len(recorded_eeg_chs)} valid scalp EEG channels.")
 
     raw_eeg = raw_orig.copy().pick(recorded_eeg_chs)
 
-    logger.debug(f"Applying zero-phase FIR bandpass filter ({l_freq} Hz - {h_freq} Hz)...")
+    logger.debug(f"{tag}Applying zero-phase FIR bandpass filter ({l_freq} Hz - {h_freq} Hz)...")
     raw_eeg.filter(
         l_freq=l_freq,
         h_freq=h_freq,
@@ -254,13 +261,14 @@ def prepare_clean_raw_eeg(
         verbose=False
     )
 
-    raw_ref = apply_eeg_referencing(raw_eeg)
+    raw_ref = apply_eeg_referencing(raw_eeg, subject_id=subject_id)
 
     raw_clean_eeg, bad_chs, subject_ok = detect_and_interpolate_bad_channels(
         raw_ref, 
         recorded_ch_names=recorded_eeg_chs, 
         max_bad_ratio=max_bad_ratio,
-        max_bad_neighbors=max_bad_neighbors
+        max_bad_neighbors=max_bad_neighbors,
+        subject_id=subject_id
     )
 
     return raw_orig, raw_clean_eeg, recorded_eeg_chs, bad_chs, subject_ok
@@ -286,16 +294,18 @@ def process_and_normalize_slice(
     slice_64: np.ndarray, 
     min_std: float = 0.5, 
     max_std: float = 150.0,
-    window_id: str = ""
+    window_id: str = "",
+    subject_id: str = ""
 ) -> Tuple[np.ndarray, bool, str]:
     """
     Evaluates window active channels for residual flatlines or extreme artifacts with 
     detailed debug logging, then applies per-window Z-score normalization strictly on active channels.
     """
+    tag = f"[Subj: {subject_id}] " if subject_id else ""
     nonzero_mask = np.abs(slice_64).sum(axis=-1) > 1e-8
 
     if not np.any(nonzero_mask):
-        logger.debug(f"[REJECT WINDOW {window_id}] Reason: EMPTY_CHANNEL_DATA (All channels zero-padded/empty).")
+        logger.debug(f"{tag}[REJECT WINDOW {window_id}] Reason: EMPTY_CHANNEL_DATA (All channels zero-padded/empty).")
         return np.zeros_like(slice_64, dtype=np.float32), False, "EMPTY_CHANNEL_DATA"
 
     active_stds = slice_64[nonzero_mask].std(axis=-1)
@@ -304,7 +314,7 @@ def process_and_normalize_slice(
     min_found_std = active_stds.min()
     if min_found_std < min_std:
         logger.debug(
-            f"[REJECT WINDOW {window_id}] Reason: FLATLINE_DETECTED "
+            f"{tag}[REJECT WINDOW {window_id}] Reason: FLATLINE_DETECTED "
             f"(Min active channel std: {min_found_std:.3f} uV < threshold {min_std:.2f} uV)."
         )
         return np.zeros_like(slice_64, dtype=np.float32), False, "FLATLINE_DETECTED"
@@ -313,7 +323,7 @@ def process_and_normalize_slice(
     max_found_std = active_stds.max()
     if max_found_std > max_std:
         logger.debug(
-            f"[REJECT WINDOW {window_id}] Reason: EXTREME_ARTIFACT "
+            f"{tag}[REJECT WINDOW {window_id}] Reason: EXTREME_ARTIFACT "
             f"(Max active channel std: {max_found_std:.2f} uV > threshold {max_std:.2f} uV)."
         )
         return np.zeros_like(slice_64, dtype=np.float32), False, "EXTREME_ARTIFACT"
@@ -390,9 +400,11 @@ def slice_strategy_a_macro(
     recorded_chs: List[str],
     bad_chs: List[str],
     subject_ok: bool,
-    window_sec: float = 30.0
+    window_sec: float = 30.0,
+    subject_id: str = ""
 ) -> Tuple[np.ndarray, List[Dict], List[str]]:
     """Strategy A: 30-second continuous macro window slicing with detailed quality logging."""
+    tag = f"[Subj: {subject_id}] " if subject_id else ""
     sfreq = raw_clean_eeg.info["sfreq"]
     samples_per_window = int(round(window_sec * sfreq))
     total_samples = raw_clean_eeg.n_times
@@ -404,7 +416,7 @@ def slice_strategy_a_macro(
         raw_stages = predict_epoch_stages_yasa(raw_clean_eeg, num_windows=num_windows)
 
     if not subject_ok:
-        logger.warning(f"[STRATEGY A] Recording unrecoverable. Zeroing all {num_windows} macro windows.")
+        logger.warning(f"{tag}[STRATEGY A] Recording unrecoverable. Zeroing all {num_windows} macro windows.")
         slices = [np.zeros((64, samples_per_window), dtype=np.float32) for _ in range(num_windows)]
         metadata = [{
             "window_idx": idx,
@@ -436,7 +448,7 @@ def slice_strategy_a_macro(
         # Screen window quality and apply Z-score normalization
         win_id_str = f"#{idx} ({start_sec:.1f}s-{end_sec:.1f}s)"
         window_norm, is_valid, quality_status = process_and_normalize_slice(
-            window_raw, window_id=win_id_str
+            window_raw, window_id=win_id_str, subject_id=subject_id
         )
 
         if not is_valid:
@@ -461,7 +473,7 @@ def slice_strategy_a_macro(
     rejected_count = num_windows - valid_count
     
     logger.info(
-        f"[STRATEGY A SUMMARY] Total: {num_windows} windows | Valid: {valid_count} | "
+        f"{tag}[STRATEGY A SUMMARY] Total: {num_windows} windows | Valid: {valid_count} | "
         f"Rejected: {rejected_count} ({(rejected_count/num_windows)*100:.1f}%). "
         f"Rejection breakdown: {rejection_reasons if rejection_reasons else 'None'}"
     )
@@ -479,11 +491,13 @@ def slice_strategy_b_micro(
     subject_ok: bool,
     crop_duration_sec: float = 3.0, 
     spindle_band: Tuple[float, float] = (11.0, 16.0),
-    threshold_std: float = 1.5
+    threshold_std: float = 1.5,
+    subject_id: str = ""
 ) -> Tuple[np.ndarray, List[Dict], List[str]]:
     """Strategy B: Event-centered candidate spindle crops with window quality logging."""
+    tag = f"[Subj: {subject_id}] " if subject_id else ""
     if not subject_ok:
-        logger.warning("[STRATEGY B] Recording unrecoverable; skipping candidate event extraction.")
+        logger.warning(f"{tag}[STRATEGY B] Recording unrecoverable; skipping candidate event extraction.")
         return np.empty((0, 64, int(crop_duration_sec * raw_clean_eeg.info["sfreq"]))), [], []
 
     sfreq = raw_clean_eeg.info["sfreq"]
@@ -573,7 +587,7 @@ def slice_strategy_b_micro(
         win_id_str = f"event_{idx} (peak={peak_t:.1f}s)"
         
         norm_crop, is_valid, quality_status = process_and_normalize_slice(
-            crop, window_id=win_id_str
+            crop, window_id=win_id_str, subject_id=subject_id
         )
         
         if is_valid:
@@ -590,7 +604,7 @@ def slice_strategy_b_micro(
     rejected_count = total_candidates - valid_count
 
     logger.info(
-        f"[STRATEGY B SUMMARY] Extracted candidates: {total_candidates} | Valid: {valid_count} | "
+        f"{tag}[STRATEGY B SUMMARY] Extracted candidates: {total_candidates} | Valid: {valid_count} | "
         f"Rejected: {rejected_count}. Rejection breakdown: {rejection_reasons if rejection_reasons else 'None'}"
     )
 
@@ -608,29 +622,34 @@ def process_subject_slicing_worker(
 
     configure_logging(verbose=verbose)
 
+    # Derive subject / file ID upfront for logging context
     subject_id = src_file.stem
     if pattern:
         match = pattern.search(subject_id)
         if match:
             subject_id = match.group(0)
+
     output_npy = dst_dir / f"{subject_id}_windows.npy"
     output_meta = dst_dir / f"{subject_id}_meta.json"
 
     dst_dir.mkdir(parents=True, exist_ok=True)
 
     if output_npy.exists() and output_meta.exists() and not force:
+        logger.debug(f"[Subj: {subject_id}] Output already exists; skipping.")
         return {"status": "SKIPPED", "subject": subject_id, "count": 0}
 
     try:
-        raw_orig, raw_clean_eeg, recorded_chs, bad_chs, subject_ok = prepare_clean_raw_eeg(src_file)
+        raw_orig, raw_clean_eeg, recorded_chs, bad_chs, subject_ok = prepare_clean_raw_eeg(
+            src_file, subject_id=subject_id
+        )
 
         if strategy.lower() == "macro":
             tensor, meta, stages = slice_strategy_a_macro(
-                raw_orig, raw_clean_eeg, recorded_chs, bad_chs, subject_ok, window_sec=window_sec
+                raw_orig, raw_clean_eeg, recorded_chs, bad_chs, subject_ok, window_sec=window_sec, subject_id=subject_id
             )
         elif strategy.lower() == "micro":
             tensor, meta, stages = slice_strategy_b_micro(
-                raw_clean_eeg, recorded_chs, bad_chs, subject_ok, crop_duration_sec=window_sec
+                raw_clean_eeg, recorded_chs, bad_chs, subject_ok, crop_duration_sec=window_sec, subject_id=subject_id
             )
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
@@ -651,7 +670,7 @@ def process_subject_slicing_worker(
         return {"status": "SUCCESS", "subject": subject_id, "count": len(meta)}
 
     except Exception as e:
-        logger.error(f"Error processing {subject_id}: {str(e)}", exc_info=True)
+        logger.error(f"[Subj: {subject_id}] Error processing file: {str(e)}", exc_info=True)
         return {"status": f"ERROR: {str(e)}", "subject": subject_id, "count": 0}
 
 
