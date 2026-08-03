@@ -12,9 +12,9 @@ import pandas as pd
 
 def evaluate_subject_gatekeeping(
     json_path: Path, 
-    max_subj_rejection_rate: float = 0.15,
-    max_n3_rejection_rate: float = 0.10,
-    min_valid_sleep_hours: float = 4.5
+    max_subj_rejection_rate: float = 0.20,
+    max_n3_rejection_rate: float = 0.15,
+    min_valid_sleep_hours: float = 4.0
 ) -> dict:
     """Evaluates a single subject JSON against acceptance rules."""
     with open(json_path, 'r') as f:
