@@ -3,8 +3,9 @@
 Preflight Data Sanity Check CLI for Sleep EEG Pipeline.
 
 Performs rigorous pre-training validation on manifest CSVs, .npy tensor files, 
-and metadata JSONs. Detects missing files, corrupted arrays, NaN/Inf values, 
-shape mismatches, flatlined channels, and label anomalies before launching fine-tuning.
+and metadata JSONs. Handles zero-padded channels gracefully while detecting 
+missing files, corrupted arrays, NaN/Inf values, shape mismatches, true 
+flatlined channels, and label anomalies before fine-tuning.
 
 Usage:
     python preflight_check.py --manifest_dir ./manifests --data_dir ./data --expected_channels 64
@@ -55,7 +56,9 @@ class EEGPreflightChecker:
         expected_channels: int = 64,
         sample_check_ratio: float = 0.2,
         flatline_std_threshold: float = 1e-7,
-        extreme_value_threshold: float = 1e4
+        extreme_value_threshold: float = 1e4,
+        allow_zero_padding: bool = True,
+        min_active_channels: int = 1
     ):
         self.manifest_dir = Path(manifest_dir)
         self.data_dir = Path(data_dir) if data_dir else None
@@ -63,6 +66,8 @@ class EEGPreflightChecker:
         self.sample_check_ratio = max(0.01, min(1.0, sample_check_ratio))
         self.flatline_std_threshold = flatline_std_threshold
         self.extreme_value_threshold = extreme_value_threshold
+        self.allow_zero_padding = allow_zero_padding
+        self.min_active_channels = min_active_channels
 
         self.errors_found = 0
         self.warnings_found = 0
@@ -111,7 +116,9 @@ class EEGPreflightChecker:
             "invalid_slices": 0,
             "nan_count": 0,
             "inf_count": 0,
-            "flatlines_detected": 0
+            "flatlines_detected": 0,
+            "padded_channels": 0,
+            "active_channels": self.expected_channels
         }
 
         subject_id = row["subject_id"]
@@ -171,7 +178,7 @@ class EEGPreflightChecker:
                         meta = json.load(f)
 
                     slices_meta = meta.get("slices", [])
-                    if len(slices_meta) != num_windows:
+                    if slices_meta and len(slices_meta) != num_windows:
                         results["warnings"].append(
                             f"Subject {subject_id}: Metadata slice count ({len(slices_meta)}) "
                             f"differs from tensor shape count ({num_windows})."
@@ -179,8 +186,9 @@ class EEGPreflightChecker:
 
                     valid_indices = [
                         s["window_idx"] for s in slices_meta 
-                        if s.get("is_valid", True) and s["window_idx"] < num_windows
-                    ]
+                        if s.get("is_valid", True) and s.get("window_idx", 0) < num_windows
+                    ] if slices_meta else list(range(num_windows))
+
                     results["valid_slices"] = len(valid_indices)
                     results["invalid_slices"] = num_windows - len(valid_indices)
 
@@ -194,7 +202,7 @@ class EEGPreflightChecker:
             try:
                 # Load valid slices into memory for checking
                 sample_slice_indices = valid_indices[:min(len(valid_indices), 20)]
-                arr_chunk = np.array(mmap_arr[sample_slice_indices], dtype=np.float32)
+                arr_chunk = np.array(mmap_arr[sample_slice_indices], dtype=np.float32)  # [Slices, Channels, Time]
 
                 # Check NaN / Inf
                 nans = np.isnan(arr_chunk).sum()
@@ -210,21 +218,44 @@ class EEGPreflightChecker:
                     results["valid"] = False
                     results["inf_count"] += infs
 
-                # Check for extreme scale outliers (e.g. unnormalized microvolts vs z-score)
-                max_val = np.abs(arr_chunk).max()
-                if max_val > self.extreme_value_threshold:
-                    results["warnings"].append(
-                        f"Subject {subject_id}: Extreme unscaled values detected (Max abs value: {max_val:.2f})."
-                    )
+                # Zero-Padded Channels vs. Active Channels Analysis
+                # A channel is zero-padded if all time samples across all inspected windows are identically zero
+                is_channel_zero_padded = np.all(arr_chunk == 0, axis=(0, 2))  # Shape: [Channels]
+                num_padded = int(np.sum(is_channel_zero_padded))
+                num_active = self.expected_channels - num_padded
 
-                # Check standard deviation across time to catch flatlines
-                stds = np.std(arr_chunk, axis=-1)  # Shape: [Slices, Channels]
-                flatlines = np.sum(stds < self.flatline_std_threshold)
-                if flatlines > 0:
-                    results["warnings"].append(
-                        f"Subject {subject_id}: Detected {flatlines} zero-variance/flatlined channel windows."
+                results["padded_channels"] = num_padded
+                results["active_channels"] = num_active
+
+                if not self.allow_zero_padding and num_padded > 0:
+                    results["errors"].append(
+                        f"Subject {subject_id}: Zero-padded channels detected ({num_padded} padded), but --allow_zero_padding is False."
                     )
-                    results["flatlines_detected"] += flatlines
+                    results["valid"] = False
+
+                if num_active < self.min_active_channels:
+                    results["errors"].append(
+                        f"Subject {subject_id}: Insufficient active channels ({num_active} active < min required {self.min_active_channels})."
+                    )
+                    results["valid"] = False
+
+                # Check for extreme scale outliers on ACTIVE channels only
+                if num_active > 0:
+                    active_chunk = arr_chunk[:, ~is_channel_zero_padded, :]
+                    max_val = np.abs(active_chunk).max()
+                    if max_val > self.extreme_value_threshold:
+                        results["warnings"].append(
+                            f"Subject {subject_id}: Extreme unscaled values detected on active channels (Max abs: {max_val:.2f})."
+                        )
+
+                    # Check standard deviation across time to catch flatlines ONLY on active channels
+                    stds = np.std(active_chunk, axis=-1)  # Shape: [Slices, Active_Channels]
+                    flatlines = np.sum(stds < self.flatline_std_threshold)
+                    if flatlines > 0:
+                        results["warnings"].append(
+                            f"Subject {subject_id}: Detected {flatlines} flatlined/zero-variance active channel windows."
+                        )
+                        results["flatlines_detected"] += flatlines
 
             except Exception as e:
                 results["warnings"].append(f"Subject {subject_id}: Deep numerical check failed: {e}")
@@ -244,6 +275,7 @@ class EEGPreflightChecker:
         total_subjects = len(df)
         total_slices = 0
         total_valid_slices = 0
+        total_padded_channels_list = []
         label_counter: Dict[int, int] = {}
 
         # Determine indices for deep numerical array testing
@@ -266,6 +298,9 @@ class EEGPreflightChecker:
             total_slices += subject_res["num_slices"]
             total_valid_slices += subject_res["valid_slices"]
 
+            if is_deep and subject_res["valid"]:
+                total_padded_channels_list.append(subject_res["padded_channels"])
+
             for err in subject_res["errors"]:
                 log_fail(err)
                 self.errors_found += 1
@@ -275,6 +310,7 @@ class EEGPreflightChecker:
                 self.warnings_found += 1
 
         elapsed = time.time() - start_time
+        avg_padded = np.mean(total_padded_channels_list) if total_padded_channels_list else 0.0
 
         # Print Split Summary
         print("\n" + "-" * 45)
@@ -284,6 +320,8 @@ class EEGPreflightChecker:
         print(f"  Total Extracted Slices:    {total_slices:,}")
         print(f"  Usable (Valid) Slices:     {total_valid_slices:,} "
               f"({(total_valid_slices/max(1, total_slices))*100:.1f}%)")
+        print(f"  Avg Active Channels:       {self.expected_channels - avg_padded:.1f} / {self.expected_channels}")
+        print(f"  Avg Zero-Padded Channels:  {avg_padded:.1f} / {self.expected_channels}")
         print(f"  Label Distribution:        {dict(sorted(label_counter.items()))}")
         print(f"  Audit Duration:            {elapsed:.2f}s")
         print("-" * 45)
@@ -311,7 +349,18 @@ def main():
         "--expected_channels",
         type=int,
         default=64,
-        help="Expected number of EEG channels (default: 64)"
+        help="Expected total tensor channel count (default: 64)"
+    )
+    parser.add_argument(
+        "--min_active_channels",
+        type=int,
+        default=1,
+        help="Minimum non-zero active channels required per subject (default: 1)"
+    )
+    parser.add_argument(
+        "--disallow_zero_padding",
+        action="store_true",
+        help="Raise error if any zero-padded channel is detected"
     )
     parser.add_argument(
         "--sample_ratio",
@@ -334,7 +383,9 @@ def main():
         manifest_dir=manifest_dir,
         data_dir=data_dir,
         expected_channels=args.expected_channels,
-        sample_check_ratio=args.sample_ratio
+        sample_check_ratio=args.sample_ratio,
+        allow_zero_padding=not args.disallow_zero_padding,
+        min_active_channels=args.min_active_channels
     )
 
     train_ok = checker.run_check("train_manifest.csv")
