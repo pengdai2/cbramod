@@ -209,7 +209,7 @@ def detect_and_interpolate_bad_channels(
         if not is_spatially_isolated:
             return raw, bad_ch_names, False
 
-    # 3. Interpolate isolated bad channels
+    # 3. Interpolate isolated bad channels (reset_bads=True clears raw.info['bads'] after interpolation)
     if bad_count > 0:
         clean_count = n_recorded - bad_count
         logger.info(
@@ -217,7 +217,7 @@ def detect_and_interpolate_bad_channels(
             f"using {clean_count} clean spatial anchors via spherical splines."
         )
         raw.info['bads'] = bad_ch_names
-        raw.interpolate_bads(reset=True, mode='accurate', verbose=False)
+        raw.interpolate_bads(reset_bads=True, mode='accurate', verbose=False)
         logger.debug("Interpolation successfully applied.")
     else:
         logger.debug("No bad channels detected. All recorded channels are clean.")
@@ -243,7 +243,6 @@ def prepare_clean_raw_eeg(
 
     logger.debug(f"Discovered {len(recorded_eeg_chs)} valid scalp EEG channels.")
 
-    # Modern MNE syntax: replace deprecated raw.pick_channels(...) with raw.pick(...)
     raw_eeg = raw_orig.copy().pick(recorded_eeg_chs)
 
     logger.debug(f"Applying zero-phase FIR bandpass filter ({l_freq} Hz - {h_freq} Hz)...")
@@ -396,8 +395,6 @@ def slice_strategy_a_macro(
     """Strategy A: 30-second continuous macro window slicing with detailed quality logging."""
     sfreq = raw_clean_eeg.info["sfreq"]
     samples_per_window = int(round(window_sec * sfreq))
-    
-    # Modern MNE property: replace non-existent raw.n_samples with raw.n_times
     total_samples = raw_clean_eeg.n_times
     num_windows = total_samples // samples_per_window
 
