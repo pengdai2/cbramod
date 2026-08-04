@@ -6,6 +6,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import mne
+import safetensors
 from torch.utils.data import Dataset
 from mne.datasets.sleep_physionet import age
 

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Production CLI Pipeline for CBraMod with Manifest-based .npy Datasets.
 
@@ -40,6 +39,7 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
     roc_auc_score,
 )
+import safetensors
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, TensorDataset
@@ -194,7 +194,8 @@ class CBraModFeatureExtractor(nn.Module):
     """Backbone extractor that channel-pools [B, C, S, P] -> [B, S, P]."""
     def __init__(self, num_channels: int = 64, emb_dim: int = 200, sfreq: float = 200.0):
         super().__init__()
-        self.backbone = CBraMod(
+        self.backbone = CBraMod.from_pretrained(
+            "braindecode/cbramod-pretrained",
             n_outputs=emb_dim,
             n_chans=num_channels,
             sfreq=sfreq,
@@ -269,7 +270,7 @@ class EmbeddingManager:
                 with torch.amp.autocast(device_type="cuda", enabled=(self.config.use_amp and self.device.type == "cuda")):
                     pooled_feats = extractor(batch_x)
 
-                all_embeddings.append(pooled_feats.cpu())
+                all_embeddings.append(pooled_feats.cpu().float())
                 all_labels.append(batch_y.cpu())
 
         cached_feats = torch.cat(all_embeddings, dim=0)
