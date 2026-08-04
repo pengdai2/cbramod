@@ -1,16 +1,17 @@
+#!/usr/bin/env python3
 """
 Production CLI Pipeline for CBraMod with Manifest-based .npy Datasets.
 
 Usage:
-  # 1. First run (Parses manifest files, extracts backbone embeddings from .npy files, and trains head):
+  # 1. First run (Parses manifest files, extracts backbone embeddings, and trains head):
   python cbramod_manifest_pipeline.py \
       --train-manifest /data/eeg_study/train_manifest.csv \
       --val-manifest /data/eeg_study/val_manifest.csv \
       --data-dir /data/eeg_study/npy_files \
       --num-workers 8
 
-  # 2. Subsequent runs (Auto-detects cached embeddings, skips .npy reading, trains head in seconds):
-  python cbramod_manifest_pipeline.py --head-lr 0.0003 --epochs 25
+  # 2. Subsequent runs (Auto-detects cached embeddings, skips .npy reading, trains head):
+  python cbramod_manifest_pipeline.py --head-lr 0.0003 --epochs 40
 
   # 3. Force re-extraction from .npy files:
   python cbramod_manifest_pipeline.py \
@@ -39,9 +40,9 @@ from sklearn.metrics import (
     precision_recall_fscore_support,
     roc_auc_score,
 )
-import safetensors
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from tqdm import tqdm
 
@@ -78,8 +79,9 @@ class PipelineConfig:
     
     # Hyperparameters
     batch_size: int = 512
-    epochs: int = 30
+    epochs: int = 40
     head_lr: float = 1e-4
+    min_lr: float = 1e-6
     weight_decay: float = 1e-2
     hidden_dim: int = 128
     dropout_prob: float = 0.3
@@ -88,7 +90,7 @@ class PipelineConfig:
     force_extract: bool = False
     num_workers: int = 4
     seed: int = 42
-    early_stopping_patience: int = 7
+    early_stopping_patience: int = 10
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     use_amp: bool = True
 
@@ -106,7 +108,7 @@ class PipelineConfig:
 def parse_cli_args() -> PipelineConfig:
     """Parses command-line arguments into a structured PipelineConfig."""
     parser = argparse.ArgumentParser(
-        description="CBraMod Automated Embedding Extraction from Manifest-Based .npy Datasets",
+        description="CBraMod Automated Embedding Extraction & Probe Fine-Tuning Pipeline",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -120,9 +122,10 @@ def parse_cli_args() -> PipelineConfig:
 
     # Hyperparameters
     hp_group = parser.add_argument_group("Hyperparameters")
-    hp_group.add_argument("--epochs", type=int, default=30, help="Maximum training epochs for linear probe head")
+    hp_group.add_argument("--epochs", type=int, default=40, help="Maximum training epochs for linear probe head")
     hp_group.add_argument("--batch-size", type=int, default=512, help="Batch size for head training and feature extraction")
-    hp_group.add_argument("--head-lr", type=float, default=1e-4, help="Learning rate for the classification head")
+    hp_group.add_argument("--head-lr", type=float, default=1e-4, help="Initial learning rate for the classification head")
+    hp_group.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing scheduler")
     hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay regularizer")
     hp_group.add_argument("--hidden-dim", type=int, default=128, help="Bottleneck linear layer dimension")
     hp_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
@@ -131,7 +134,7 @@ def parse_cli_args() -> PipelineConfig:
     sys_group = parser.add_argument_group("System Controls")
     sys_group.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers for parallel .npy disk reads")
     sys_group.add_argument("--seed", type=int, default=42, help="Random seed for deterministic execution")
-    sys_group.add_argument("--patience", type=int, default=7, help="Early stopping patience (epochs without F1 improvement)")
+    sys_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without F1 improvement)")
     sys_group.add_argument("--num-channels", type=int, default=64, help="Number of EEG input channels")
 
     args = parser.parse_args()
@@ -146,6 +149,7 @@ def parse_cli_args() -> PipelineConfig:
         epochs=args.epochs,
         batch_size=args.batch_size,
         head_lr=args.head_lr,
+        min_lr=args.min_lr,
         weight_decay=args.weight_decay,
         hidden_dim=args.hidden_dim,
         dropout_prob=args.dropout,
@@ -156,7 +160,7 @@ def parse_cli_args() -> PipelineConfig:
 
 
 # =====================================================================
-# 3. LOGGING & UTILITIES
+# 2. LOGGING & UTILITIES
 # =====================================================================
 
 def setup_logger(log_path: Path) -> logging.Logger:
@@ -187,16 +191,15 @@ def seed_everything(seed: int = 42) -> None:
 
 
 # =====================================================================
-# 4. ARCHITECTURES
+# 3. ARCHITECTURES
 # =====================================================================
 
 class CBraModFeatureExtractor(nn.Module):
     """Backbone extractor that channel-pools [B, C, S, P] -> [B, S, P]."""
-    def __init__(self, num_channels: int = 64, emb_dim: int = 200, sfreq: float = 200.0):
+    def __init__(self, num_channels: int = 64, sfreq: float = 200.0):
         super().__init__()
         self.backbone = CBraMod.from_pretrained(
             "braindecode/cbramod-pretrained",
-            n_outputs=emb_dim,
             n_chans=num_channels,
             sfreq=sfreq,
             return_encoder_output=True
@@ -228,7 +231,7 @@ class LinearProbeHead(nn.Module):
 
 
 # =====================================================================
-# 5. EXTRACTION ENGINE
+# 4. EXTRACTION ENGINE
 # =====================================================================
 
 class EmbeddingManager:
@@ -256,7 +259,6 @@ class EmbeddingManager:
         self.logger.info(f"[{split_name.upper()}] Extracting backbone representations to: {output_cache_path}")
         extractor = CBraModFeatureExtractor(
             num_channels=self.config.num_channels,
-            emb_dim=self.config.emb_dim,
             sfreq=self.config.sfreq
         ).to(self.device)
         extractor.eval()
@@ -289,15 +291,30 @@ class EmbeddingManager:
 
 
 # =====================================================================
-# 6. TRAINER ENGINE
+# 5. TRAINER ENGINE WITH SCHEDULING & THRESHOLD OPTIMIZATION
 # =====================================================================
 
 class ProbeTrainer:
-    """Trains classification head directly on cached embeddings."""
+    """Trains classification head with Cosine Annealing and Decision Threshold Optimization."""
     def __init__(self, config: PipelineConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self.device = torch.device(config.device)
+
+    def _find_best_threshold(self, val_targets: np.ndarray, val_probs: np.ndarray) -> Tuple[float, float]:
+        """Sweeps decision thresholds [0.10, 0.90] to find max Macro F1."""
+        best_threshold = 0.5
+        best_f1 = 0.0
+
+        thresholds = np.linspace(0.10, 0.90, 81)
+        for t in thresholds:
+            t_preds = (val_probs[:, 1] >= t).astype(int)
+            _, _, t_f1, _ = precision_recall_fscore_support(val_targets, t_preds, average="macro", zero_division=0)
+            if t_f1 > best_f1:
+                best_f1 = t_f1
+                best_threshold = t
+
+        return best_threshold, best_f1
 
     def train(self, train_cache_path: Path, val_cache_path: Path) -> float:
         self.logger.info("Loading cached feature tensors into RAM...")
@@ -328,22 +345,32 @@ class ProbeTrainer:
 
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = torch.optim.AdamW(head.parameters(), lr=self.config.head_lr, weight_decay=self.config.weight_decay)
+        
+        # Cosine Annealing Learning Rate Scheduler
+        scheduler = CosineAnnealingLR(optimizer, T_max=self.config.epochs, eta_min=self.config.min_lr)
 
         best_val_f1 = 0.0
+        best_threshold = 0.5
         patience_counter = 0
         best_model_path = self.config.cache_dir / self.config.best_head_filename
 
-        self.logger.info(f"Starting Probe Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | Head LR: {self.config.head_lr})")
-        self.logger.info("=" * 80)
+        self.logger.info(
+            f"Starting Probe Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | "
+            f"Head LR: {self.config.head_lr} -> {self.config.min_lr})"
+        )
+        self.logger.info("=" * 110)
 
         for epoch in range(1, self.config.epochs + 1):
             t0 = time.time()
+            current_lr = scheduler.get_last_lr()[0]
 
             # Train Loop
             head.train()
             train_loss, train_correct = 0.0, 0
             for x_b, y_b in train_loader:
-                x_b, y_b = x_b.to(self.device, non_blocking=True), y_b.to(self.device, non_blocking=True)
+                x_b = x_b.to(self.device, non_blocking=True).float()  # Safe float32 conversion
+                y_b = y_b.to(self.device, non_blocking=True)
+
                 optimizer.zero_grad()
                 out = head(x_b)
                 loss = criterion(out, y_b)
@@ -363,7 +390,9 @@ class ProbeTrainer:
 
             with torch.no_grad():
                 for x_b, y_b in val_loader:
-                    x_b, y_b = x_b.to(self.device, non_blocking=True), y_b.to(self.device, non_blocking=True)
+                    x_b = x_b.to(self.device, non_blocking=True).float()  # Safe float32 conversion
+                    y_b = y_b.to(self.device, non_blocking=True)
+
                     out = head(x_b)
                     loss = criterion(out, y_b)
                     probs = torch.softmax(out, dim=1)
@@ -378,25 +407,40 @@ class ProbeTrainer:
             val_targets = np.concatenate(val_targets)
             val_probs = np.concatenate(val_probs)
 
-            # Metrics
+            # Metrics at default 0.5 decision threshold
             val_acc = accuracy_score(val_targets, val_preds)
             bal_acc = balanced_accuracy_score(val_targets, val_preds)
-            _, _, macro_f1, _ = precision_recall_fscore_support(val_targets, val_preds, average="macro", zero_division=0)
+            _, _, std_macro_f1, _ = precision_recall_fscore_support(val_targets, val_preds, average="macro", zero_division=0)
             roc_auc = roc_auc_score(val_targets, val_probs[:, 1]) if self.config.num_classes == 2 else 0.5
+
+            # Decision Threshold Optimization
+            opt_thresh, tuned_macro_f1 = self._find_best_threshold(val_targets, val_probs) if self.config.num_classes == 2 else (0.5, std_macro_f1)
+            
+            # Step Learning Rate Scheduler
+            scheduler.step()
             elapsed = time.time() - t0
 
             log_str = (
-                f"Epoch [{epoch:02d}/{self.config.epochs:02d}] ({elapsed:.2f}s) | "
+                f"Epoch [{epoch:02d}/{self.config.epochs:02d}] ({elapsed:.2f}s) | LR: {current_lr:.2e} | "
                 f"Train Loss: {train_loss:.4f}, Acc: {train_acc*100:.2f}% | "
-                f"Val Loss: {val_loss:.4f}, Acc: {val_acc*100:.2f}%, "
-                f"Macro F1: {macro_f1:.4f}, Bal Acc: {bal_acc*100:.2f}%, AUC: {roc_auc:.4f}"
+                f"Val Loss: {val_loss:.4f}, Acc: {val_acc*100:.2f}%, AUC: {roc_auc:.4f} | "
+                f"F1@0.5: {std_macro_f1:.4f} -> Tuned F1@{opt_thresh:.2f}: {tuned_macro_f1:.4f}"
             )
 
-            # Checkpointing
-            if macro_f1 > best_val_f1:
-                best_val_f1 = macro_f1
+            # Checkpointing based on Tuned Macro F1
+            if tuned_macro_f1 > best_val_f1:
+                best_val_f1 = tuned_macro_f1
+                best_threshold = opt_thresh
                 patience_counter = 0
-                torch.save({"epoch": epoch, "model_state_dict": head.state_dict(), "best_macro_f1": best_val_f1}, best_model_path)
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": head.state_dict(),
+                        "best_macro_f1": best_val_f1,
+                        "optimal_threshold": best_threshold,
+                    },
+                    best_model_path
+                )
                 log_str += f" --> [BEST MODEL SAVED]"
             else:
                 patience_counter += 1
@@ -408,13 +452,13 @@ class ProbeTrainer:
                 self.logger.info(f"Early stopping triggered after {epoch} epochs.")
                 break
 
-        self.logger.info("=" * 80)
-        self.logger.info(f"Training Complete. Best Validation Macro F1: {best_val_f1:.4f}")
+        self.logger.info("=" * 110)
+        self.logger.info(f"Training Complete. Best Validation Macro F1: {best_val_f1:.4f} (at Optimal Threshold: {best_threshold:.2f})")
         return best_val_f1
 
 
 # =====================================================================
-# 7. PIPELINE ORCHESTRATOR
+# 6. PIPELINE ORCHESTRATOR
 # =====================================================================
 
 def main():
@@ -441,7 +485,7 @@ def main():
     else:
         logger.info(f"Found existing cached feature files at '{config.cache_dir}'. Skipping .npy extraction phase.")
 
-    # Phase 2: Fast Head Training
+    # Phase 2: Fast Head Training with Scheduling & Thresholding
     trainer = ProbeTrainer(config, logger)
     trainer.train(train_cache_path, val_cache_path)
 
