@@ -8,6 +8,7 @@ import torch.nn as nn
 import mne
 import safetensors
 from torch.utils.data import Dataset
+from einops.layers.torch import Rearrange
 from mne.datasets.sleep_physionet import age
 
 # Import CBraMod architecture from braindecode if available
@@ -187,22 +188,24 @@ def fetch_and_preprocess_sleep_edf(subject_id: int = 0) -> Tuple[np.ndarray, np.
 
 class CBraModRealWorldBenchmark(nn.Module):
     """CBraMod backbone coupled with a 5-class sleep staging head."""
-    def __init__(self, num_channels: int, num_classes: int = 5):
+    def __init__(self, num_channels: int, num_patches: int = 30, emb_dim: int = 200, head_dim: int = 128, num_classes: int = 5, dropout: float = 0.3):
         super().__init__()
         if HAS_BRAINDECODE:
             self.backbone = CBraMod.from_pretrained(
                 "braindecode/cbramod-pretrained",
-                n_outputs=200,
                 n_chans=num_channels,
                 sfreq=200.0,
                 return_encoder_output=True
             )
+
+            in_features = num_patches * emb_dim
             self.head = nn.Sequential(
-                nn.Flatten(),
-                nn.Linear(num_channels * 30 * 200, 256),
+                Rearrange("b s p -> b (s p)"),
+                nn.LayerNorm(in_features),
+                nn.Linear(in_features, head_dim),
                 nn.ELU(),
-                nn.Dropout(0.3),
-                nn.Linear(256, num_classes)
+                nn.Dropout(p=dropout),
+                nn.Linear(head_dim, num_classes)
             )
         else:
             # Fallback mock architecture if braindecode package is not installed
@@ -218,6 +221,7 @@ class CBraModRealWorldBenchmark(nn.Module):
     def forward(self, x):
         if HAS_BRAINDECODE:
             feats = self.backbone(x)
-            return self.head(feats)
+            pooled_feats = feats.mean(dim=1)
+            return self.head(pooled_feats)
         else:
             return self.head(x)
