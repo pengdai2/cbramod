@@ -1,28 +1,36 @@
 #!/usr/bin/env python3
 """
-Production CLI Pipeline for CBraMod Feature Extraction and Linear Probing.
+Production CLI Pipeline for CBraMod with Manifest-based .npy Datasets.
 
 Usage:
-  # 1. First run (Auto-extracts features, saves cache, then trains head):
-  python cbramod_cli_pipeline.py --train-raw /path/to/train_eeg.pt --val-raw /path/to/val_eeg.pt
+  # 1. First run (Parses manifest files, extracts backbone embeddings from .npy files, and trains head):
+  python cbramod_manifest_pipeline.py \
+      --train-manifest /data/eeg_study/train_manifest.csv \
+      --val-manifest /data/eeg_study/val_manifest.csv \
+      --data-dir /data/eeg_study/npy_files \
+      --num-workers 8
 
-  # 2. Subsequent runs (Detects cache automatically, skips extraction, trains head in seconds):
-  python cbramod_cli_pipeline.py --head-lr 0.0003 --epochs 25 --batch-size 1024
+  # 2. Subsequent runs (Auto-detects cached embeddings, skips .npy reading, trains head in seconds):
+  python cbramod_manifest_pipeline.py --head-lr 0.0003 --epochs 25
 
-  # 3. Force re-extraction (Overwrites existing cache):
-  python cbramod_cli_pipeline.py --train-raw /path/to/train_eeg.pt --val-raw /path/to/val_eeg.pt --force-extract
+  # 3. Force re-extraction from .npy files:
+  python cbramod_manifest_pipeline.py \
+      --train-manifest /data/eeg_study/train_manifest.csv \
+      --val-manifest /data/eeg_study/val_manifest.csv \
+      --force-extract
 """
 
 import argparse
-from dataclasses import dataclass, field
+import csv
+from dataclasses import dataclass
 import gc
+import json
 import logging
-import os
 from pathlib import Path
 import random
 import sys
 import time
-from typing import Dict, Tuple, Optional
+from typing import Dict, List, Optional, Tuple
 
 from einops.layers.torch import Rearrange
 import numpy as np
@@ -34,7 +42,7 @@ from sklearn.metrics import (
 )
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 from tqdm import tqdm
 
 try:
@@ -44,16 +52,16 @@ except ImportError:
 
 
 # =====================================================================
-# 1. CONFIGURATION & CLI ARGUMENT PARSER
+# 1. CONFIGURATION & CLI PARSER
 # =====================================================================
 
 @dataclass
 class PipelineConfig:
     """Dataclass storing pipeline execution state."""
-    # Data Paths
     cache_dir: Path
-    train_raw_path: Optional[Path] = None
-    val_raw_path: Optional[Path] = None
+    train_manifest_path: Optional[Path] = None
+    val_manifest_path: Optional[Path] = None
+    data_dir: Optional[Path] = None
     train_cache_name: str = "cached_train_embeddings.pt"
     val_cache_name: str = "cached_val_embeddings.pt"
     best_head_filename: str = "cbramod_head_best.pt"
@@ -76,6 +84,7 @@ class PipelineConfig:
     
     # Control Flags
     force_extract: bool = False
+    num_workers: int = 4
     seed: int = 42
     early_stopping_patience: int = 7
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -84,23 +93,26 @@ class PipelineConfig:
     def __post_init__(self):
         self.cache_dir = Path(self.cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        if self.train_raw_path:
-            self.train_raw_path = Path(self.train_raw_path)
-        if self.val_raw_path:
-            self.val_raw_path = Path(self.val_raw_path)
+        if self.train_manifest_path:
+            self.train_manifest_path = Path(self.train_manifest_path)
+        if self.val_manifest_path:
+            self.val_manifest_path = Path(self.val_manifest_path)
+        if self.data_dir:
+            self.data_dir = Path(self.data_dir)
 
 
 def parse_cli_args() -> PipelineConfig:
     """Parses command-line arguments into a structured PipelineConfig."""
     parser = argparse.ArgumentParser(
-        description="CBraMod Automated Embedding Extraction & Fast Linear Probing",
+        description="CBraMod Automated Embedding Extraction from Manifest-Based .npy Datasets",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    # Data Source Arguments
+    # Manifest & Data Paths
     data_group = parser.add_argument_group("Data Sources")
-    data_group.add_argument("--train-raw", type=str, default=None, help="Path to raw training dataset (.pt or .npz container)")
-    data_group.add_argument("--val-raw", type=str, default=None, help="Path to raw validation dataset (.pt or .npz container)")
+    data_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON/JSONL)")
+    data_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON/JSONL)")
+    data_group.add_argument("--data-dir", type=str, default=None, help="Root directory containing .npy files (if paths in manifest are relative)")
     data_group.add_argument("--cache-dir", type=str, default="/opt/cbra_data/checkpoints", help="Directory for cached embeddings & checkpoints")
     data_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings even if cache exists")
 
@@ -113,8 +125,9 @@ def parse_cli_args() -> PipelineConfig:
     hp_group.add_argument("--hidden-dim", type=int, default=128, help="Bottleneck linear layer dimension")
     hp_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
 
-    # System & Execution
+    # System Controls
     sys_group = parser.add_argument_group("System Controls")
+    sys_group.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers for parallel .npy disk reads")
     sys_group.add_argument("--seed", type=int, default=42, help="Random seed for deterministic execution")
     sys_group.add_argument("--patience", type=int, default=7, help="Early stopping patience (epochs without F1 improvement)")
     sys_group.add_argument("--num-channels", type=int, default=64, help="Number of EEG input channels")
@@ -123,9 +136,11 @@ def parse_cli_args() -> PipelineConfig:
 
     return PipelineConfig(
         cache_dir=Path(args.cache_dir),
-        train_raw_path=Path(args.train_raw) if args.train_raw else None,
-        val_raw_path=Path(args.val_raw) if args.val_raw else None,
+        train_manifest_path=Path(args.train_manifest) if args.train_manifest else None,
+        val_manifest_path=Path(args.val_manifest) if args.val_manifest else None,
+        data_dir=Path(args.data_dir) if args.data_dir else None,
         force_extract=args.force_extract,
+        num_workers=args.num_workers,
         epochs=args.epochs,
         batch_size=args.batch_size,
         head_lr=args.head_lr,
@@ -139,11 +154,103 @@ def parse_cli_args() -> PipelineConfig:
 
 
 # =====================================================================
-# 2. LOGGING & UTILITIES
+# 2. MANIFEST DATASET LOADER
+# =====================================================================
+
+class ManifestEEGDataset(Dataset):
+    """
+    PyTorch Dataset that reads a manifest file and dynamically loads 
+    individual .npy EEG files from disk.
+    
+    Supports CSV, TSV, JSON, and JSONL formats.
+    Auto-detects common column names for file paths and labels.
+    """
+    PATH_KEYS = ["path", "file_path", "filepath", "npy_path", "filename", "file"]
+    LABEL_KEYS = ["label", "target", "class", "category", "y"]
+
+    def __init__(self, manifest_path: Path, data_dir: Optional[Path] = None):
+        self.manifest_path = Path(manifest_path)
+        self.data_dir = Path(data_dir) if data_dir else self.manifest_path.parent
+
+        if not self.manifest_path.exists():
+            raise FileNotFoundError(f"Manifest file not found at: {self.manifest_path}")
+
+        self.samples: List[Tuple[Path, int]] = self._parse_manifest()
+
+    def _parse_manifest(self) -> List[Tuple[Path, int]]:
+        samples = []
+        suffix = self.manifest_path.suffix.lower()
+
+        if suffix in [".csv", ".tsv", ".txt"]:
+            delimiter = "\t" if suffix == ".tsv" else ","
+            with open(self.manifest_path, mode="r", encoding="utf-8") as f:
+                reader = csv.DictReader(f, delimiter=delimiter)
+                headers = reader.fieldnames or []
+                
+                path_key = self._find_key(headers, self.PATH_KEYS, "path")
+                label_key = self._find_key(headers, self.LABEL_KEYS, "label")
+
+                for row in reader:
+                    npy_rel_path = row[path_key].strip()
+                    label = int(row[label_key])
+                    full_path = self._resolve_path(npy_rel_path)
+                    samples.append((full_path, label))
+
+        elif suffix in [".json", ".jsonl"]:
+            with open(self.manifest_path, mode="r", encoding="utf-8") as f:
+                if suffix == ".jsonl":
+                    records = [json.loads(line) for line in f if line.strip()]
+                else:
+                    records = json.load(f)
+
+                if len(records) > 0:
+                    sample_keys = list(records[0].keys())
+                    path_key = self._find_key(sample_keys, self.PATH_KEYS, "path")
+                    label_key = self._find_key(sample_keys, self.LABEL_KEYS, "label")
+
+                    for rec in records:
+                        full_path = self._resolve_path(str(rec[path_key]))
+                        label = int(rec[label_key])
+                        samples.append((full_path, label))
+        else:
+            raise ValueError(f"Unsupported manifest extension '{suffix}'. Expected CSV, TSV, JSON, or JSONL.")
+
+        return samples
+
+    def _find_key(self, available_keys: List[str], target_keys: List[str], key_type: str) -> str:
+        for k in available_keys:
+            if k.lower() in target_keys:
+                return k
+        raise KeyError(
+            f"Could not automatically identify {key_type} column in manifest header {available_keys}. "
+            f"Expected one of: {target_keys}"
+        )
+
+    def _resolve_path(self, raw_path_str: str) -> Path:
+        p = Path(raw_path_str)
+        if p.is_absolute():
+            return p
+        return self.data_dir / p
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
+        file_path, label = self.samples[idx]
+        
+        # Load .npy array from disk
+        arr = np.load(file_path)
+        tensor_x = torch.from_numpy(arr).float()
+        
+        return tensor_x, label
+
+
+# =====================================================================
+# 3. LOGGING & UTILITIES
 # =====================================================================
 
 def setup_logger(log_path: Path) -> logging.Logger:
-    """Configures structured logging to stdout and log file."""
+    """Configures structured logging to stdout and file."""
     logger = logging.getLogger("CBraModPipeline")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
@@ -169,31 +276,8 @@ def seed_everything(seed: int = 42) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def load_raw_eeg_dataset(file_path: Path) -> TensorDataset:
-    """Loads raw sliced EEG tensors and labels from standard PyTorch or NumPy files."""
-    if not file_path.exists():
-        raise FileNotFoundError(f"Raw data file not found at: {file_path}")
-
-    if file_path.suffix == ".pt":
-        data = torch.load(file_path, map_location="cpu")
-        if isinstance(data, dict):
-            x, y = data["x"], data["y"]
-        elif isinstance(data, (tuple, list)):
-            x, y = data[0], data[1]
-        else:
-            raise ValueError(f"Unrecognized data structure inside {file_path}")
-    elif file_path.suffix == ".npz":
-        container = np.load(file_path)
-        x = torch.from_numpy(container["x"]).float()
-        y = torch.from_numpy(container["y"]).long()
-    else:
-        raise ValueError(f"Unsupported file format '{file_path.suffix}'. Expected .pt or .npz")
-
-    return TensorDataset(x, y)
-
-
 # =====================================================================
-# 3. ARCHITECTURES
+# 4. ARCHITECTURES
 # =====================================================================
 
 class CBraModFeatureExtractor(nn.Module):
@@ -233,21 +317,30 @@ class LinearProbeHead(nn.Module):
 
 
 # =====================================================================
-# 4. EXTRACTION ENGINE
+# 5. EXTRACTION ENGINE
 # =====================================================================
 
 class EmbeddingManager:
-    """Manages feature extraction and caching."""
+    """Manages feature extraction from manifest-defined .npy files."""
     def __init__(self, config: PipelineConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self.device = torch.device(config.device)
 
-    def extract_and_cache(self, raw_data_path: Path, output_cache_path: Path, split_name: str) -> None:
-        """Runs raw EEG through frozen CBraMod backbone and writes pooled vectors to disk."""
-        self.logger.info(f"[{split_name.upper()}] Loading raw data from: {raw_data_path}")
-        dataset = load_raw_eeg_dataset(raw_data_path)
-        loader = DataLoader(dataset, batch_size=self.config.batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    def extract_and_cache(self, manifest_path: Path, output_cache_path: Path, split_name: str) -> None:
+        """Reads .npy files via ManifestEEGDataset, extracts features, and saves unified tensor."""
+        self.logger.info(f"[{split_name.upper()}] Initializing manifest dataset from: {manifest_path}")
+        dataset = ManifestEEGDataset(manifest_path=manifest_path, data_dir=self.config.data_dir)
+        self.logger.info(f"[{split_name.upper()}] Successfully parsed {len(dataset):,} .npy references.")
+
+        loader = DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
+            prefetch_factor=2 if self.config.num_workers > 0 else None
+        )
 
         self.logger.info(f"[{split_name.upper()}] Extracting backbone representations to: {output_cache_path}")
         extractor = CBraModFeatureExtractor(
@@ -281,11 +374,11 @@ class EmbeddingManager:
 
         elapsed = time.time() - start_time
         file_size_mb = output_cache_path.stat().st_size / (1024 * 1024)
-        self.logger.info(f"✓ [{split_name.upper()}] Extraction complete ({elapsed:.1f}s) | Samples: {len(cached_feats):,} | Size: {file_size_mb:.2f} MB")
+        self.logger.info(f"✓ [{split_name.upper()}] Extraction complete ({elapsed:.1f}s) | Samples: {len(cached_feats):,} | Cache Size: {file_size_mb:.2f} MB")
 
 
 # =====================================================================
-# 5. TRAINER ENGINE
+# 6. TRAINER ENGINE
 # =====================================================================
 
 class ProbeTrainer:
@@ -296,7 +389,7 @@ class ProbeTrainer:
         self.device = torch.device(config.device)
 
     def train(self, train_cache_path: Path, val_cache_path: Path) -> float:
-        self.logger.info("Loading cached feature tensors into memory...")
+        self.logger.info("Loading cached feature tensors into RAM...")
         train_data = torch.load(train_cache_path, map_location="cpu")
         val_data = torch.load(val_cache_path, map_location="cpu")
 
@@ -329,13 +422,13 @@ class ProbeTrainer:
         patience_counter = 0
         best_model_path = self.config.cache_dir / self.config.best_head_filename
 
-        self.logger.info(f"Starting Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | Head LR: {self.config.head_lr})")
+        self.logger.info(f"Starting Probe Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | Head LR: {self.config.head_lr})")
         self.logger.info("=" * 80)
 
         for epoch in range(1, self.config.epochs + 1):
             t0 = time.time()
 
-            # Train
+            # Train Loop
             head.train()
             train_loss, train_correct = 0.0, 0
             for x_b, y_b in train_loader:
@@ -352,7 +445,7 @@ class ProbeTrainer:
             train_acc = train_correct / len(train_ds)
             train_loss /= len(train_ds)
 
-            # Evaluate
+            # Evaluate Loop
             head.eval()
             val_loss = 0.0
             val_preds, val_targets, val_probs = [], [], []
@@ -374,7 +467,7 @@ class ProbeTrainer:
             val_targets = np.concatenate(val_targets)
             val_probs = np.concatenate(val_probs)
 
-            # Metrics Calculation
+            # Metrics
             val_acc = accuracy_score(val_targets, val_preds)
             bal_acc = balanced_accuracy_score(val_targets, val_preds)
             _, _, macro_f1, _ = precision_recall_fscore_support(val_targets, val_preds, average="macro", zero_division=0)
@@ -410,7 +503,7 @@ class ProbeTrainer:
 
 
 # =====================================================================
-# 6. PIPELINE ORCHESTRATOR
+# 7. PIPELINE ORCHESTRATOR
 # =====================================================================
 
 def main():
@@ -427,17 +520,17 @@ def main():
     if not cache_exists or config.force_extract:
         logger.info("Cached embeddings not found or --force-extract specified. Initializing Feature Extraction Phase...")
 
-        if not config.train_raw_path or not config.val_raw_path:
-            logger.error("Missing raw dataset paths! Please provide --train-raw and --val-raw to perform feature extraction.")
+        if not config.train_manifest_path or not config.val_manifest_path:
+            logger.error("Missing manifest paths! Please provide --train-manifest and --val-manifest to extract features.")
             sys.exit(1)
 
         extractor_mgr = EmbeddingManager(config, logger)
-        extractor_mgr.extract_and_cache(config.train_raw_path, train_cache_path, split_name="train")
-        extractor_mgr.extract_and_cache(config.val_raw_path, val_cache_path, split_name="val")
+        extractor_mgr.extract_and_cache(config.train_manifest_path, train_cache_path, split_name="train")
+        extractor_mgr.extract_and_cache(config.val_manifest_path, val_cache_path, split_name="val")
     else:
-        logger.info(f"Found existing cached feature files at '{config.cache_dir}'. Skipping backbone extraction.")
+        logger.info(f"Found existing cached feature files at '{config.cache_dir}'. Skipping .npy extraction phase.")
 
-    # Phase 2: Train Linear Probe
+    # Phase 2: Fast Head Training
     trainer = ProbeTrainer(config, logger)
     trainer.train(train_cache_path, val_cache_path)
 
