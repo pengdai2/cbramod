@@ -1,6 +1,7 @@
 from typing import List, Tuple, Optional, Union
 from pathlib import Path
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import mne
