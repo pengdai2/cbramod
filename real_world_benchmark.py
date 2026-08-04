@@ -189,7 +189,8 @@ class CBraModRealWorldBenchmark(nn.Module):
     def __init__(self, num_channels: int, num_classes: int = 5):
         super().__init__()
         if HAS_BRAINDECODE:
-            self.backbone = CBraMod(
+            self.backbone = CBraMod.from_pretrained(
+                "braindecode/cbramod-pretrained",
                 n_outputs=200,
                 n_chans=num_channels,
                 sfreq=200.0,
