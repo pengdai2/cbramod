@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 Production CLI Pipeline for CBraMod with Manifest-based .npy Datasets.
+Supports Window-Level Probe Training & Subject-Level Multi-Strategy Pooling Evaluation.
 
 Usage:
-  # 1. First run (Parses manifest files, extracts backbone embeddings, and trains head):
+  # 1. First run (Extracts embeddings & performs window training with subject-level validation):
   python cbramod_manifest_pipeline.py \
       --train-manifest /data/eeg_study/train_manifest.csv \
       --val-manifest /data/eeg_study/val_manifest.csv \
       --data-dir /data/eeg_study/npy_files \
       --num-workers 8
 
-  # 2. Subsequent runs (Auto-detects cached embeddings, skips .npy reading, trains head):
-  python cbramod_manifest_pipeline.py --head-lr 0.0003 --epochs 40
+  # 2. Subsequent runs (Uses cached embeddings, trains head with custom primary pooling):
+  python cbramod_manifest_pipeline.py --head-lr 0.0003 --epochs 40 --primary-pooling p85_score
 
   # 3. Force re-extraction from .npy files:
   python cbramod_manifest_pipeline.py \
@@ -21,7 +22,6 @@ Usage:
 """
 
 import argparse
-import csv
 from dataclasses import dataclass
 import gc
 import json
@@ -30,15 +30,20 @@ from pathlib import Path
 import random
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from einops.layers.torch import Rearrange
 import numpy as np
+import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
+    classification_report,
+    confusion_matrix,
+    f1_score,
     precision_recall_fscore_support,
     roc_auc_score,
+    roc_curve,
 )
 import torch
 import torch.nn as nn
@@ -77,6 +82,11 @@ class PipelineConfig:
     emb_dim: int = 200
     num_classes: int = 2
     
+    # Pooling & Threshold Hyperparameters
+    primary_pooling: str = "p85_score"
+    top_percentile: float = 0.10
+    t_window: float = 0.60
+    
     # Hyperparameters
     batch_size: int = 512
     epochs: int = 40
@@ -114,27 +124,40 @@ def parse_cli_args() -> PipelineConfig:
 
     # Manifest & Data Paths
     data_group = parser.add_argument_group("Data Sources")
-    data_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON/JSONL)")
-    data_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON/JSONL)")
-    data_group.add_argument("--data-dir", type=str, default=None, help="Root directory containing .npy files (if paths in manifest are relative)")
+    data_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON)")
+    data_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON)")
+    data_group.add_argument("--data-dir", type=str, default=None, help="Root directory containing .npy files")
     data_group.add_argument("--cache-dir", type=str, default="/opt/cbra_data/checkpoints", help="Directory for cached embeddings & checkpoints")
-    data_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings even if cache exists")
+    data_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
+
+    # Pooling Configurations
+    pool_group = parser.add_argument_group("Subject-Level Pooling Options")
+    pool_group.add_argument(
+        "--primary-pooling", 
+        type=str, 
+        default="p85_score", 
+        choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"],
+        help="Primary pooling strategy used for early stopping and model selection"
+    )
+    pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio for top-K pooling methods")
+    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for pathology burden ratio")
 
     # Hyperparameters
     hp_group = parser.add_argument_group("Hyperparameters")
     hp_group.add_argument("--epochs", type=int, default=40, help="Maximum training epochs for linear probe head")
-    hp_group.add_argument("--batch-size", type=int, default=512, help="Batch size for head training and feature extraction")
-    hp_group.add_argument("--head-lr", type=float, default=1e-4, help="Initial learning rate for the classification head")
+    hp_group.add_argument("--batch-size", type=int, default=512, help="Batch size for training and feature extraction")
+    hp_group.add_argument("--head-lr", type=float, default=1e-4, help="Initial learning rate for classification head")
     hp_group.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing scheduler")
     hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay regularizer")
     hp_group.add_argument("--hidden-dim", type=int, default=128, help="Bottleneck linear layer dimension")
     hp_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
+    hp_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
 
     # System Controls
     sys_group = parser.add_argument_group("System Controls")
-    sys_group.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers for parallel .npy disk reads")
+    sys_group.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers for disk reads")
     sys_group.add_argument("--seed", type=int, default=42, help="Random seed for deterministic execution")
-    sys_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without F1 improvement)")
+    sys_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without Subject F1 improvement)")
     sys_group.add_argument("--num-channels", type=int, default=64, help="Number of EEG input channels")
 
     args = parser.parse_args()
@@ -145,6 +168,9 @@ def parse_cli_args() -> PipelineConfig:
         val_manifest_path=Path(args.val_manifest) if args.val_manifest else None,
         data_dir=Path(args.data_dir) if args.data_dir else None,
         force_extract=args.force_extract,
+        primary_pooling=args.primary_pooling,
+        top_percentile=args.top_percentile,
+        t_window=args.t_window,
         num_workers=args.num_workers,
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -156,6 +182,7 @@ def parse_cli_args() -> PipelineConfig:
         seed=args.seed,
         early_stopping_patience=args.patience,
         num_channels=args.num_channels,
+        num_classes=args.num_classes,
     )
 
 
@@ -191,7 +218,62 @@ def seed_everything(seed: int = 42) -> None:
 
 
 # =====================================================================
-# 3. ARCHITECTURES
+# 3. POOLING FUNCTIONS (BINARY & MULTI-CLASS)
+# =====================================================================
+
+def compute_pooled_scores(
+    window_probs: np.ndarray,
+    method: str = "p85_score",
+    top_percentile: float = 0.10,
+    t_window: float = 0.60
+) -> Union[float, np.ndarray]:
+    """
+    Aggregates window probabilities into subject-level class scores.
+    Supports 1D arrays (binary) and 2D matrices [Num_Windows, Num_Classes].
+    """
+    if len(window_probs) == 0:
+        return 0.0 if window_probs.ndim == 1 else np.array([])
+
+    is_1d = (window_probs.ndim == 1)
+    N = len(window_probs)
+    k_len = max(1, int(np.ceil(N * top_percentile)))
+
+    if method == "p85_score":
+        if is_1d:
+            return float(np.percentile(window_probs, 85))
+        return np.percentile(window_probs, 85, axis=0)
+
+    elif method == "top_10_mean":
+        if is_1d:
+            sorted_p = np.sort(window_probs)[::-1]
+            return float(np.mean(sorted_p[:k_len]))
+        sorted_p = np.sort(window_probs, axis=0)[::-1, :]
+        return np.mean(sorted_p[:k_len, :], axis=0)
+
+    elif method == "trimmed_top_10":
+        skip = int(N * 0.02)
+        if is_1d:
+            sorted_p = np.sort(window_probs)[::-1]
+            return float(np.mean(sorted_p[skip : skip + k_len]))
+        sorted_p = np.sort(window_probs, axis=0)[::-1, :]
+        return np.mean(sorted_p[skip : skip + k_len, :], axis=0)
+
+    elif method == "burden_ratio":
+        if is_1d:
+            return float(np.mean(window_probs >= t_window))
+        dominant_class = np.argmax(window_probs, axis=1)
+        K = window_probs.shape[1]
+        scores = np.zeros(K, dtype=np.float64)
+        for c in range(K):
+            scores[c] = np.mean((dominant_class == c) & (window_probs[:, c] >= t_window))
+        return scores
+
+    else:
+        raise ValueError(f"Unsupported pooling method: {method}")
+
+
+# =====================================================================
+# 4. ARCHITECTURES
 # =====================================================================
 
 class CBraModFeatureExtractor(nn.Module):
@@ -231,21 +313,28 @@ class LinearProbeHead(nn.Module):
 
 
 # =====================================================================
-# 4. EXTRACTION ENGINE
+# 5. EMBEDDING EXTRACTION ENGINE WITH SUBJECT ID TRACKING
 # =====================================================================
 
 class EmbeddingManager:
-    """Manages feature extraction from manifest-defined .npy files."""
+    """Manages feature extraction from manifest .npy files and preserves subject IDs."""
     def __init__(self, config: PipelineConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self.device = torch.device(config.device)
 
     def extract_and_cache(self, manifest_path: Path, output_cache_path: Path, split_name: str) -> None:
-        """Reads .npy files via RealSleepEEGDataset, extracts features, and saves unified tensor."""
+        """Reads .npy files, extracts backbone embeddings, and caches feats + labels + subject_ids."""
         self.logger.info(f"[{split_name.upper()}] Initializing manifest dataset from: {manifest_path}")
         dataset = RealSleepEEGDataset(manifest_csv=manifest_path, data_dir=self.config.data_dir)
         self.logger.info(f"[{split_name.upper()}] Successfully parsed {len(dataset):,} .npy references.")
+
+        # Extract subject IDs from manifest
+        df = pd.read_csv(manifest_path)
+        if "subject_id" in df.columns:
+            subject_ids = df["subject_id"].astype(str).tolist()
+        else:
+            subject_ids = [Path(p).stem for p in df["npy_path"]]
 
         loader = DataLoader(
             dataset,
@@ -278,7 +367,11 @@ class EmbeddingManager:
         cached_feats = torch.cat(all_embeddings, dim=0)
         cached_labels = torch.cat(all_labels, dim=0)
 
-        torch.save({"feats": cached_feats, "labels": cached_labels}, output_cache_path)
+        torch.save({
+            "feats": cached_feats, 
+            "labels": cached_labels,
+            "subject_ids": subject_ids
+        }, output_cache_path)
 
         del extractor, dataset, loader, all_embeddings, all_labels
         gc.collect()
@@ -291,30 +384,104 @@ class EmbeddingManager:
 
 
 # =====================================================================
-# 5. TRAINER ENGINE WITH SCHEDULING & THRESHOLD OPTIMIZATION
+# 6. TRAINER ENGINE WITH WINDOW TRAINING & SUBJECT POOLING VAL
 # =====================================================================
 
 class ProbeTrainer:
-    """Trains classification head with Cosine Annealing and Decision Threshold Optimization."""
+    """Trains head on window instances while evaluating and tuning thresholds on subject-level pooled scores."""
     def __init__(self, config: PipelineConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self.device = torch.device(config.device)
 
-    def _find_best_threshold(self, val_targets: np.ndarray, val_probs: np.ndarray) -> Tuple[float, float]:
-        """Sweeps decision thresholds [0.10, 0.90] to find max Macro F1."""
-        best_threshold = 0.5
-        best_f1 = 0.0
+    def _evaluate_subject_pooling(
+        self, 
+        val_probs: np.ndarray, 
+        val_targets: np.ndarray, 
+        val_subject_ids: List[str]
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Groups window probabilities by subject, applies all 4 pooling strategies, 
+        and performs operating threshold tuning for binary classification or max score for multi-class.
+        """
+        df_val = pd.DataFrame({
+            "subject_id": val_subject_ids,
+            "label": val_targets
+        })
+        
+        strategies = ["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"]
+        unique_subjects = df_val["subject_id"].unique()
+        
+        # Aggregate pooled scores per subject
+        subject_data = {strat: [] for strat in strategies}
+        subject_labels = []
 
-        thresholds = np.linspace(0.10, 0.90, 81)
-        for t in thresholds:
-            t_preds = (val_probs[:, 1] >= t).astype(int)
-            _, _, t_f1, _ = precision_recall_fscore_support(val_targets, t_preds, average="macro", zero_division=0)
-            if t_f1 > best_f1:
-                best_f1 = t_f1
-                best_threshold = t
+        for subj in unique_subjects:
+            idx = np.where(np.array(val_subject_ids) == subj)[0]
+            subj_probs = val_probs[idx]
+            subj_gt = val_targets[idx[0]]
+            subject_labels.append(subj_gt)
 
-        return best_threshold, best_f1
+            for strat in strategies:
+                if self.config.num_classes == 2:
+                    score = compute_pooled_scores(
+                        subj_probs[:, 1], 
+                        method=strat, 
+                        top_percentile=self.config.top_percentile, 
+                        t_window=self.config.t_window
+                    )
+                else:
+                    score = compute_pooled_scores(
+                        subj_probs, 
+                        method=strat, 
+                        top_percentile=self.config.top_percentile, 
+                        t_window=self.config.t_window
+                    )
+                subject_data[strat].append(score)
+
+        subject_labels = np.array(subject_labels)
+        results = {}
+
+        # Strategy evaluation and threshold optimization
+        for strat in strategies:
+            scores = np.array(subject_data[strat])
+            
+            if self.config.num_classes == 2:
+                # Binary threshold sweep to maximize Macro F1 on Subject predictions
+                best_t = 0.5
+                best_f1 = 0.0
+                thresholds = np.linspace(0.01, 0.99, 99)
+                
+                for t in thresholds:
+                    preds = (scores >= t).astype(int)
+                    f1 = f1_score(subject_labels, preds, average="macro", zero_division=0)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_t = t
+                
+                final_preds = (scores >= best_t).astype(int)
+                acc = accuracy_score(subject_labels, final_preds)
+                roc_auc = roc_auc_score(subject_labels, scores) if len(np.unique(subject_labels)) > 1 else 0.5
+
+                results[strat] = {
+                    "subject_macro_f1": best_f1,
+                    "optimal_threshold": float(best_t),
+                    "subject_accuracy": acc,
+                    "roc_auc": roc_auc
+                }
+            else:
+                # Multi-class argmax selection
+                preds = np.argmax(scores, axis=1)
+                macro_f1 = f1_score(subject_labels, preds, average="macro", zero_division=0)
+                acc = accuracy_score(subject_labels, preds)
+                results[strat] = {
+                    "subject_macro_f1": macro_f1,
+                    "optimal_threshold": 0.5,
+                    "subject_accuracy": acc,
+                    "roc_auc": 0.5
+                }
+
+        return results
 
     def train(self, train_cache_path: Path, val_cache_path: Path) -> float:
         self.logger.info("Loading cached feature tensors into RAM...")
@@ -327,7 +494,9 @@ class ProbeTrainer:
         train_loader = DataLoader(train_ds, batch_size=self.config.batch_size, shuffle=True, num_workers=2, pin_memory=True)
         val_loader = DataLoader(val_ds, batch_size=self.config.batch_size, shuffle=False, num_workers=2, pin_memory=True)
 
-        # Inverse Class Weighting
+        val_subject_ids = val_data.get("subject_ids", [str(i) for i in range(len(val_ds))])
+
+        # Inverse Class Weighting for Loss Function
         labels_np = train_data["labels"].numpy()
         class_counts = np.bincount(labels_np, minlength=self.config.num_classes)
         class_weights = torch.tensor(
@@ -345,30 +514,28 @@ class ProbeTrainer:
 
         criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = torch.optim.AdamW(head.parameters(), lr=self.config.head_lr, weight_decay=self.config.weight_decay)
-        
-        # Cosine Annealing Learning Rate Scheduler
         scheduler = CosineAnnealingLR(optimizer, T_max=self.config.epochs, eta_min=self.config.min_lr)
 
-        best_val_f1 = 0.0
-        best_threshold = 0.5
+        best_primary_f1 = 0.0
+        best_thresholds = {}
         patience_counter = 0
         best_model_path = self.config.cache_dir / self.config.best_head_filename
 
         self.logger.info(
             f"Starting Probe Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | "
-            f"Head LR: {self.config.head_lr} -> {self.config.min_lr})"
+            f"Primary Pooling: {self.config.primary_pooling})"
         )
-        self.logger.info("=" * 110)
+        self.logger.info("=" * 125)
 
         for epoch in range(1, self.config.epochs + 1):
             t0 = time.time()
             current_lr = scheduler.get_last_lr()[0]
 
-            # Train Loop
+            # 1. Window-Level Training Loop
             head.train()
             train_loss, train_correct = 0.0, 0
             for x_b, y_b in train_loader:
-                x_b = x_b.to(self.device, non_blocking=True).float()  # Safe float32 conversion
+                x_b = x_b.to(self.device, non_blocking=True).float()
                 y_b = y_b.to(self.device, non_blocking=True)
 
                 optimizer.zero_grad()
@@ -383,14 +550,14 @@ class ProbeTrainer:
             train_acc = train_correct / len(train_ds)
             train_loss /= len(train_ds)
 
-            # Evaluate Loop
+            # 2. Window-Level Inference on Validation
             head.eval()
             val_loss = 0.0
             val_preds, val_targets, val_probs = [], [], []
 
             with torch.no_grad():
                 for x_b, y_b in val_loader:
-                    x_b = x_b.to(self.device, non_blocking=True).float()  # Safe float32 conversion
+                    x_b = x_b.to(self.device, non_blocking=True).float()
                     y_b = y_b.to(self.device, non_blocking=True)
 
                     out = head(x_b)
@@ -403,45 +570,45 @@ class ProbeTrainer:
                     val_probs.append(probs.cpu().numpy())
 
             val_loss /= len(val_ds)
-            val_preds = np.concatenate(val_preds)
             val_targets = np.concatenate(val_targets)
             val_probs = np.concatenate(val_probs)
 
-            # Metrics at default 0.5 decision threshold
-            val_acc = accuracy_score(val_targets, val_preds)
-            bal_acc = balanced_accuracy_score(val_targets, val_preds)
-            _, _, std_macro_f1, _ = precision_recall_fscore_support(val_targets, val_preds, average="macro", zero_division=0)
-            roc_auc = roc_auc_score(val_targets, val_probs[:, 1]) if self.config.num_classes == 2 else 0.5
-
-            # Decision Threshold Optimization
-            opt_thresh, tuned_macro_f1 = self._find_best_threshold(val_targets, val_probs) if self.config.num_classes == 2 else (0.5, std_macro_f1)
+            # 3. Subject-Level Multi-Strategy Pooling & Threshold Calibration
+            pooling_results = self._evaluate_subject_pooling(val_probs, val_targets, val_subject_ids)
             
-            # Step Learning Rate Scheduler
+            primary_metrics = pooling_results[self.config.primary_pooling]
+            primary_f1 = primary_metrics["subject_macro_f1"]
+            primary_t = primary_metrics["optimal_threshold"]
+            primary_acc = primary_metrics["subject_accuracy"]
+
             scheduler.step()
             elapsed = time.time() - t0
 
+            # Format log string showing window loss + subject-level pooled metrics across strategies
             log_str = (
                 f"Epoch [{epoch:02d}/{self.config.epochs:02d}] ({elapsed:.2f}s) | LR: {current_lr:.2e} | "
-                f"Train Loss: {train_loss:.4f}, Acc: {train_acc*100:.2f}% | "
-                f"Val Loss: {val_loss:.4f}, Acc: {val_acc*100:.2f}%, AUC: {roc_auc:.4f} | "
-                f"F1@0.5: {std_macro_f1:.4f} -> Tuned F1@{opt_thresh:.2f}: {tuned_macro_f1:.4f}"
+                f"Win Loss: {train_loss:.4f} | Subj Acc: {primary_acc*100:.2f}% | "
+                f"Subj F1 ({self.config.primary_pooling}@{primary_t:.2f}): {primary_f1:.4f}"
             )
 
-            # Checkpointing based on Tuned Macro F1
-            if tuned_macro_f1 > best_val_f1:
-                best_val_f1 = tuned_macro_f1
-                best_threshold = opt_thresh
+            # Model Selection & Checkpointing based on Primary Subject-Level Macro F1
+            if primary_f1 > best_primary_f1:
+                best_primary_f1 = primary_f1
                 patience_counter = 0
+                best_thresholds = {strat: res["optimal_threshold"] for strat, res in pooling_results.items()}
+                
                 torch.save(
                     {
                         "epoch": epoch,
                         "model_state_dict": head.state_dict(),
-                        "best_macro_f1": best_val_f1,
-                        "optimal_threshold": best_threshold,
+                        "best_macro_f1": best_primary_f1,
+                        "primary_pooling": self.config.primary_pooling,
+                        "optimal_thresholds": best_thresholds,
+                        "pooling_summary": pooling_results
                     },
                     best_model_path
                 )
-                log_str += f" --> [BEST MODEL SAVED]"
+                log_str += f" --> [BEST SUBJECT MODEL SAVED]"
             else:
                 patience_counter += 1
                 log_str += f" | EarlyStop: {patience_counter}/{self.config.early_stopping_patience}"
@@ -452,13 +619,16 @@ class ProbeTrainer:
                 self.logger.info(f"Early stopping triggered after {epoch} epochs.")
                 break
 
-        self.logger.info("=" * 110)
-        self.logger.info(f"Training Complete. Best Validation Macro F1: {best_val_f1:.4f} (at Optimal Threshold: {best_threshold:.2f})")
-        return best_val_f1
+        self.logger.info("=" * 125)
+        self.logger.info(
+            f"Training Complete. Best Validation Subject Macro F1 ({self.config.primary_pooling}): {best_primary_f1:.4f}"
+        )
+        self.logger.info(f"Calibrated Strategy Thresholds: {best_thresholds}")
+        return best_primary_f1
 
 
 # =====================================================================
-# 6. PIPELINE ORCHESTRATOR
+# 7. PIPELINE ORCHESTRATOR
 # =====================================================================
 
 def main():
@@ -469,7 +639,6 @@ def main():
     train_cache_path = config.cache_dir / config.train_cache_name
     val_cache_path = config.cache_dir / config.val_cache_name
 
-    # Check Cache Existence
     cache_exists = train_cache_path.exists() and val_cache_path.exists()
 
     if not cache_exists or config.force_extract:
@@ -485,7 +654,7 @@ def main():
     else:
         logger.info(f"Found existing cached feature files at '{config.cache_dir}'. Skipping .npy extraction phase.")
 
-    # Phase 2: Fast Head Training with Scheduling & Thresholding
+    # Phase 2: Probe Training on Windows + Multi-Strategy Subject Pooling Validation
     trainer = ProbeTrainer(config, logger)
     trainer.train(train_cache_path, val_cache_path)
 
