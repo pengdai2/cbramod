@@ -240,7 +240,7 @@ class EmbeddingManager:
     def extract_and_cache(self, manifest_path: Path, output_cache_path: Path, split_name: str) -> None:
         """Reads .npy files via RealSleepEEGDataset, extracts features, and saves unified tensor."""
         self.logger.info(f"[{split_name.upper()}] Initializing manifest dataset from: {manifest_path}")
-        dataset = RealSleepEEGDataset(manifest_path=manifest_path, data_dir=self.config.data_dir)
+        dataset = RealSleepEEGDataset(manifest_csv=manifest_path, data_dir=self.config.data_dir)
         self.logger.info(f"[{split_name.upper()}] Successfully parsed {len(dataset):,} .npy references.")
 
         loader = DataLoader(
