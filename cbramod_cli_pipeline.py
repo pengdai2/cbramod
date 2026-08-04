@@ -50,6 +50,8 @@ try:
 except ImportError:
     raise ImportError("The 'braindecode' library is required. Install via: pip install braindecode")
 
+from real_world_benchmark import RealSleepEEGDataset
+
 
 # =====================================================================
 # 1. CONFIGURATION & CLI PARSER
@@ -154,98 +156,6 @@ def parse_cli_args() -> PipelineConfig:
 
 
 # =====================================================================
-# 2. MANIFEST DATASET LOADER
-# =====================================================================
-
-class ManifestEEGDataset(Dataset):
-    """
-    PyTorch Dataset that reads a manifest file and dynamically loads 
-    individual .npy EEG files from disk.
-    
-    Supports CSV, TSV, JSON, and JSONL formats.
-    Auto-detects common column names for file paths and labels.
-    """
-    PATH_KEYS = ["path", "file_path", "filepath", "npy_path", "filename", "file"]
-    LABEL_KEYS = ["label", "target", "class", "category", "y"]
-
-    def __init__(self, manifest_path: Path, data_dir: Optional[Path] = None):
-        self.manifest_path = Path(manifest_path)
-        self.data_dir = Path(data_dir) if data_dir else self.manifest_path.parent
-
-        if not self.manifest_path.exists():
-            raise FileNotFoundError(f"Manifest file not found at: {self.manifest_path}")
-
-        self.samples: List[Tuple[Path, int]] = self._parse_manifest()
-
-    def _parse_manifest(self) -> List[Tuple[Path, int]]:
-        samples = []
-        suffix = self.manifest_path.suffix.lower()
-
-        if suffix in [".csv", ".tsv", ".txt"]:
-            delimiter = "\t" if suffix == ".tsv" else ","
-            with open(self.manifest_path, mode="r", encoding="utf-8") as f:
-                reader = csv.DictReader(f, delimiter=delimiter)
-                headers = reader.fieldnames or []
-                
-                path_key = self._find_key(headers, self.PATH_KEYS, "path")
-                label_key = self._find_key(headers, self.LABEL_KEYS, "label")
-
-                for row in reader:
-                    npy_rel_path = row[path_key].strip()
-                    label = int(row[label_key])
-                    full_path = self._resolve_path(npy_rel_path)
-                    samples.append((full_path, label))
-
-        elif suffix in [".json", ".jsonl"]:
-            with open(self.manifest_path, mode="r", encoding="utf-8") as f:
-                if suffix == ".jsonl":
-                    records = [json.loads(line) for line in f if line.strip()]
-                else:
-                    records = json.load(f)
-
-                if len(records) > 0:
-                    sample_keys = list(records[0].keys())
-                    path_key = self._find_key(sample_keys, self.PATH_KEYS, "path")
-                    label_key = self._find_key(sample_keys, self.LABEL_KEYS, "label")
-
-                    for rec in records:
-                        full_path = self._resolve_path(str(rec[path_key]))
-                        label = int(rec[label_key])
-                        samples.append((full_path, label))
-        else:
-            raise ValueError(f"Unsupported manifest extension '{suffix}'. Expected CSV, TSV, JSON, or JSONL.")
-
-        return samples
-
-    def _find_key(self, available_keys: List[str], target_keys: List[str], key_type: str) -> str:
-        for k in available_keys:
-            if k.lower() in target_keys:
-                return k
-        raise KeyError(
-            f"Could not automatically identify {key_type} column in manifest header {available_keys}. "
-            f"Expected one of: {target_keys}"
-        )
-
-    def _resolve_path(self, raw_path_str: str) -> Path:
-        p = Path(raw_path_str)
-        if p.is_absolute():
-            return p
-        return self.data_dir / p
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        file_path, label = self.samples[idx]
-        
-        # Load .npy array from disk
-        arr = np.load(file_path)
-        tensor_x = torch.from_numpy(arr).float()
-        
-        return tensor_x, label
-
-
-# =====================================================================
 # 3. LOGGING & UTILITIES
 # =====================================================================
 
@@ -328,9 +238,9 @@ class EmbeddingManager:
         self.device = torch.device(config.device)
 
     def extract_and_cache(self, manifest_path: Path, output_cache_path: Path, split_name: str) -> None:
-        """Reads .npy files via ManifestEEGDataset, extracts features, and saves unified tensor."""
+        """Reads .npy files via RealSleepEEGDataset, extracts features, and saves unified tensor."""
         self.logger.info(f"[{split_name.upper()}] Initializing manifest dataset from: {manifest_path}")
-        dataset = ManifestEEGDataset(manifest_path=manifest_path, data_dir=self.config.data_dir)
+        dataset = RealSleepEEGDataset(manifest_path=manifest_path, data_dir=self.config.data_dir)
         self.logger.info(f"[{split_name.upper()}] Successfully parsed {len(dataset):,} .npy references.")
 
         loader = DataLoader(
