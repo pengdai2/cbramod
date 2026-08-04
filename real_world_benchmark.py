@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import mne
-ifrom torch.utils.data import Dataset
+from torch.utils.data import Dataset
 from mne.datasets.sleep_physionet import age
 
 # Import CBraMod architecture from braindecode if available
