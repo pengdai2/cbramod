@@ -276,11 +276,11 @@ class ProbeTrainer(CBraModTrainer):
                 log_str += f" --> [BEST SUBJECT MODEL SAVED]"
             else:
                 patience_counter += 1
-                log_str += f" | EarlyStop: {patience_counter}/{self.config.early_stopping_patience}"
+                log_str += f" | EarlyStop: {patience_counter}/{self.config.patience}"
 
             self.logger.info(log_str)
 
-            if patience_counter >= self.config.early_stopping_patience:
+            if patience_counter >= self.config.patience:
                 self.logger.info(f"Early stopping triggered after {epoch} epochs.")
                 break
 
