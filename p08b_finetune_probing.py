@@ -376,14 +376,14 @@ class ProbeTrainer:
         val_ds = TensorDataset(val_data["feats"], val_data["labels"])
 
         train_loader, criterion = setup_data_loader_and_criterion(
-            train_ds=train_ds,
+            dataset=train_ds,
+            labels=train_data["labels"].numpy(),
             batch_size=self.config.batch_size,
             num_workers=self.config.num_workers,
             imbalance_strategy=self.config.imbalance_strategy,
             device=self.device,
             logger=self.logger
         )
-        
         val_loader = DataLoader(val_ds, batch_size=self.config.batch_size, shuffle=False, num_workers=self.config.num_workers, pin_memory=True)
 
         val_subject_ids = val_data.get("subject_ids", [str(i) for i in range(len(val_ds))])

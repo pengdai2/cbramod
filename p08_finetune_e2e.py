@@ -215,7 +215,8 @@ class EndToEndTrainer:
 
         # 2. Configure Strategy-Based Data Loaders and Loss Function
         train_loader, criterion = setup_data_loader_and_criterion(
-            train_ds=train_ds,
+            dataset=train_ds,
+            labels=np.array([sample[1] for sample in train_ds.samples]),
             batch_size=self.config.batch_size,
             num_workers=self.config.num_workers,
             imbalance_strategy=self.config.imbalance_strategy,

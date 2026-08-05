@@ -384,7 +384,8 @@ def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str
 
 
 def setup_data_loader_and_criterion(
-    train_ds: PANSleepEEGDataset,
+    dataset: Dataset,
+    labels: np.ndarray,
     batch_size: int,
     num_workers: int,
     imbalance_strategy: str,
@@ -399,9 +400,8 @@ def setup_data_loader_and_criterion(
       - 'loss_weights': Standard DataLoader with shuffle=True. Inverse class frequency weighted CrossEntropyLoss.
       - 'none': Standard DataLoader with shuffle=True and unweighted CrossEntropyLoss.
     """
-    train_labels = np.array([sample[1] for sample in train_ds.samples])
-    class_counts = np.bincount(train_labels)
-    total_samples = len(train_labels)
+    class_counts = np.bincount(labels)
+    total_samples = len(labels)
     num_classes = len(class_counts)
 
     logger.info("--- Training Set Class Distribution ---")
@@ -421,7 +421,7 @@ def setup_data_loader_and_criterion(
             replacement=True
         )
         train_loader = DataLoader(
-            train_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers,
+            dataset, batch_size=batch_size, sampler=sampler, num_workers=num_workers,
             pin_memory=True, persistent_workers=persistent_workers
         )
         criterion = nn.CrossEntropyLoss()
@@ -436,7 +436,7 @@ def setup_data_loader_and_criterion(
 
         criterion = nn.CrossEntropyLoss(weight=weights_tensor)
         train_loader = DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+            dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
             pin_memory=True, persistent_workers=persistent_workers
         )
 
@@ -444,7 +444,7 @@ def setup_data_loader_and_criterion(
         logger.info("--> Imbalance Strategy: None (Unweighted training)")
         criterion = nn.CrossEntropyLoss()
         train_loader = DataLoader(
-            train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+            dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers,
             pin_memory=True, persistent_workers=persistent_workers
         )
 
