@@ -1,4 +1,5 @@
 import json
+import logging
 import re
 import numpy as np
 import pandas as pd
@@ -370,3 +371,74 @@ def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str
         return stages
     except Exception:
         return ["UNKNOWN"] * num_windows
+
+
+def setup_data_loader_and_criterion(
+    train_ds: PANSleepEEGDataset,
+    batch_size: int,
+    num_workers: int,
+    imbalance_strategy: str,
+    device: torch.device,
+    logger: logging.Logger
+) -> Tuple[DataLoader, nn.Module]:
+    """
+    Configures training DataLoader and CrossEntropyLoss based on imbalance strategy.
+
+    Strategies:
+      - 'sampler': Uses WeightedRandomSampler to balance batch draws. Unweighted CrossEntropyLoss.
+      - 'loss_weights': Standard DataLoader with shuffle=True. Inverse class frequency weighted CrossEntropyLoss.
+      - 'none': Standard DataLoader with shuffle=True and unweighted CrossEntropyLoss.
+    """
+    train_labels = np.array([sample[1] for sample in train_ds.samples])
+    class_counts = np.bincount(train_labels)
+    total_samples = len(train_labels)
+    num_classes = len(class_counts)
+
+    logger.info("--- Training Set Class Distribution ---")
+    for class_id, count in enumerate(class_counts):
+        pct = (count / total_samples) * 100.0 if total_samples > 0 else 0.0
+        logger.info(f"  Class {class_id}: {count:,} samples ({pct:.2f}%)")
+
+    persistent_workers = num_workers > 0
+
+    if imbalance_strategy == "sampler":
+        logger.info("--> Imbalance Strategy: WeightedRandomSampler (Resampling minority class batches)")
+        class_weights_raw = 1.0 / np.maximum(class_counts, 1)
+        sample_weights = class_weights_raw[train_labels]
+        sampler = WeightedRandomSampler(
+            weights=torch.from_numpy(sample_weights).double(),
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers,
+            pin_memory=True, persistent_workers=persistent_workers
+        )
+        criterion = nn.CrossEntropyLoss()
+
+    elif imbalance_strategy == "loss_weights":
+        logger.info("--> Imbalance Strategy: Class-Weighted CrossEntropyLoss")
+        balanced_weights = total_samples / (num_classes * np.maximum(class_counts, 1).astype(np.float32))
+        weights_tensor = torch.from_numpy(balanced_weights).float().to(device)
+
+        weight_str = ", ".join([f"Class {i}: {w:.4f}" for i, w in enumerate(balanced_weights)])
+        logger.info(f"    Derived Loss Weights: [{weight_str}]")
+
+        criterion = nn.CrossEntropyLoss(weight=weights_tensor)
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+            pin_memory=True, persistent_workers=persistent_workers
+        )
+
+    elif imbalance_strategy == "none":
+        logger.info("--> Imbalance Strategy: None (Unweighted training)")
+        criterion = nn.CrossEntropyLoss()
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+            pin_memory=True, persistent_workers=persistent_workers
+        )
+
+    else:
+        raise ValueError(f"Invalid imbalance strategy: {imbalance_strategy}. Choose 'sampler', 'loss_weights', or 'none'.")
+
+    return train_loader, criterion

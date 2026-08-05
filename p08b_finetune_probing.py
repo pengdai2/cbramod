@@ -52,11 +52,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from tqdm import tqdm
 
-try:
-except ImportError:
-    raise ImportError("The 'braindecode' library is required. Install via: pip install braindecode")
-
-from cbramod_common import CBraModFeatureExtractor, LinearProbeHead, PANSleepEEGDataset, compute_pooled_scores
+from cbramod_common import CBraModFeatureExtractor, LinearProbeHead, PANSleepEEGDataset, compute_pooled_scores, setup_data_loader_and_criterion
 
 
 # =====================================================================
@@ -70,7 +66,6 @@ class PipelineConfig:
     train_manifest_path: Optional[Path] = None
     val_manifest_path: Optional[Path] = None
     data_dir: Optional[Path] = None
-    filter_stage: Optional[str] = None
     train_cache_name: str = "cached_train_embeddings.pt"
     val_cache_name: str = "cached_val_embeddings.pt"
     best_head_filename: str = "cbramod_head_best.pt"
@@ -82,6 +77,9 @@ class PipelineConfig:
     num_patches: int = 30
     emb_dim: int = 200
     num_classes: int = 2
+
+    imbalance_strategy: str = "loss_weights"
+    filter_stage: Optional[str] = None
     
     # Pooling & Threshold Hyperparameters
     primary_pooling: str = "p85_score"
@@ -128,9 +126,19 @@ def parse_cli_args() -> PipelineConfig:
     data_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON)")
     data_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON)")
     data_group.add_argument("--data-dir", type=str, default=None, help="Root directory containing .npy files")
-    data_group.add_argument("--filter-stage", type=str, default=None, help="Comma-separated sleep stages to filter (e.g., 'N2,N3')")
     data_group.add_argument("--cache-dir", type=str, default="/opt/cbra_data/checkpoints", help="Directory for cached embeddings & checkpoints")
     data_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
+
+    # Imbalance & Stage Controls
+    strat_group = parser.add_argument_group("Imbalance & Stage Controls")
+    strat_group.add_argument(
+        "--imbalance-strategy", 
+        type=str, 
+        choices=["sampler", "loss_weights", "none"], 
+        default="loss_weights", 
+        help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
+    )
+    strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into RealSleepEEGDataset (e.g., N2,N3)")
 
     # Pooling Configurations
     pool_group = parser.add_argument_group("Subject-Level Pooling Options")
@@ -261,7 +269,7 @@ class EmbeddingManager:
 
 
 # =====================================================================
-# 6. TRAINER ENGINE WITH WINDOW TRAINING & FAST SUBJECT POOLING VAL
+# 3. TRAINER ENGINE WITH WINDOW TRAINING & FAST SUBJECT POOLING VAL
 # =====================================================================
 
 class ProbeTrainer:
@@ -367,18 +375,18 @@ class ProbeTrainer:
         train_ds = TensorDataset(train_data["feats"], train_data["labels"])
         val_ds = TensorDataset(val_data["feats"], val_data["labels"])
 
-        train_loader = DataLoader(train_ds, batch_size=self.config.batch_size, shuffle=True, num_workers=2, pin_memory=True)
-        val_loader = DataLoader(val_ds, batch_size=self.config.batch_size, shuffle=False, num_workers=2, pin_memory=True)
+        train_loader, criterion = setup_data_loader_and_criterion(
+            train_ds=train_ds,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.num_workers,
+            imbalance_strategy=self.config.imbalance_strategy,
+            device=self.device,
+            logger=self.logger
+        )
+        
+        val_loader = DataLoader(val_ds, batch_size=self.config.batch_size, shuffle=False, num_workers=self.config.num_workers, pin_memory=True)
 
         val_subject_ids = val_data.get("subject_ids", [str(i) for i in range(len(val_ds))])
-
-        # Inverse Class Weighting for Loss Function
-        labels_np = train_data["labels"].numpy()
-        class_counts = np.bincount(labels_np, minlength=self.config.num_classes)
-        class_weights = torch.tensor(
-            [len(labels_np) / (self.config.num_classes * count) for count in class_counts],
-            dtype=torch.float
-        ).to(self.device)
 
         head = LinearProbeHead(
             num_patches=self.config.num_patches,
@@ -388,7 +396,6 @@ class ProbeTrainer:
             dropout=self.config.dropout_prob
         ).to(self.device)
 
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
         optimizer = torch.optim.AdamW(head.parameters(), lr=self.config.head_lr, weight_decay=self.config.weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=self.config.epochs, eta_min=self.config.min_lr)
 
@@ -504,7 +511,7 @@ class ProbeTrainer:
 
 
 # =====================================================================
-# 7. PIPELINE ORCHESTRATOR
+# 4. PIPELINE ORCHESTRATOR
 # =====================================================================
 
 def main():
