@@ -170,11 +170,7 @@ def evaluate_clinical_cohort(
     # 2. Instantiate Model Architecture
     model = CBraModE2EClassifier(
         num_classes=num_classes,
-        num_channels=num_channels,
-        num_patches=30,
-        emb_dim=200,
-        head_dim=128,
-        dropout=0.3
+        num_channels=num_channels
     )
 
     # 3. Load Model Checkpoint (Head-Only or Full-Model)
