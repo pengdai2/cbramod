@@ -138,7 +138,7 @@ def parse_cli_args() -> PipelineConfig:
         default="loss_weights", 
         help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
     )
-    strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into RealSleepEEGDataset (e.g., N2,N3)")
+    strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into PANSleepEEGDataset (e.g., N2,N3)")
 
     # Pooling Configurations
     pool_group = parser.add_argument_group("Subject-Level Pooling Options")
@@ -211,7 +211,7 @@ class EmbeddingManager:
     def extract_and_cache(self, manifest_path: Path, output_cache_path: Path, split_name: str) -> None:
         """Reads .npy files, applies stage filtering, extracts backbone embeddings, and caches feats + labels + subject_ids."""
         filter_str = f" [Filter: {self.config.filter_stage}]" if self.config.filter_stage else ""
-        self.logger.info(f"[{split_name.upper()}] Initializing RealSleepEEGDataset from: {manifest_path}{filter_str}")
+        self.logger.info(f"[{split_name.upper()}] Initializing PANSleepEEGDataset from: {manifest_path}{filter_str}")
         
         dataset = PANSleepEEGDataset(
             manifest_csv=manifest_path, 

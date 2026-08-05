@@ -37,7 +37,7 @@ def create_deployment_package(
 
     # 1. Construct Configuration Metadata
     config_metadata = {
-        "model_architecture": "CBraModRealWorldBenchmark",
+        "model_architecture": "CBraModE2EClassifier",
         "version": export_version,
         "input_specs": {
             "num_channels": num_channels,

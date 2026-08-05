@@ -1,6 +1,6 @@
 """
 Production End-to-End Fine-Tuning Pipeline for CBraMod.
-Uses RealSleepEEGDataset's native stage filtering, CBraModRealWorldBenchmark,
+Uses PANSleepEEGDataset's native stage filtering, CBraModE2EClassifier,
 class imbalance handling (WeightedRandomSampler, class loss weighting, or none),
 flexible backbone unfreezing, warm-start probing head initialization, and 
 vectorized subject-level validation pooling.
@@ -420,7 +420,7 @@ def parse_cli_args() -> argparse.Namespace:
         default="loss_weights", 
         help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
     )
-    strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into RealSleepEEGDataset (e.g., N2,N3)")
+    strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into PANSleepEEGDataset (e.g., N2,N3)")
 
     # Unfreezing Controls
     unfreeze_group = parser.add_argument_group("Backbone Unfreezing Controls")
