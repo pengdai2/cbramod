@@ -634,6 +634,7 @@ def setup_pipeline_cli_parser(
     # CBraMod Architecture Controls    
     cbra_group = parser.add_argument_group("CBraMod Architecture Controls")
     cbra_group.add_argument("--num-channels", type=int, default=64, help="EEG Channel count")
+    cbra_group.add_argument("--num-patches", type=int, default=30, help="Number of temporal patches in CBraMod")
     cbra_group.add_argument("--sfreq", type=float, default=200.0, help="EEG sampling frequency")
     cbra_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
 
