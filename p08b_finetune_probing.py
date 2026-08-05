@@ -24,178 +24,43 @@ Usage:
 """
 
 import argparse
-from collections import defaultdict
-from dataclasses import dataclass
 import gc
-import json
 import logging
 from pathlib import Path
 import sys
 import time
-from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-    precision_recall_fscore_support,
-    roc_auc_score,
-    roc_curve,
-)
 from cbramod_utils import seed_everything, setup_logger
 import torch
-import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from torch.utils.data import DataLoader, Dataset, TensorDataset
+from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from cbramod_common import CBraModFeatureExtractor, LinearProbeHead, PANSleepEEGDataset, compute_pooled_scores, setup_data_loader_and_criterion
+from cbramod_common import CBraModFeatureExtractor, CBraModTrainer, LinearProbeHead, PANSleepEEGDataset, setup_data_loader_and_criterion, add_pipeline_args_common, setup_pipeline_cli_parser
 
 
 # =====================================================================
 # 1. CONFIGURATION & CLI PARSER
 # =====================================================================
 
-@dataclass
-class PipelineConfig:
-    """Dataclass storing pipeline execution state."""
-    cache_dir: Path
-    train_manifest_path: Optional[Path] = None
-    val_manifest_path: Optional[Path] = None
-    data_dir: Optional[Path] = None
-    train_cache_name: str = "cached_train_embeddings.pt"
-    val_cache_name: str = "cached_val_embeddings.pt"
-    best_head_filename: str = "cbramod_head_best.pt"
-    log_filename: str = "pipeline.log"
-    
-    # Model & Feature Dimensions
-    num_channels: int = 64
-    sfreq: float = 200.0
-    num_patches: int = 30
-    emb_dim: int = 200
-    num_classes: int = 2
-
-    imbalance_strategy: str = "loss_weights"
-    filter_stage: Optional[str] = None
-    
-    # Pooling & Threshold Hyperparameters
-    primary_pooling: str = "p85_score"
-    top_percentile: float = 0.10
-    t_window: float = 0.60
-    
-    # Hyperparameters
-    batch_size: int = 512
-    epochs: int = 40
-    head_lr: float = 1e-4
-    min_lr: float = 1e-6
-    weight_decay: float = 1e-2
-    hidden_dim: int = 128
-    dropout_prob: float = 0.3
-    
-    # Control Flags
-    force_extract: bool = False
-    num_workers: int = 4
-    seed: int = 42
-    early_stopping_patience: int = 10
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    use_amp: bool = True
-
-    def __post_init__(self):
-        self.cache_dir = Path(self.cache_dir)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        if self.train_manifest_path:
-            self.train_manifest_path = Path(self.train_manifest_path)
-        if self.val_manifest_path:
-            self.val_manifest_path = Path(self.val_manifest_path)
-        if self.data_dir:
-            self.data_dir = Path(self.data_dir)
-
-
-def parse_cli_args() -> PipelineConfig:
-    """Parses command-line arguments into a structured PipelineConfig."""
-    parser = argparse.ArgumentParser(
-        description="CBraMod Automated Embedding Extraction & Probe Fine-Tuning Pipeline",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+def parse_cli_args() -> argparse.Namespace:
+    """Parses command-line arguments for the CBraMod manifest-based pipeline."""
+    parser = setup_pipeline_cli_parser(
+        description="CBraMod Manifest-Based Pipeline for Embedding Extraction & Probe Training"
     )
 
-    # Manifest & Data Paths
-    data_group = parser.add_argument_group("Data Sources")
-    data_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON)")
-    data_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON)")
-    data_group.add_argument("--data-dir", type=str, default=None, help="Root directory containing .npy files")
-    data_group.add_argument("--cache-dir", type=str, default="/opt/cbra_data/checkpoints", help="Directory for cached embeddings & checkpoints")
-    data_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
-
-    # Imbalance & Stage Controls
-    strat_group = parser.add_argument_group("Imbalance & Stage Controls")
-    strat_group.add_argument(
-        "--imbalance-strategy", 
-        type=str, 
-        choices=["sampler", "loss_weights", "none"], 
-        default="loss_weights", 
-        help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
-    )
-    strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into PANSleepEEGDataset (e.g., N2,N3)")
-
-    # Pooling Configurations
-    pool_group = parser.add_argument_group("Subject-Level Pooling Options")
-    pool_group.add_argument(
-        "--primary-pooling", 
-        type=str, 
-        default="p85_score", 
-        choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"],
-        help="Primary pooling strategy used for early stopping and model selection"
-    )
-    pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio for top-K pooling methods")
-    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for pathology burden ratio")
-
-    # Hyperparameters
-    hp_group = parser.add_argument_group("Hyperparameters")
-    hp_group.add_argument("--epochs", type=int, default=40, help="Maximum training epochs for linear probe head")
-    hp_group.add_argument("--batch-size", type=int, default=512, help="Batch size for training and feature extraction")
-    hp_group.add_argument("--head-lr", type=float, default=1e-4, help="Initial learning rate for classification head")
-    hp_group.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing scheduler")
-    hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay regularizer")
-    hp_group.add_argument("--hidden-dim", type=int, default=128, help="Bottleneck linear layer dimension")
-    hp_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
-    hp_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
-
-    # System Controls
-    sys_group = parser.add_argument_group("System Controls")
-    sys_group.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers for disk reads")
-    sys_group.add_argument("--seed", type=int, default=42, help="Random seed for deterministic execution")
-    sys_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without Subject F1 improvement)")
-    sys_group.add_argument("--num-channels", type=int, default=64, help="Number of EEG input channels")
+    # Checkpoint & Cache Controls
+    ckpt_group = parser.add_argument_group("Checkpoint & Cache Controls")
+    ckpt_group.add_argument("--cache-dir", type=str, default="/opt/cbra_data/checkpoints", help="Directory for cached embeddings & checkpoints")
+    ckpt_group.add_argument("--train-cache-name", type=str, default="cached_train_embeddings.pt", help="Filename for cached training embeddings")
+    ckpt_group.add_argument("--val-cache-name", type=str, default="cached_val_embeddings.pt", help="Filename for cached validation embeddings")
+    ckpt_group.add_argument("--best-head-filename", type=str, default="cbramod_head_best.pt", help="Filename for best probe head checkpoint")
+    ckpt_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
 
     args = parser.parse_args()
-
-    return PipelineConfig(
-        cache_dir=Path(args.cache_dir),
-        train_manifest_path=Path(args.train_manifest) if args.train_manifest else None,
-        val_manifest_path=Path(args.val_manifest) if args.val_manifest else None,
-        data_dir=Path(args.data_dir) if args.data_dir else None,
-        filter_stage=args.filter_stage,
-        force_extract=args.force_extract,
-        primary_pooling=args.primary_pooling,
-        top_percentile=args.top_percentile,
-        t_window=args.t_window,
-        num_workers=args.num_workers,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        head_lr=args.head_lr,
-        min_lr=args.min_lr,
-        weight_decay=args.weight_decay,
-        hidden_dim=args.hidden_dim,
-        dropout_prob=args.dropout,
-        seed=args.seed,
-        early_stopping_patience=args.patience,
-        num_channels=args.num_channels,
-        num_classes=args.num_classes,
-    )
-
+    args.use_amp = not args.no_amp
+    return args
 
 # =====================================================================
 # 2. EMBEDDING EXTRACTION ENGINE WITH STAGE FILTERING & SUBJECT ID TRACKING
@@ -203,7 +68,7 @@ def parse_cli_args() -> PipelineConfig:
 
 class EmbeddingManager:
     """Manages feature extraction from manifest .npy files with optional stage filtering."""
-    def __init__(self, config: PipelineConfig, logger: logging.Logger):
+    def __init__(self, config: argparse.Namespace, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self.device = torch.device(config.device)
@@ -272,105 +137,15 @@ class EmbeddingManager:
 # 3. TRAINER ENGINE WITH WINDOW TRAINING & FAST SUBJECT POOLING VAL
 # =====================================================================
 
-class ProbeTrainer:
+class ProbeTrainer(CBraModTrainer):
     """Trains head on window instances while evaluating and tuning thresholds on subject-level pooled scores."""
-    def __init__(self, config: PipelineConfig, logger: logging.Logger):
-        self.config = config
-        self.logger = logger
-        self.device = torch.device(config.device)
+    def __init__(self, config: argparse.Namespace, logger: logging.Logger):
+        super().__init__(config, logger)
 
-    def _evaluate_subject_pooling(
-        self, 
-        val_probs: np.ndarray, 
-        val_targets: np.ndarray, 
-        val_subject_ids: List[str]
-    ) -> Dict[str, Dict[str, float]]:
-        """
-        Groups window probabilities by subject using an O(N) pre-indexed map, 
-        applies all 4 pooling strategies, and performs threshold tuning.
-        """
-        strategies = ["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"]
-
-        # O(N) linear indexing pass to pre-group window indices by subject ID
-        subj_to_indices = defaultdict(list)
-        for idx, subj in enumerate(val_subject_ids):
-            subj_to_indices[subj].append(idx)
-
-        subject_data = {strat: [] for strat in strategies}
-        subject_labels = []
-
-        # Iterate through pre-grouped subject slices
-        for subj, idxs in subj_to_indices.items():
-            idx_arr = np.array(idxs, dtype=np.int64)
-            subj_probs = val_probs[idx_arr]
-            subj_gt = val_targets[idx_arr[0]]
-            subject_labels.append(subj_gt)
-
-            for strat in strategies:
-                if self.config.num_classes == 2:
-                    score = compute_pooled_scores(
-                        subj_probs[:, 1], 
-                        method=strat, 
-                        top_percentile=self.config.top_percentile, 
-                        t_window=self.config.t_window
-                    )
-                else:
-                    score = compute_pooled_scores(
-                        subj_probs, 
-                        method=strat, 
-                        top_percentile=self.config.top_percentile, 
-                        t_window=self.config.t_window
-                    )
-                subject_data[strat].append(score)
-
-        subject_labels = np.array(subject_labels)
-        results = {}
-
-        # Strategy evaluation and threshold optimization
-        for strat in strategies:
-            scores = np.array(subject_data[strat])
-            
-            if self.config.num_classes == 2:
-                # Binary threshold sweep to maximize Macro F1 on Subject predictions
-                best_t = 0.5
-                best_f1 = 0.0
-                thresholds = np.linspace(0.01, 0.99, 99)
-                
-                for t in thresholds:
-                    preds = (scores >= t).astype(int)
-                    f1 = f1_score(subject_labels, preds, average="macro", zero_division=0)
-                    if f1 > best_f1:
-                        best_f1 = f1
-                        best_t = t
-                
-                final_preds = (scores >= best_t).astype(int)
-                acc = accuracy_score(subject_labels, final_preds)
-                roc_auc = roc_auc_score(subject_labels, scores) if len(np.unique(subject_labels)) > 1 else 0.5
-
-                results[strat] = {
-                    "subject_macro_f1": best_f1,
-                    "optimal_threshold": float(best_t),
-                    "subject_accuracy": acc,
-                    "roc_auc": roc_auc
-                }
-            else:
-                # Multi-class argmax selection
-                preds = np.argmax(scores, axis=1)
-                macro_f1 = f1_score(subject_labels, preds, average="macro", zero_division=0)
-                acc = accuracy_score(subject_labels, preds)
-                results[strat] = {
-                    "subject_macro_f1": macro_f1,
-                    "optimal_threshold": 0.5,
-                    "subject_accuracy": acc,
-                    "roc_auc": 0.5
-                }
-
-        return results
-
-    def train(self, train_cache_path: Path, val_cache_path: Path) -> float:
+    def train(self, train_path: Path, val_path: Path) -> float:
         self.logger.info("Loading cached feature tensors into RAM...")
-        train_data = torch.load(train_cache_path, map_location="cpu")
-        val_data = torch.load(val_cache_path, map_location="cpu")
+        train_data = torch.load(train_path, map_location="cpu")
+        val_data = torch.load(val_path, map_location="cpu")
 
         train_ds = TensorDataset(train_data["feats"], train_data["labels"])
         val_ds = TensorDataset(val_data["feats"], val_data["labels"])
@@ -402,7 +177,7 @@ class ProbeTrainer:
         best_primary_f1 = 0.0
         best_thresholds = {}
         patience_counter = 0
-        best_model_path = self.config.cache_dir / self.config.best_head_filename
+        best_model_path = Path(self.config.cache_dir) / self.config.best_head_filename
 
         self.logger.info(
             f"Starting Probe Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | "
@@ -457,7 +232,7 @@ class ProbeTrainer:
             val_probs = np.concatenate(val_probs)
 
             # 3. Fast Subject-Level Multi-Strategy Pooling & Threshold Calibration
-            pooling_results = self._evaluate_subject_pooling(val_probs, val_targets, val_subject_ids)
+            pooling_results = self.evaluate_subject_pooling(val_probs, val_targets, val_subject_ids)
             
             primary_metrics = pooling_results[self.config.primary_pooling]
             primary_f1 = primary_metrics["subject_macro_f1"]
@@ -515,30 +290,36 @@ class ProbeTrainer:
 # =====================================================================
 
 def main():
-    config = parse_cli_args()
-    seed_everything(config.seed)
-    logger = setup_logger(config.cache_dir / config.log_filename)
+    args = parse_cli_args()
+    seed_everything(args.seed)
 
-    train_cache_path = config.cache_dir / config.train_cache_name
-    val_cache_path = config.cache_dir / config.val_cache_name
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
+    logger = setup_logger(cache_dir / args.log_filename)
+
+    train_cache_path = cache_dir / args.train_cache_name
+    val_cache_path = cache_dir / args.val_cache_name
     cache_exists = train_cache_path.exists() and val_cache_path.exists()
 
-    if not cache_exists or config.force_extract:
+    if not cache_exists or args.force_extract:
         logger.info("Cached embeddings not found or --force-extract specified. Initializing Feature Extraction Phase...")
 
-        if not config.train_manifest_path or not config.val_manifest_path:
+        if not args.train_manifest_path or not args.val_manifest_path:
             logger.error("Missing manifest paths! Please provide --train-manifest and --val-manifest to extract features.")
             sys.exit(1)
 
-        extractor_mgr = EmbeddingManager(config, logger)
-        extractor_mgr.extract_and_cache(config.train_manifest_path, train_cache_path, split_name="train")
-        extractor_mgr.extract_and_cache(config.val_manifest_path, val_cache_path, split_name="val")
+        train_manifest_path = Path(args.train_manifest_path)
+        val_manifest_path = Path(args.val_manifest_path)
+
+        extractor_mgr = EmbeddingManager(args, logger)
+        extractor_mgr.extract_and_cache(train_manifest_path, train_cache_path, split_name="train")
+        extractor_mgr.extract_and_cache(val_manifest_path, val_cache_path, split_name="val")
     else:
-        logger.info(f"Found existing cached feature files at '{config.cache_dir}'. Skipping .npy extraction phase.")
+        logger.info(f"Found existing cached feature files at '{cache_dir}'. Skipping .npy extraction phase.")
 
     # Phase 2: Probe Training on Windows + Multi-Strategy Subject Pooling Validation
-    trainer = ProbeTrainer(config, logger)
+    trainer = ProbeTrainer(args, logger)
     trainer.train(train_cache_path, val_cache_path)
 
 

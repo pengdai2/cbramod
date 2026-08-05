@@ -1,3 +1,5 @@
+import argparse
+from collections import defaultdict
 import json
 import logging
 import re
@@ -8,7 +10,7 @@ import torch.nn as nn
 import mne
 import yasa
 import safetensors
-from typing import List, Tuple, Optional, Union, Set
+from typing import Dict, List, Tuple, Optional, Union, Set
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from einops.layers.torch import Rearrange
@@ -521,3 +523,165 @@ def evaluate_subject_quality(
     }
 
     return is_accepted, metrics, reason_str
+
+class CBraModTrainer:
+    """Base class for training CBraMod models with subject-level evaluation."""
+    def __init__(self, config: argparse.Namespace, logger: logging.Logger):
+        self.config = config
+        self.logger = logger
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def evaluate_subject_pooling(
+        self, 
+        val_probs: np.ndarray, 
+        val_targets: np.ndarray, 
+        val_subject_ids: List[str]
+    ) -> Dict[str, Dict[str, float]]:
+        """
+        Groups window probabilities by subject using an O(N) pre-indexed map, 
+        applies all 4 pooling strategies, and performs threshold tuning.
+        """
+        strategies = ["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"]
+
+        # O(N) linear indexing pass to pre-group window indices by subject ID
+        subj_to_indices = defaultdict(list)
+        for idx, subj in enumerate(val_subject_ids):
+            subj_to_indices[subj].append(idx)
+
+        subject_data = {strat: [] for strat in strategies}
+        subject_labels = []
+
+        # Iterate through pre-grouped subject slices
+        for subj, idxs in subj_to_indices.items():
+            idx_arr = np.array(idxs, dtype=np.int64)
+            subj_probs = val_probs[idx_arr]
+            subj_gt = val_targets[idx_arr[0]]
+            subject_labels.append(subj_gt)
+
+            for strat in strategies:
+                if self.config.num_classes == 2:
+                    score = compute_pooled_scores(
+                        subj_probs[:, 1], 
+                        method=strat, 
+                        top_percentile=self.config.top_percentile, 
+                        t_window=self.config.t_window
+                    )
+                else:
+                    score = compute_pooled_scores(
+                        subj_probs, 
+                        method=strat, 
+                        top_percentile=self.config.top_percentile, 
+                        t_window=self.config.t_window
+                    )
+                subject_data[strat].append(score)
+
+        subject_labels = np.array(subject_labels)
+        results = {}
+
+        # Strategy evaluation and threshold optimization
+        for strat in strategies:
+            scores = np.array(subject_data[strat])
+            
+            if self.config.num_classes == 2:
+                # Binary threshold sweep to maximize Macro F1 on Subject predictions
+                best_t = 0.5
+                best_f1 = 0.0
+                thresholds = np.linspace(0.01, 0.99, 99)
+                
+                for t in thresholds:
+                    preds = (scores >= t).astype(int)
+                    f1 = f1_score(subject_labels, preds, average="macro", zero_division=0)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_t = t
+                
+                final_preds = (scores >= best_t).astype(int)
+                acc = accuracy_score(subject_labels, final_preds)
+                roc_auc = roc_auc_score(subject_labels, scores) if len(np.unique(subject_labels)) > 1 else 0.5
+
+                results[strat] = {
+                    "subject_macro_f1": best_f1,
+                    "optimal_threshold": float(best_t),
+                    "subject_accuracy": acc,
+                    "roc_auc": roc_auc
+                }
+            else:
+                # Multi-class argmax selection
+                preds = np.argmax(scores, axis=1)
+                macro_f1 = f1_score(subject_labels, preds, average="macro", zero_division=0)
+                acc = accuracy_score(subject_labels, preds)
+                results[strat] = {
+                    "subject_macro_f1": macro_f1,
+                    "optimal_threshold": 0.5,
+                    "subject_accuracy": acc,
+                    "roc_auc": 0.5
+                }
+
+        return results  
+
+    def train(self, train_path: Path, val_path: Path):
+        pass  # Placeholder for training loop implementation  
+
+
+def setup_pipeline_cli_parser(
+    description: str = "CBraMod Pipeline"
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    # CBraMod Architecture Controls    
+    cbra_group = parser.add_argument_group("CBraMod Architecture Controls")
+    cbra_group.add_argument("--num-channels", type=int, default=64, help="EEG Channel count")
+    cbra_group.add_argument("--sfreq", type=float, default=200.0, help="EEG sampling frequency")
+    cbra_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
+
+    # Manifest & Data Paths
+    data_group = parser.add_argument_group("Data Sources")
+    data_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON)")
+    data_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON)")
+    data_group.add_argument("--data-dir", type=str, default=None, help="Root directory containing .npy files")
+
+    # Imbalance & Stage Controls
+    strat_group = parser.add_argument_group("Imbalance & Stage Controls")
+    strat_group.add_argument(
+        "--imbalance-strategy",
+        type=str,
+        choices=["sampler", "loss_weights", "none"],
+        default="loss_weights",
+        help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
+    )
+    strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into PANSleepEEGDataset (e.g., N2,N3)")
+
+    # Pooling Configurations
+    pool_group = parser.add_argument_group("Subject-Level Pooling Options")
+    pool_group.add_argument(
+        "--primary-pooling",
+        type=str,
+        default="p85_score",
+        choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"],
+        help="Primary pooling strategy used for early stopping and model selection"
+    )
+    pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio for top-K pooling methods")
+    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for pathology burden ratio")
+
+    # Hyperparameters
+    hp_group = parser.add_argument_group("Common Hyperparameters")
+    hp_group.add_argument("--epochs", type=int, default=40, help="Maximum training epochs for linear probe head")
+    hp_group.add_argument("--batch-size", type=int, default=512, help="Batch size for training and feature extraction")
+    hp_group.add_argument("--head-lr", type=float, default=1e-4, help="Initial learning rate for classification head")
+    hp_group.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing scheduler")
+    hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay regularizer")
+    hp_group.add_argument("--hidden-dim", type=int, default=128, help="Bottleneck linear layer dimension")
+    hp_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
+
+    # System Controls
+    sys_group = parser.add_argument_group("System Controls")
+    sys_group.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers for disk reads")
+    sys_group.add_argument("--seed", type=int, default=42, help="Random seed for deterministic execution")
+    sys_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without Subject F1 improvement)")
+    sys_group.add_argument("--no-amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
+    sys_group.add_argument("--log-filename", type=str, default=__file__.replace(".py", ".log"), help="Filename for pipeline log output")
+
+    return parser

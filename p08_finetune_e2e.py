@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Import shared architectures and utilities without code duplication
-from cbramod_common import CBraModE2EClassifier, LinearProbeHead, PANSleepEEGDataset, compute_pooled_scores, setup_data_loader_and_criterion
+from cbramod_common import CBraModE2EClassifier, CBraModTrainer, LinearProbeHead, PANSleepEEGDataset, add_pipeline_args_common, compute_pooled_scores, setup_data_loader_and_criterion, setup_pipeline_cli_parser
 from cbramod_utils import seed_everything, setup_logger
 
 
@@ -107,108 +107,22 @@ def load_probing_head_checkpoint(
 # 2. E2E FINE-TUNING TRAINER
 # =====================================================================
 
-class EndToEndTrainer:
+class EndToEndTrainer(CBraModTrainer):
     """Manages full/partial E2E backpropagation and subject-level threshold calibration."""
     def __init__(self, config: argparse.Namespace, logger: logging.Logger):
-        self.config = config
-        self.logger = logger
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.subject_index_map: Optional[Dict[str, np.ndarray]] = None
-        self.subject_labels_map: Optional[np.ndarray] = None
+        super().__init__(config, logger)
 
-    def _prepare_subject_indices(self, val_subject_ids: List[str], val_targets: np.ndarray) -> None:
-        """Pre-computes window index maps for subject evaluation once to avoid O(S*N) lookups per epoch."""
-        val_subject_ids_np = np.array(val_subject_ids)
-        unique_subjects, first_indices = np.unique(val_subject_ids_np, return_index=True)
-        
-        self.subject_index_map = {
-            subj: np.where(val_subject_ids_np == subj)[0] for subj in unique_subjects
-        }
-        self.subject_labels_map = val_targets[first_indices]
-
-    def _evaluate_subject_pooling(self, val_probs: np.ndarray) -> Dict[str, Dict[str, float]]:
-        """Executes subject-level aggregation and vectorized threshold tuning across pooling strategies."""
-        strategies = ["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"]
-        subject_data = {strat: [] for strat in strategies}
-
-        for subj, idx in self.subject_index_map.items():
-            subj_probs = val_probs[idx]
-
-            for strat in strategies:
-                if self.config.num_classes == 2:
-                    score = compute_pooled_scores(
-                        subj_probs[:, 1], 
-                        method=strat, 
-                        top_percentile=self.config.top_percentile, 
-                        t_window=self.config.t_window
-                    )
-                else:
-                    score = compute_pooled_scores(
-                        subj_probs, 
-                        method=strat, 
-                        top_percentile=self.config.top_percentile, 
-                        t_window=self.config.t_window
-                    )
-                subject_data[strat].append(score)
-
-        subject_labels = self.subject_labels_map
-        results = {}
-        thresholds = np.linspace(0.01, 0.99, 99)
-
-        for strat in strategies:
-            scores = np.array(subject_data[strat])
-            if self.config.num_classes == 2:
-                preds_matrix = (scores[:, None] >= thresholds[None, :]).astype(int)
-                pos_mask = (subject_labels == 1)[:, None]
-                neg_mask = (subject_labels == 0)[:, None]
-                
-                tp = np.sum(preds_matrix & pos_mask, axis=0)
-                fp = np.sum(preds_matrix & neg_mask, axis=0)
-                fn = np.sum((~preds_matrix) & pos_mask, axis=0)
-                tn = np.sum((~preds_matrix) & neg_mask, axis=0)
-
-                f1_pos = np.where((2 * tp + fp + fn) > 0, (2 * tp) / (2 * tp + fp + fn), 0.0)
-                f1_neg = np.where((2 * tn + fp + fn) > 0, (2 * tn) / (2 * tn + fp + fn), 0.0)
-                macro_f1s = (f1_pos + f1_neg) / 2.0
-
-                best_idx = int(np.argmax(macro_f1s))
-                best_f1 = float(macro_f1s[best_idx])
-                best_t = float(thresholds[best_idx])
-
-                final_preds = preds_matrix[:, best_idx]
-                acc = accuracy_score(subject_labels, final_preds)
-                roc_auc = roc_auc_score(subject_labels, scores) if len(np.unique(subject_labels)) > 1 else 0.5
-
-                results[strat] = {
-                    "subject_macro_f1": best_f1,
-                    "optimal_threshold": best_t,
-                    "subject_accuracy": acc,
-                    "roc_auc": roc_auc
-                }
-            else:
-                preds = np.argmax(scores, axis=1)
-                macro_f1 = f1_score(subject_labels, preds, average="macro", zero_division=0)
-                acc = accuracy_score(subject_labels, preds)
-                results[strat] = {
-                    "subject_macro_f1": macro_f1,
-                    "optimal_threshold": 0.5,
-                    "subject_accuracy": acc,
-                    "roc_auc": 0.5
-                }
-
-        return results
-
-    def fit(self, train_manifest: Path, val_manifest: Path) -> float:
+    def train(self, train_path: Path, val_path: Path) -> float:
         allowed_stages = [s.strip() for s in self.config.filter_stage.split(",") if s.strip()] if self.config.stages else None
 
         # 1. Instantiate Datasets using built-in stage filtering
         train_ds = PANSleepEEGDataset(
-            manifest_csv=train_manifest,
+            manifest_csv=train_path,
             data_dir=self.config.data_dir,
             filter_stage=allowed_stages
         )
         val_ds = PANSleepEEGDataset(
-            manifest_csv=val_manifest,
+            manifest_csv=val_path,
             data_dir=self.config.data_dir,
             filter_stage=allowed_stages
         )
@@ -231,7 +145,7 @@ class EndToEndTrainer:
         )
 
         # Extract Subject IDs for validation pooling
-        df_val = pd.read_csv(val_manifest)
+        df_val = pd.read_csv(val_path)
         if allowed_stages and "stage" in df_val.columns:
             df_val = df_val[df_val["stage"].astype(str).str.upper().isin([s.upper() for s in allowed_stages])]
 
@@ -241,9 +155,6 @@ class EndToEndTrainer:
             else [Path(p).stem for p in df_val["npy_path"]]
         )
         val_targets = np.array([sample[1] for sample in val_ds.samples])
-
-        # Pre-index subjects for fast validation evaluation
-        self._prepare_subject_indices(val_subject_ids, val_targets)
 
         # 3. Build Model Architecture
         model = CBraModE2EClassifier(
@@ -272,9 +183,9 @@ class EndToEndTrainer:
 
         optimizer_grouped_parameters = []
         if backbone_trainable:
-            optimizer_grouped_parameters.append({"params": backbone_trainable, "lr": self.config.lr_backbone})
+            optimizer_grouped_parameters.append({"params": backbone_trainable, "lr": self.config.backbone_lr})
         if head_trainable:
-            optimizer_grouped_parameters.append({"params": head_trainable, "lr": self.config.lr_head})
+            optimizer_grouped_parameters.append({"params": head_trainable, "lr": self.config.head_lr})
 
         optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=self.config.weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=self.config.epochs, eta_min=self.config.min_lr)
@@ -286,7 +197,7 @@ class EndToEndTrainer:
 
         self.logger.info(
             f"Starting E2E Training ({self.config.epochs} Epochs | Batch Size: {self.config.batch_size} | "
-            f"Strategy: {self.config.imbalance_strategy} | Backbone LR: {self.config.lr_backbone} | Head LR: {self.config.lr_head})"
+            f"Strategy: {self.config.imbalance_strategy} | Backbone LR: {self.config.backbone_lr} | Head LR: {self.config.head_lr})"
         )
         self.logger.info("=" * 125)
 
@@ -348,7 +259,7 @@ class EndToEndTrainer:
             val_probs = np.concatenate(val_probs, axis=0)
 
             # Subject-Level Multi-Strategy Pooling Evaluation
-            pooling_results = self._evaluate_subject_pooling(val_probs)
+            pooling_results = self.evaluate_subject_pooling(val_probs, val_subject_ids, val_targets)
             primary_metrics = pooling_results[self.config.primary_pooling]
             primary_f1 = primary_metrics["subject_macro_f1"]
             primary_t = primary_metrics["optimal_threshold"]
@@ -395,33 +306,19 @@ class EndToEndTrainer:
 
 
 # =====================================================================
-# 4. CLI ORCHESTRATOR
+# 3. CLI ORCHESTRATOR
 # =====================================================================
 
 def parse_cli_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="CBraMod End-to-End Fine-Tuning Pipeline with Imbalance Strategy Controls",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    """Parses command-line arguments for the E2E fine-tuning pipeline."""
+    parser = setup_pipeline_cli_parser(
+        description="CBraMod End-to-End Fine-Tuning Pipeline"
     )
-    
-    # Manifest & Data Sources
-    data_group = parser.add_argument_group("Data & Checkpoints")
-    data_group.add_argument("--train-manifest", type=str, required=True, help="Path to training manifest CSV")
-    data_group.add_argument("--val-manifest", type=str, required=True, help="Path to validation manifest CSV")
-    data_group.add_argument("--data-dir", type=str, default=None, help="Root directory for .npy EEG files")
-    data_group.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save fine-tuned checkpoints")
-    data_group.add_argument("--probe-head-ckpt", type=str, default=None, help="Optional path to warm-start linear probe head checkpoint")
 
-    # Imbalance & Stage Controls
-    strat_group = parser.add_argument_group("Imbalance & Stage Controls")
-    strat_group.add_argument(
-        "--imbalance-strategy", 
-        type=str, 
-        choices=["sampler", "loss_weights", "none"], 
-        default="loss_weights", 
-        help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
-    )
-    strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into PANSleepEEGDataset (e.g., N2,N3)")
+    # Checkpoints
+    ckpt_group = parser.add_argument_group("Checkpoint Controls")
+    ckpt_group.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save fine-tuned checkpoints")
+    ckpt_group.add_argument("--probe-head-ckpt", type=str, default=None, help="Optional path to warm-start linear probe head checkpoint")
 
     # Unfreezing Controls
     unfreeze_group = parser.add_argument_group("Backbone Unfreezing Controls")
@@ -432,27 +329,9 @@ def parse_cli_args() -> argparse.Namespace:
     unfreeze_group.add_argument("--unfreeze-last-n", type=int, default=2, help="Number of top backbone submodules to unfreeze in 'partial' mode")
 
     # Hyperparameters
-    hp_group = parser.add_argument_group("Hyperparameters")
-    hp_group.add_argument("--epochs", type=int, default=20, help="Maximum fine-tuning epochs")
-    hp_group.add_argument("--batch-size", type=int, default=32, help="Batch size for training")
-    hp_group.add_argument("--lr-backbone", type=float, default=1e-5, help="Learning rate for trainable backbone parameters")
-    hp_group.add_argument("--lr-head", type=float, default=3e-4, help="Learning rate for classification head")
-    hp_group.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing scheduler")
-    hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay")
+    hp_group = parser.get_argument_group("Pipeline Specific Hyperparameters")
+    hp_group.add_argument("--backbone-lr", type=float, default=1e-5, help="Learning rate for trainable backbone parameters")
     hp_group.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
-
-    # System & Validation Options
-    sys_group = parser.add_argument_group("System & Pooling Options")
-    sys_group.add_argument("--num-channels", type=int, default=64, help="EEG Channel count")
-    sys_group.add_argument("--sfreq", type=float, default=200.0, help="EEG sampling frequency")
-    sys_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
-    sys_group.add_argument("--primary-pooling", type=str, default="p85_score", choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"])
-    sys_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio for top-K pooling methods")
-    sys_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for pathology burden ratio")
-    sys_group.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers")
-    sys_group.add_argument("--patience", type=int, default=7, help="Early stopping patience")
-    sys_group.add_argument("--seed", type=int, default=42, help="Random seed")
-    sys_group.add_argument("--no-amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
 
     args = parser.parse_args()
     args.use_amp = not args.no_amp
@@ -465,7 +344,7 @@ def main():
 
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    logger = setup_logger(checkpoint_dir / "e2e_finetune.log")
+    logger = setup_logger(checkpoint_dir / args.log_filename)
 
     trainer = EndToEndTrainer(args, logger)
     trainer.fit(train_manifest=Path(args.train_manifest), val_manifest=Path(args.val_manifest))
