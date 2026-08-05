@@ -37,7 +37,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
-from cbramod_common import CBraModFeatureExtractor, CBraModTrainer, LinearProbeHead, PANSleepEEGDataset, setup_data_loader_and_criterion, add_pipeline_args_common, setup_pipeline_cli_parser
+from cbramod_common import CBraModFeatureExtractor, CBraModTrainer, LinearProbeHead, PANSleepEEGDataset, setup_data_loader_and_criterion, setup_pipeline_cli_parser
 
 
 # =====================================================================
