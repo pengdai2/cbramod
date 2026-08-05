@@ -102,7 +102,7 @@ def load_model_checkpoint(
     model: torch.nn.Module, 
     checkpoint_path: Path, 
     device: torch.device
-) -> Tuple[torch.nn.Module, float, Union[int, str]]:
+) -> Tuple[torch.nn.Module, dict, Union[int, str]]:
     """
     Loads checkpoint weights into the model architecture.
     Handles both head-only (backbone frozen / LP-FT) state dicts and full model state dicts.
@@ -120,7 +120,7 @@ def load_model_checkpoint(
     else:
         state_dict = checkpoint
 
-    optimal_threshold = checkpoint.get("optimal_threshold", 0.5) if isinstance(checkpoint, dict) else 0.5
+    optimal_thresholds = checkpoint.get("optimal_thresholds", {}) if isinstance(checkpoint, dict) else {}
     epoch = checkpoint.get("epoch", "N/A") if isinstance(checkpoint, dict) else "N/A"
 
     # Strategy 1: Attempt direct full-model state dict load (Full Fine-Tuning)
@@ -155,7 +155,7 @@ def load_model_checkpoint(
     if unexpected_keys:
         print(f"  [Info] Unexpected keys: {len(unexpected_keys)}")
 
-    return model, optimal_threshold, epoch
+    return model, optimal_thresholds, epoch
 
 
 def run_subject_inference(
@@ -240,7 +240,7 @@ def evaluate_clinical_cohort(
     )
 
     # 3. Load Model Checkpoint (Head-Only or Full-Model)
-    model, ckpt_threshold, epoch = load_model_checkpoint(model, checkpoint_path, device)
+    model, ckpt_thresholds, epoch = load_model_checkpoint(model, checkpoint_path, device)
     model.to(device)
     model.eval()
 
@@ -248,9 +248,12 @@ def evaluate_clinical_cohort(
     if override_threshold is not None:
         operating_threshold = override_threshold
         print(f"Using explicitly set decision threshold: {operating_threshold:.4f}")
-    else:
-        operating_threshold = ckpt_threshold
+    elif pooling_strategy in ckpt_thresholds:
+        operating_threshold = ckpt_thresholds.get(pooling_strategy)
         print(f"Using checkpoint operating threshold: {operating_threshold:.4f}")
+    else:
+        operating_threshold = 0.5
+        print(f"Falling back to default operating threshold: {operating_threshold:.4f}")
 
     # Determine Active Strategies
     if pooling_strategy == "all":
