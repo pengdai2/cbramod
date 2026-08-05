@@ -140,6 +140,24 @@ def run_subject_inference(
     return all_window_probs, window_data, num_windows
 
 
+def get_operating_threshold(
+    pooling_strategy: str,
+    override_threshold: Optional[float],
+    ckpt_thresholds: Dict[str, float]
+) -> float:
+    # Determine Operating Decision Threshold
+    if override_threshold is not None:
+        operating_threshold = override_threshold
+        print(f"Using explicitly set decision threshold: {operating_threshold:.4f}")
+    elif pooling_strategy in ckpt_thresholds:
+        operating_threshold = ckpt_thresholds.get(pooling_strategy)
+        print(f"Using checkpoint operating threshold: {operating_threshold:.4f}")
+    else:
+        operating_threshold = 0.5
+        print(f"Falling back to default operating threshold: {operating_threshold:.4f}")
+    return operating_threshold
+
+
 def evaluate_clinical_cohort(
     checkpoint_path: Path,
     test_manifest_path: Path,
@@ -173,17 +191,6 @@ def evaluate_clinical_cohort(
     model, ckpt_thresholds, epoch = load_model_checkpoint(model, checkpoint_path, device)
     model.to(device)
     model.eval()
-
-    # Determine Operating Decision Threshold
-    if override_threshold is not None:
-        operating_threshold = override_threshold
-        print(f"Using explicitly set decision threshold: {operating_threshold:.4f}")
-    elif pooling_strategy in ckpt_thresholds:
-        operating_threshold = ckpt_thresholds.get(pooling_strategy)
-        print(f"Using checkpoint operating threshold: {operating_threshold:.4f}")
-    else:
-        operating_threshold = 0.5
-        print(f"Falling back to default operating threshold: {operating_threshold:.4f}")
 
     # Determine Active Strategies
     if pooling_strategy == "all":
@@ -235,6 +242,11 @@ def evaluate_clinical_cohort(
 
             for strat in active_strategies:
                 score = pooled_dict[strat]
+                operating_threshold = get_operating_threshold(
+                    pooling_strategy=strat,
+                    override_threshold=override_threshold,
+                    ckpt_thresholds=ckpt_thresholds
+                )
                 pred_class = 1 if score >= operating_threshold else 0
                 subject_results[strat].append({
                     "subject_id": subject_id,
@@ -273,6 +285,11 @@ def evaluate_clinical_cohort(
 
     # 5. Analyze and Report Performance Metrics
     for strat in active_strategies:
+        operating_threshold = get_operating_threshold(
+            pooling_strategy=strat,
+            override_threshold=override_threshold,
+            ckpt_thresholds=ckpt_thresholds
+        )
         analyze_subject_results(
             subject_results=subject_results[strat],
             strategy=strat,
