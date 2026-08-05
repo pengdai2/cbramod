@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Single-Subject EEG Window Noise & Sleep Stage Correlation Analyzer.
 

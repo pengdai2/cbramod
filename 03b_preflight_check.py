@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Preflight Data Sanity Check CLI for Sleep EEG Pipeline.
 

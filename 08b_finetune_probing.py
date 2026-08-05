@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Production CLI Pipeline for CBraMod with Manifest-based .npy Datasets.
 Supports Stage-Filtered Embedding Extraction, Window-Level Probe Training & 

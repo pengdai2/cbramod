@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 EEG Window Slicing Pipeline with Continuous Preprocessing, Spatial Validation, 
 Spherical Spline Interpolation, and Full Debug Logging for Channel & Window Rejections.
