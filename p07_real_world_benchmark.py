@@ -5,7 +5,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 import mne
 
-from real_world_benchmark import fetch_and_preprocess_sleep_edf, CBraModRealWorldBenchmark
+from cbramod_common import fetch_and_preprocess_sleep_edf, CBraModRealWorldBenchmark
 
 
 def run_real_world_benchmark(subject_id: int = 0, batch_size: int = 16, device_str: str = "cuda"):

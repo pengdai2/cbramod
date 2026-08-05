@@ -59,7 +59,7 @@ try:
 except ImportError:
     raise ImportError("The 'braindecode' library is required. Install via: pip install braindecode")
 
-from real_world_benchmark import RealSleepEEGDataset
+from cbramod_common import RealSleepEEGDataset
 
 
 # =====================================================================

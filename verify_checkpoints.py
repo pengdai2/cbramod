@@ -6,7 +6,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.metrics import classification_report, f1_score, accuracy_score
 import numpy as np
 
-from real_world_benchmark import fetch_and_preprocess_sleep_edf, CBraModRealWorldBenchmark
+from cbramod_common import fetch_and_preprocess_sleep_edf, CBraModRealWorldBenchmark
 
 def verify_cbramod_checkpoints(subject_id: int = 0, epochs: int = 10, batch_size: int = 16, device_str: str = "cuda"):
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")

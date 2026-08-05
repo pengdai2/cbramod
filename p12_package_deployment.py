@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 # Import architecture definition from our benchmark script
-from real_world_benchmark import CBraModRealWorldBenchmark
+from cbramod_common import CBraModRealWorldBenchmark
 
 
 def create_deployment_package(

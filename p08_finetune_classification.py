@@ -11,7 +11,7 @@ from sklearn.metrics import classification_report, f1_score, accuracy_score
 from tqdm import tqdm
 
 # Import model architecture setup from benchmark module
-from real_world_benchmark import CBraModRealWorldBenchmark, RealSleepEEGDataset
+from cbramod_common import CBraModRealWorldBenchmark, RealSleepEEGDataset
 
 
 class EarlyStopping:

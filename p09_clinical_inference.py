@@ -18,7 +18,7 @@ from sklearn.metrics import (
 from tqdm import tqdm
 
 # Import architecture from benchmark module
-from real_world_benchmark import CBraModRealWorldBenchmark
+from cbramod_common import CBraModRealWorldBenchmark
 
 
 def compute_pooled_scores(
