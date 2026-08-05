@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Production End-to-End Fine-Tuning Pipeline for CBraMod.
 Uses RealSleepEEGDataset's native stage filtering, CBraModRealWorldBenchmark,
@@ -8,10 +7,8 @@ vectorized subject-level validation pooling.
 """
 
 import argparse
-import gc
 import logging
 from pathlib import Path
-import sys
 import time
 from typing import Dict, List, Optional
 

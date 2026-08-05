@@ -7,14 +7,14 @@ from torch.utils.data import DataLoader
 from braindecode.models import CBraMod
 
 
-def run_benchmark_verification(
+def verify_pipeline_setup(
     batch_size: int = 16, 
     num_samples: int = 128, 
     device_str: str = "cuda"
 ):
-    """Executes a benchmark forward/backward pass and measures throughput (samples/sec)."""
+    """Executes a forward/backward pass and measures throughput (samples/sec)."""
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
-    print(f"=== Running CBraMod Pipeline Benchmark Verification on [{device}] ===")
+    print(f"=== Running CBraMod Pipeline Verification on [{device}] ===")
 
     # 1. Instantiate Data Pipeline
     dataset = SyntheticEEGDataset(num_samples=num_samples, channels=64, time_samples=6000)
@@ -50,7 +50,7 @@ def run_benchmark_verification(
     elapsed = time.time() - start_time
     throughput = num_samples / elapsed
 
-    print("\n=== Benchmark Verification Summary ===")
+    print("\n=== Pipeline Verification Summary ===")
     print(f"  - Total Elapsed Time: {elapsed:.2f} seconds")
     print(f"  - Processing Throughput: {throughput:.2f} samples/sec")
     print(f"  - Mean Batch Loss: {total_loss / len(loader):.4f}")
@@ -63,14 +63,14 @@ def run_benchmark_verification(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="CBraMod Pipeline Benchmark Verification")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for benchmark test")
+    parser = argparse.ArgumentParser(description="CBraMod Pipeline Verification")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for the test")
     parser.add_argument("--num_samples", type=int, default=128, help="Number of synthetic samples")
     parser.add_argument("--device", type=str, default="cuda", help="Target computing device (cuda/cpu)")
 
     args = parser.parse_args()
 
-    run_benchmark_verification(
+    verify_pipeline_setup(
         batch_size=args.batch_size,
         num_samples=args.num_samples,
         device_str=args.device
