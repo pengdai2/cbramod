@@ -15,6 +15,11 @@ from pathlib import Path
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from einops.layers.torch import Rearrange
 from braindecode.models import CBraMod
+from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    roc_auc_score
+)
 
 
 class PANSleepEEGDataset(Dataset):

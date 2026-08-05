@@ -21,7 +21,13 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 # Import shared architectures and utilities without code duplication
-from cbramod_common import CBraModE2EClassifier, CBraModTrainer, LinearProbeHead, PANSleepEEGDataset, compute_pooled_scores, setup_data_loader_and_criterion, setup_pipeline_cli_parser
+from cbramod_common import (
+    CBraModE2EClassifier,
+    CBraModTrainer,
+    PANSleepEEGDataset,
+    setup_data_loader_and_criterion,
+    setup_pipeline_cli_parser
+)
 from cbramod_utils import seed_everything, setup_logger
 
 
