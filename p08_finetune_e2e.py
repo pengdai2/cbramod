@@ -159,7 +159,12 @@ class EndToEndTrainer(CBraModTrainer):
         # 3. Build Model Architecture
         model = CBraModE2EClassifier(
             num_channels=self.config.num_channels,
-            num_classes=self.config.num_classes
+            sfreq=self.config.sfreq,
+            num_patches=self.config.num_patches,
+            emb_dim=self.config.cbra_dim,
+            hidden_dim=self.config.head_dim,
+            num_classes=self.config.num_classes,
+            dropout=self.config.dropout
         ).to(self.device)
 
         # Load Probing Head Checkpoint if specified

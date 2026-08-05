@@ -165,10 +165,10 @@ class ProbeTrainer(CBraModTrainer):
 
         head = LinearProbeHead(
             num_patches=self.config.num_patches,
-            emb_dim=self.config.emb_dim,
-            hidden_dim=self.config.hidden_dim,
+            emb_dim=self.config.cbra_dim,
+            hidden_dim=self.config.head_dim,
             num_classes=self.config.num_classes,
-            dropout=self.config.dropout_prob
+            dropout=self.config.dropout
         ).to(self.device)
 
         optimizer = torch.optim.AdamW(head.parameters(), lr=self.config.head_lr, weight_decay=self.config.weight_decay)

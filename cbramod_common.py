@@ -636,6 +636,8 @@ def setup_pipeline_cli_parser(
     cbra_group.add_argument("--num-channels", type=int, default=64, help="EEG Channel count")
     cbra_group.add_argument("--num-patches", type=int, default=30, help="Number of temporal patches in CBraMod")
     cbra_group.add_argument("--sfreq", type=float, default=200.0, help="EEG sampling frequency")
+    cbra_group.add_argument("--cbra-dim", type=int, default=200, help="CBraMod embedding dimension per patch")
+    cbra_group.add_argument("--head-dim", type=int, default=128, help="Head dimension")
     cbra_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
 
     # Manifest & Data Paths
@@ -674,7 +676,6 @@ def setup_pipeline_cli_parser(
     hp_group.add_argument("--head-lr", type=float, default=1e-4, help="Initial learning rate for classification head")
     hp_group.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing scheduler")
     hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay regularizer")
-    hp_group.add_argument("--hidden-dim", type=int, default=128, help="Bottleneck linear layer dimension")
     hp_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
 
     # System Controls
