@@ -16,8 +16,6 @@ from sklearn.metrics import (
     roc_curve,
 )
 from tqdm import tqdm
-
-# Import architecture from benchmark module
 from cbramod_common import CBraModE2EClassifier, compute_pooled_scores
 
 
@@ -65,23 +63,21 @@ def load_model_checkpoint(
     try:
         model.load_state_dict(state_dict, strict=True)
         print(f"Successfully loaded full model checkpoint (strict=True) from epoch {epoch}.")
-        return model, optimal_threshold, epoch
+        return model, optimal_thresholds, epoch
     except Exception:
         pass
 
     # Strategy 2: Attempt head-only state dict load into model.head (Linear Probe / Head Frozen)
     head_state_dict = {}
     for k, v in state_dict.items():
-        if k.startswith("head."):
-            head_state_dict[k.replace("head.", "")] = v
-        elif not k.startswith("backbone.") and not k.startswith("encoder."):
+        if not k.startswith("backbone.") and not k.startswith("encoder."):
             head_state_dict[k] = v
 
     if hasattr(model, "head") and head_state_dict:
         try:
             model.head.load_state_dict(head_state_dict, strict=True)
             print(f"Successfully loaded head-only state dict into model.head from epoch {epoch}.")
-            return model, optimal_threshold, epoch
+            return model, optimal_thresholds, epoch
         except Exception:
             pass
 
