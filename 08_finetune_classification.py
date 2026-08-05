@@ -207,7 +207,7 @@ def run_fine_tuning_pipeline(
         train_total = 0
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch:02d}/{epochs:02d} [Train]", leave=False)
-        for x_batch, y_batch in pbar:
+        for x_batch, y_batch, s_batch in pbar:
             x_batch, y_batch = x_batch.to(device), y_batch.to(device)
 
             optimizer.zero_grad()
@@ -234,7 +234,7 @@ def run_fine_tuning_pipeline(
 
         val_pbar = tqdm(val_loader, desc=f"Epoch {epoch:02d}/{epochs:02d} [Val]  ", leave=False)
         with torch.no_grad():
-            for x_batch, y_batch in val_pbar:
+            for x_batch, y_batch, s_batch in val_pbar:
                 x_batch, y_batch = x_batch.to(device), y_batch.to(device)
                 logits = model(x_batch)
                 loss = criterion(logits, y_batch)

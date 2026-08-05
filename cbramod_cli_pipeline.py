@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
 Production CLI Pipeline for CBraMod with Manifest-based .npy Datasets.
-Supports Window-Level Probe Training & Subject-Level Multi-Strategy Pooling Evaluation.
+Supports Stage-Filtered Embedding Extraction, Window-Level Probe Training & 
+Subject-Level Multi-Strategy Pooling Evaluation.
 
 Usage:
-  # 1. First run (Extracts embeddings & performs window training with subject-level validation):
+  # 1. First run (Extracts embeddings filtered by stage & performs probe training):
   python cbramod_manifest_pipeline.py \
       --train-manifest /data/eeg_study/train_manifest.csv \
       --val-manifest /data/eeg_study/val_manifest.csv \
       --data-dir /data/eeg_study/npy_files \
+      --filter-stage N2,N3 \
       --num-workers 8
 
   # 2. Subsequent runs (Uses cached embeddings, trains head with custom primary pooling):
@@ -18,10 +20,12 @@ Usage:
   python cbramod_manifest_pipeline.py \
       --train-manifest /data/eeg_study/train_manifest.csv \
       --val-manifest /data/eeg_study/val_manifest.csv \
+      --filter-stage N2,N3 \
       --force-extract
 """
 
 import argparse
+from collections import defaultdict
 from dataclasses import dataclass
 import gc
 import json
@@ -70,6 +74,7 @@ class PipelineConfig:
     train_manifest_path: Optional[Path] = None
     val_manifest_path: Optional[Path] = None
     data_dir: Optional[Path] = None
+    filter_stage: Optional[str] = None
     train_cache_name: str = "cached_train_embeddings.pt"
     val_cache_name: str = "cached_val_embeddings.pt"
     best_head_filename: str = "cbramod_head_best.pt"
@@ -127,6 +132,7 @@ def parse_cli_args() -> PipelineConfig:
     data_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON)")
     data_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON)")
     data_group.add_argument("--data-dir", type=str, default=None, help="Root directory containing .npy files")
+    data_group.add_argument("--filter-stage", type=str, default=None, help="Comma-separated sleep stages to filter (e.g., 'N2,N3')")
     data_group.add_argument("--cache-dir", type=str, default="/opt/cbra_data/checkpoints", help="Directory for cached embeddings & checkpoints")
     data_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
 
@@ -167,6 +173,7 @@ def parse_cli_args() -> PipelineConfig:
         train_manifest_path=Path(args.train_manifest) if args.train_manifest else None,
         val_manifest_path=Path(args.val_manifest) if args.val_manifest else None,
         data_dir=Path(args.data_dir) if args.data_dir else None,
+        filter_stage=args.filter_stage,
         force_extract=args.force_extract,
         primary_pooling=args.primary_pooling,
         top_percentile=args.top_percentile,
@@ -313,28 +320,27 @@ class LinearProbeHead(nn.Module):
 
 
 # =====================================================================
-# 5. EMBEDDING EXTRACTION ENGINE WITH SUBJECT ID TRACKING
+# 5. EMBEDDING EXTRACTION ENGINE WITH STAGE FILTERING & SUBJECT ID TRACKING
 # =====================================================================
 
 class EmbeddingManager:
-    """Manages feature extraction from manifest .npy files and preserves subject IDs."""
+    """Manages feature extraction from manifest .npy files with optional stage filtering."""
     def __init__(self, config: PipelineConfig, logger: logging.Logger):
         self.config = config
         self.logger = logger
         self.device = torch.device(config.device)
 
     def extract_and_cache(self, manifest_path: Path, output_cache_path: Path, split_name: str) -> None:
-        """Reads .npy files, extracts backbone embeddings, and caches feats + labels + subject_ids."""
-        self.logger.info(f"[{split_name.upper()}] Initializing manifest dataset from: {manifest_path}")
-        dataset = RealSleepEEGDataset(manifest_csv=manifest_path, data_dir=self.config.data_dir)
-        self.logger.info(f"[{split_name.upper()}] Successfully parsed {len(dataset):,} .npy references.")
-
-        # Extract subject IDs from manifest
-        df = pd.read_csv(manifest_path)
-        if "subject_id" in df.columns:
-            subject_ids = df["subject_id"].astype(str).tolist()
-        else:
-            subject_ids = [Path(p).stem for p in df["npy_path"]]
+        """Reads .npy files, applies stage filtering, extracts backbone embeddings, and caches feats + labels + subject_ids."""
+        filter_str = f" [Filter: {self.config.filter_stage}]" if self.config.filter_stage else ""
+        self.logger.info(f"[{split_name.upper()}] Initializing RealSleepEEGDataset from: {manifest_path}{filter_str}")
+        
+        dataset = RealSleepEEGDataset(
+            manifest_csv=manifest_path, 
+            data_dir=self.config.data_dir,
+            filter_stage=self.config.filter_stage
+        )
+        self.logger.info(f"[{split_name.upper()}] Successfully indexed {len(dataset):,} valid stage-filtered window references.")
 
         loader = DataLoader(
             dataset,
@@ -352,17 +358,18 @@ class EmbeddingManager:
         ).to(self.device)
         extractor.eval()
 
-        all_embeddings, all_labels = [], []
+        all_embeddings, all_labels, all_subject_ids = [], [], []
         start_time = time.time()
 
         with torch.no_grad():
-            for batch_x, batch_y in tqdm(loader, desc=f"Extracting {split_name}", unit="batch"):
+            for batch_x, batch_y, batch_subj in tqdm(loader, desc=f"Extracting {split_name}", unit="batch"):
                 batch_x = batch_x.to(self.device, non_blocking=True)
                 with torch.amp.autocast(device_type="cuda", enabled=(self.config.use_amp and self.device.type == "cuda")):
                     pooled_feats = extractor(batch_x)
 
                 all_embeddings.append(pooled_feats.cpu().float())
                 all_labels.append(batch_y.cpu())
+                all_subject_ids.extend(batch_subj)
 
         cached_feats = torch.cat(all_embeddings, dim=0)
         cached_labels = torch.cat(all_labels, dim=0)
@@ -370,21 +377,21 @@ class EmbeddingManager:
         torch.save({
             "feats": cached_feats, 
             "labels": cached_labels,
-            "subject_ids": subject_ids
+            "subject_ids": all_subject_ids
         }, output_cache_path)
 
-        del extractor, dataset, loader, all_embeddings, all_labels
+        del extractor, dataset, loader, all_embeddings, all_labels, all_subject_ids
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         elapsed = time.time() - start_time
         file_size_mb = output_cache_path.stat().st_size / (1024 * 1024)
-        self.logger.info(f"✓ [{split_name.upper()}] Extraction complete ({elapsed:.1f}s) | Samples: {len(cached_feats):,} | Cache Size: {file_size_mb:.2f} MB")
+        self.logger.info(f"✓ [{split_name.upper()}] Extraction complete ({elapsed:.1f}s) | Windows: {len(cached_feats):,} | Cache Size: {file_size_mb:.2f} MB")
 
 
 # =====================================================================
-# 6. TRAINER ENGINE WITH WINDOW TRAINING & SUBJECT POOLING VAL
+# 6. TRAINER ENGINE WITH WINDOW TRAINING & FAST SUBJECT POOLING VAL
 # =====================================================================
 
 class ProbeTrainer:
@@ -401,25 +408,24 @@ class ProbeTrainer:
         val_subject_ids: List[str]
     ) -> Dict[str, Dict[str, float]]:
         """
-        Groups window probabilities by subject, applies all 4 pooling strategies, 
-        and performs operating threshold tuning for binary classification or max score for multi-class.
+        Groups window probabilities by subject using an O(N) pre-indexed map, 
+        applies all 4 pooling strategies, and performs threshold tuning.
         """
-        df_val = pd.DataFrame({
-            "subject_id": val_subject_ids,
-            "label": val_targets
-        })
-        
         strategies = ["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"]
-        unique_subjects = df_val["subject_id"].unique()
-        
-        # Aggregate pooled scores per subject
+
+        # O(N) linear indexing pass to pre-group window indices by subject ID
+        subj_to_indices = defaultdict(list)
+        for idx, subj in enumerate(val_subject_ids):
+            subj_to_indices[subj].append(idx)
+
         subject_data = {strat: [] for strat in strategies}
         subject_labels = []
 
-        for subj in unique_subjects:
-            idx = np.where(np.array(val_subject_ids) == subj)[0]
-            subj_probs = val_probs[idx]
-            subj_gt = val_targets[idx[0]]
+        # Iterate through pre-grouped subject slices
+        for subj, idxs in subj_to_indices.items():
+            idx_arr = np.array(idxs, dtype=np.int64)
+            subj_probs = val_probs[idx_arr]
+            subj_gt = val_targets[idx_arr[0]]
             subject_labels.append(subj_gt)
 
             for strat in strategies:
@@ -573,7 +579,7 @@ class ProbeTrainer:
             val_targets = np.concatenate(val_targets)
             val_probs = np.concatenate(val_probs)
 
-            # 3. Subject-Level Multi-Strategy Pooling & Threshold Calibration
+            # 3. Fast Subject-Level Multi-Strategy Pooling & Threshold Calibration
             pooling_results = self._evaluate_subject_pooling(val_probs, val_targets, val_subject_ids)
             
             primary_metrics = pooling_results[self.config.primary_pooling]
