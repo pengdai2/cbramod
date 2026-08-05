@@ -145,16 +145,14 @@ def get_operating_threshold(
     override_threshold: Optional[float],
     ckpt_thresholds: Dict[str, float]
 ) -> float:
+    """Determines the operating threshold based on the pooling strategy and override settings."""
     # Determine Operating Decision Threshold
     if override_threshold is not None:
         operating_threshold = override_threshold
-        print(f"Using explicitly set decision threshold: {operating_threshold:.4f}")
     elif pooling_strategy in ckpt_thresholds:
         operating_threshold = ckpt_thresholds.get(pooling_strategy)
-        print(f"Using checkpoint operating threshold: {operating_threshold:.4f}")
     else:
         operating_threshold = 0.5
-        print(f"Falling back to default operating threshold: {operating_threshold:.4f}")
     return operating_threshold
 
 
