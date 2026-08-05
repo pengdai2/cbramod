@@ -3,14 +3,14 @@ import logging
 import re
 import numpy as np
 import pandas as pd
-from p02_slice_eeg_dataset import STAGE_NORM_MAP
 import torch
 import torch.nn as nn
 import mne
+import yasa
 import safetensors
 from typing import List, Tuple, Optional, Union, Set
 from pathlib import Path
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from einops.layers.torch import Rearrange
 from braindecode.models import CBraMod
 
@@ -314,6 +314,16 @@ def compute_pooled_scores(
 
     else:
         raise ValueError(f"Unsupported pooling method: {method}")
+
+
+# Standard sleep stage string normalization map
+STAGE_NORM_MAP = {
+    "sleep stage w": "W", "stage w": "W", "wake": "W", "0": "W",
+    "sleep stage n1": "N1", "stage 1": "N1", "n1": "N1", "1": "N1",
+    "sleep stage n2": "N2", "stage 2": "N2", "n2": "N2", "2": "N2",
+    "sleep stage n3": "N3", "stage 3": "N3", "stage 4": "N3", "n3": "N3", "3": "N3", "4": "N3",
+    "sleep stage r": "REM", "stage rem": "REM", "rem": "REM", "5": "REM"
+}
 
 
 def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: float = 30.0) -> List[str]:

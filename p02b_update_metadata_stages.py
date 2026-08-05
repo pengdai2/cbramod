@@ -89,8 +89,6 @@ def run_metadata_update_pipeline(
     dst_dir = Path(dst_dir).resolve()
 
     files = find_eeg_files(src_dir)
-    files = sorted(files)
-
     print(f"Found {len(files)} raw files to match against metadata in: {dst_dir}")
 
     tasks = [

@@ -27,18 +27,12 @@ from pathlib import Path
 from typing import Dict, List, Tuple, Union
 from cbramod_common import extract_epoch_stages, predict_epoch_stages_yasa
 import mne
+import yasa
 import numpy as np
 from scipy.signal import hilbert
 from tqdm import tqdm
-from cbramod_utils import load_raw_eeg, valid_regex
+from cbramod_utils import find_eeg_files, load_raw_eeg, valid_regex
 
-try:
-    import yasa
-    HAS_YASA = True
-except ImportError:
-    HAS_YASA = False
-
-SUPPORTED_EXTENSIONS = {".fif", ".edf", ".bdf", ".vhdr"}
 
 # Standard CBraMod 64-channel 10-20 spatial layout topology
 CBRMOD_STANDARD_64 = [
@@ -51,15 +45,6 @@ CBRMOD_STANDARD_64 = [
     'PZ', 'P2', 'P4', 'P6', 'P8', 'PO8', 'PO4', 'POZ',
     'PO3', 'PO7', 'O1', 'OZ', 'O2', 'CB1', 'CB2', 'IZ'
 ]
-
-# Standard sleep stage string normalization map
-STAGE_NORM_MAP = {
-    "sleep stage w": "W", "stage w": "W", "wake": "W", "0": "W",
-    "sleep stage n1": "N1", "stage 1": "N1", "n1": "N1", "1": "N1",
-    "sleep stage n2": "N2", "stage 2": "N2", "n2": "N2", "2": "N2",
-    "sleep stage n3": "N3", "stage 3": "N3", "stage 4": "N3", "n3": "N3", "3": "N3", "4": "N3",
-    "sleep stage r": "REM", "stage rem": "REM", "rem": "REM", "5": "REM"
-}
 
 logger = logging.getLogger("EEG_Pipeline")
 
@@ -661,11 +646,7 @@ def run_slicing_pipeline(
     src_dir = Path(src_dir).resolve()
     dst_dir = Path(dst_dir).resolve()
 
-    files = []
-    for ext in SUPPORTED_EXTENSIONS:
-        files.extend(src_dir.rglob(f"*{ext}"))
-    files = sorted(files)
-
+    files = find_eeg_files(src_dir)
     print(f"Found {len(files)} files for slicing. Strategy: '{strategy.upper()}', Window: {window_sec}s")
 
     tasks = [
