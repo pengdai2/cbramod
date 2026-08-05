@@ -452,3 +452,72 @@ def setup_data_loader_and_criterion(
         raise ValueError(f"Invalid imbalance strategy: {imbalance_strategy}. Choose 'sampler', 'loss_weights', or 'none'.")
 
     return train_loader, criterion
+
+
+def evaluate_subject_quality(
+    meta: dict,
+    max_rejection_rate: float = 0.15,
+    max_n3_rejection_rate: float = 0.10,
+    min_valid_hours: float = 4.5,
+    window_duration_sec: float = 30.0
+) -> Tuple[bool, dict, str]:
+    """
+    Evaluates slice-level metadata for quality screening and subject acceptance.
+
+    Checks:
+    1. Overall window rejection rate <= max_rejection_rate
+    2. N3 stage window rejection rate <= max_n3_rejection_rate
+    3. Total usable sleep duration >= min_valid_hours
+    """
+    slices = meta.get("slices", [])
+    stages = meta.get("stages", [])
+    total_slices = meta.get("num_slices", len(slices))
+
+    if total_slices == 0:
+        return False, {}, "EMPTY_RECORDING"
+
+    # Extract or infer slice validity
+    if slices:
+        valid_mask = [s.get("is_valid", True) for s in slices]
+    else:
+        # Fallback if slice details are omitted
+        valid_mask = [True] * total_slices
+
+    total_valid = sum(valid_mask)
+    total_invalid = total_slices - total_valid
+    overall_rejection_rate = total_invalid / float(total_slices)
+    valid_hours = (total_valid * window_duration_sec) / 3600.0
+
+    # Calculate N3 stage specific rejection rate if stage data is present
+    n3_rejection_rate = 0.0
+    if stages and len(stages) == len(valid_mask):
+        n3_pairs = [(v, st) for v, st in zip(valid_mask, stages) if str(st).upper() == "N3"]
+        if n3_pairs:
+            n3_total = len(n3_pairs)
+            n3_invalid = sum(1 for v, _ in n3_pairs if not v)
+            n3_rejection_rate = n3_invalid / float(n3_total)
+
+    # Evaluate Gatekeeping Rules
+    reasons = []
+    if overall_rejection_rate > max_rejection_rate:
+        reasons.append(f"HIGH_REJECTION_RATE ({overall_rejection_rate:.1%})")
+    if n3_rejection_rate > max_n3_rejection_rate:
+        reasons.append(f"HIGH_N3_REJECTION ({n3_rejection_rate:.1%})")
+    if valid_hours < min_valid_hours:
+        reasons.append(f"INSUFFICIENT_SLEEP_DURATION ({valid_hours:.2f}h)")
+
+    is_accepted = len(reasons) == 0
+    reason_str = "PASSED" if is_accepted else "; ".join(reasons)
+
+    metrics = {
+        "total_slices": total_slices,
+        "valid_slices": total_valid,
+        "invalid_slices": total_invalid,
+        "overall_rejection_rate": round(overall_rejection_rate, 4),
+        "n3_rejection_rate": round(n3_rejection_rate, 4),
+        "valid_sleep_hours": round(valid_hours, 2),
+        "gatekeeping_status": "ACCEPTED" if is_accepted else "REJECTED",
+        "rejection_reason": reason_str
+    }
+
+    return is_accepted, metrics, reason_str

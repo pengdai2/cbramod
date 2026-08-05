@@ -10,59 +10,32 @@ import argparse
 from pathlib import Path
 import pandas as pd
 
+from cbramod_common import evaluate_subject_quality
+
 
 def evaluate_subject_gatekeeping(
     json_path: Path, 
     max_subj_rejection_rate: float = 0.20,
     max_n3_rejection_rate: float = 0.15,
-    min_valid_sleep_hours: float = 4.0
+    min_valid_sleep_hours: float = 4.0,
+    window_duration_sec: float = 30.0
 ) -> dict:
     """Evaluates a single subject JSON against acceptance rules."""
     with open(json_path, 'r') as f:
         meta = json.load(f)
 
     subject_id = meta.get("subject_id", json_path.stem)
-    slices = meta.get("slices", [])
-    stages = meta.get("stages", [])
 
-    total_wins = len(slices)
-    if total_wins == 0:
-        return {"subject_id": subject_id, "accepted": False, "reason": "EMPTY_SLICES"}
-
-    df = pd.DataFrame(slices)
-    df['stage'] = stages[:len(df)]
-
-    invalid_wins = (~df['is_valid']).sum()
-    overall_rejection_rate = invalid_wins / total_wins
-    valid_duration_hrs = (df['is_valid'].sum() * 30.0) / 3600.0
-
-    # Check N3 specific rejection rate
-    n3_df = df[df['stage'].str.upper() == 'N3']
-    n3_rejection_rate = (~n3_df['is_valid']).sum() / len(n3_df) if len(n3_df) > 0 else 0.0
-
-    # Policy Checks
-    reasons = []
-    if overall_rejection_rate > max_subj_rejection_rate:
-        reasons.append(f"HIGH_REJECTION_RATE ({overall_rejection_rate:.1%})")
-    
-    if n3_rejection_rate > max_n3_rejection_rate:
-        reasons.append(f"HIGH_N3_REJECTION ({n3_rejection_rate:.1%})")
-        
-    if valid_duration_hrs < min_valid_sleep_hours:
-        reasons.append(f"SHORT_VALID_SLEEP ({valid_duration_hrs:.2f} hrs)")
-
-    accepted = len(reasons) == 0
-
+    _, qa_metrics, _ = evaluate_subject_quality(meta, 
+                                                max_subj_rejection_rate=max_subj_rejection_rate,
+                                                max_n3_rejection_rate=max_n3_rejection_rate,
+                                                min_valid_sleep_hours=min_valid_sleep_hours,
+                                                window_duration_sec=window_duration_sec)
+ 
     return {
         "subject_id": subject_id,
         "json_path": str(json_path),
-        "total_windows": total_wins,
-        "valid_windows": df['is_valid'].sum(),
-        "overall_rejection_rate": overall_rejection_rate,
-        "n3_rejection_rate": n3_rejection_rate,
-        "valid_hours": valid_duration_hrs,
-        "accepted": accepted,
-        "reasons": "; ".join(reasons) if not accepted else "PASSED"
+        **qa_metrics
     }
 
 
