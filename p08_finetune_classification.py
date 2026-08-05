@@ -11,7 +11,7 @@ from sklearn.metrics import classification_report, f1_score, accuracy_score
 from tqdm import tqdm
 
 # Import model architecture setup from benchmark module
-from cbramod_common import CBraModRealWorldBenchmark, RealSleepEEGDataset
+from cbramod_common import CBraModE2EClassifier, PANSleepEEGDataset
 
 
 class EarlyStopping:
@@ -38,7 +38,7 @@ class EarlyStopping:
 
 
 def setup_data_loader_and_criterion(
-    train_ds: RealSleepEEGDataset,
+    train_ds: PANSleepEEGDataset,
     batch_size: int,
     num_workers: int,
     imbalance_strategy: str,
@@ -134,8 +134,8 @@ def run_fine_tuning_pipeline(
         print(f"Data Root Directory:  {data_dir}")
 
     # 1. Instantiate Datasets
-    train_ds = RealSleepEEGDataset(train_manifest, data_dir=data_dir)
-    val_ds = RealSleepEEGDataset(val_manifest, data_dir=data_dir)
+    train_ds = PANSleepEEGDataset(train_manifest, data_dir=data_dir)
+    val_ds = PANSleepEEGDataset(val_manifest, data_dir=data_dir)
 
     # 2. Configure Strategy-Based DataLoader & Loss Criterion
     train_loader, criterion = setup_data_loader_and_criterion(
@@ -152,7 +152,7 @@ def run_fine_tuning_pipeline(
     )
 
     # 3. Instantiate Model Architecture
-    model = CBraModRealWorldBenchmark(num_channels=num_channels, num_classes=num_classes).to(device)
+    model = CBraModE2EClassifier(num_channels=num_channels, num_classes=num_classes).to(device)
 
     # 4. Configure Differential Learning Rates
     backbone_params = []

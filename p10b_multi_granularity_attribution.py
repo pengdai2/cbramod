@@ -13,7 +13,7 @@ try:
 except ImportError:
     HAS_CAPTUM = False
 
-from cbramod_common import CBraModRealWorldBenchmark
+from cbramod_common import CBraModE2EClassifier
 
 
 def compute_multi_granularity_attributions(
@@ -139,7 +139,7 @@ def analyze_sample_attributions(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Load Model
-    model = CBraModRealWorldBenchmark(num_channels=num_channels, num_classes=2).to(device)
+    model = CBraModE2EClassifier(num_channels=num_channels, num_classes=2).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
 

@@ -3,19 +3,11 @@ import math
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, Tuple
+from cbramod_utils import find_eeg_files, load_raw_eeg
 import mne
 import numpy as np
 from tqdm import tqdm
-
-SUPPORTED_EXTENSIONS = {".edf", ".fif", ".vhdr", ".bdf", ".set"}
-
-def find_eeg_files(src_dir: Path) -> List[Path]:
-    """Recursively gather all supported EEG files in the source directory."""
-    files = []
-    for ext in SUPPORTED_EXTENSIONS:
-        files.extend(src_dir.rglob(f"*{ext}"))
-    return sorted(files)
 
 def compute_resample_ratio(orig_sfreq: float, target_sfreq: float) -> Tuple[int, int]:
     """Computes exact integer up/down factors for non-divisive resampling."""
@@ -25,22 +17,6 @@ def compute_resample_ratio(orig_sfreq: float, target_sfreq: float) -> Tuple[int,
     up = target_int // common_gcd
     down = orig_int // common_gcd
     return up, down
-
-def load_raw_eeg(file_path: Path) -> mne.io.BaseRaw:
-    """Loads raw EEG file using the appropriate MNE reader with preload enabled."""
-    ext = file_path.suffix.lower()
-    if ext == ".edf":
-        return mne.io.read_raw_edf(file_path, preload=True, verbose=False)
-    elif ext == ".fif":
-        return mne.io.read_raw_fif(file_path, preload=True, verbose=False)
-    elif ext == ".vhdr":
-        return mne.io.read_raw_brainvision(file_path, preload=True, verbose=False)
-    elif ext == ".bdf":
-        return mne.io.read_raw_bdf(file_path, preload=True, verbose=False)
-    elif ext == ".set":
-        return mne.io.read_raw_eeglab(file_path, preload=True, verbose=False)
-    else:
-        raise ValueError(f"Unsupported file format: {ext}")
 
 def validate_resampled_data(
     raw_resampled: mne.io.BaseRaw, 

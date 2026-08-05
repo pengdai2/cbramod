@@ -8,7 +8,7 @@ from pathlib import Path
 import torch
 
 # Import architecture definition from our benchmark script
-from cbramod_common import CBraModRealWorldBenchmark
+from cbramod_common import CBraModE2EClassifier
 
 
 def create_deployment_package(
@@ -71,7 +71,7 @@ def create_deployment_package(
         # 3. Sanity Verification (Dry-Run Loading)
         print("  [*] Running pre-export sanity check...")
         try:
-            model = CBraModRealWorldBenchmark(num_channels=num_channels, num_classes=num_classes)
+            model = CBraModE2EClassifier(num_channels=num_channels, num_classes=num_classes)
             checkpoint = torch.load(weights_file, map_location="cpu")
             state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
             model.load_state_dict(state_dict)

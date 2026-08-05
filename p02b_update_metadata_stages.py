@@ -5,101 +5,10 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
-import mne
-import yasa
+from cbramod_common import extract_epoch_stages
+from cbramod_utils import find_eeg_files, load_raw_eeg, valid_regex
+from cbramod_common import predict_epoch_stages_yasa
 from tqdm import tqdm
-
-SUPPORTED_EXTENSIONS = {".fif", ".edf", ".bdf", ".vhdr"}
-
-# Standard sleep stage string normalization map
-STAGE_NORM_MAP = {
-    "sleep stage w": "W", "stage w": "W", "wake": "W", "0": "W",
-    "sleep stage n1": "N1", "stage 1": "N1", "n1": "N1", "1": "N1",
-    "sleep stage n2": "N2", "stage 2": "N2", "n2": "N2", "2": "N2",
-    "sleep stage n3": "N3", "stage 3": "N3", "stage 4": "N3", "n3": "N3", "3": "N3", "4": "N3",
-    "sleep stage r": "REM", "stage rem": "REM", "rem": "REM", "5": "REM"
-}
-
-
-def load_raw_eeg(file_path: Path) -> mne.io.BaseRaw:
-    """Loads raw EEG recording using MNE."""
-    ext = file_path.suffix.lower()
-    if ext == ".fif":
-        return mne.io.read_raw_fif(file_path, preload=False, verbose=False)
-    elif ext == ".edf":
-        return mne.io.read_raw_edf(file_path, preload=False, verbose=False)
-    elif ext == ".bdf":
-        return mne.io.read_raw_bdf(file_path, preload=False, verbose=False)
-    elif ext == ".vhdr":
-        return mne.io.read_raw_brainvision(file_path, preload=False, verbose=False)
-    else:
-        raise ValueError(f"Unsupported file format: {ext}")
-
-
-def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: float = 30.0) -> List[str]:
-    """Parses MNE raw annotations and maps each window midpoint to its sleep stage."""
-    if len(raw.annotations) == 0:
-        return ["UNKNOWN"] * num_windows
-
-    stages = []
-    annotations = raw.annotations
-
-    for idx in range(num_windows):
-        t_mid = (idx * window_sec) + (window_sec / 2.0)
-        stage_label = "UNKNOWN"
-
-        for ann in annotations:
-            ann_start = ann["onset"]
-            ann_end = ann_start + ann["duration"]
-            if ann_start <= t_mid < ann_end:
-                raw_desc = str(ann["description"]).strip().lower()
-                stage_label = STAGE_NORM_MAP.get(raw_desc, ann["description"])
-                break
-
-        stages.append(stage_label)
-
-    return stages
-
-
-def select_best_eeg_channel(eeg_chs: List[str]) -> str:
-    """
-    Selects the optimal central EEG channel using exact word-boundary matching.
-    Avoids false positive substring matches like FC4 or CP4.
-    """
-    # Priority list of central channels
-    preferences = ["C4", "C3", "CZ"]
-
-    for pref in preferences:
-        # \b ensures exact word boundary match (e.g. matches "C4", "C4-M1", "C4_A1", but NOT "FC4")
-        pattern = re.compile(rf"\b{pref}\b", re.IGNORECASE)
-        for ch in eeg_chs:
-            if pattern.search(ch):
-                return ch
-
-    # Fallback: Return first available channel if no central channels match
-    return eeg_chs[0]
-
-
-def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str]:
-    """Uses YASA to predict sleep stages for unannotated recordings."""
-    try:
-        eeg_chs = raw.copy().pick_types(eeg=True).ch_names
-        if not eeg_chs:
-            eeg_chs = raw.ch_names
-        target_ch = select_best_eeg_channel(eeg_chs)
-
-        sls = yasa.SleepStaging(raw, eeg_name=target_ch)
-        stages = list(sls.predict().hypno)
-
-        # Align predicted length with target window count
-        if len(stages) < num_windows:
-            stages.extend(["UNKNOWN"] * (num_windows - len(stages)))
-        elif len(stages) > num_windows:
-            stages = stages[:num_windows]
-
-        return stages
-    except Exception as e:
-        return ["UNKNOWN"] * num_windows
 
 
 def process_metadata_update_worker(
@@ -179,9 +88,7 @@ def run_metadata_update_pipeline(
     src_dir = Path(src_dir).resolve()
     dst_dir = Path(dst_dir).resolve()
 
-    files = []
-    for ext in SUPPORTED_EXTENSIONS:
-        files.extend(src_dir.rglob(f"*{ext}"))
+    files = find_eeg_files(src_dir)
     files = sorted(files)
 
     print(f"Found {len(files)} raw files to match against metadata in: {dst_dir}")
@@ -218,13 +125,6 @@ def run_metadata_update_pipeline(
     print(f" - Missing JSON Files:     {results['MISSING_JSON']}")
     print(f" - Errors:                 {results['ERROR']}")
     print(f" - Total Stage Labels Added: {results['UPDATED_STAGES']}")
-
-
-def valid_regex(pattern_string):
-    try:
-        return re.compile(pattern_string)
-    except re.error:
-        raise argparse.ArgumentTypeError(f"Invalid regex: '{pattern_string}'")
 
 
 if __name__ == "__main__":

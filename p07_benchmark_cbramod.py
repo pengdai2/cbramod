@@ -1,70 +1,10 @@
 import argparse
 import time
+from cbramod_common import SyntheticEEGDataset
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-import numpy as np
-
-# Import CBraMod architecture from braindecode or local model module
-try:
-    from braindecode.models import CBraMod
-    HAS_BRAINDECODE = True
-except ImportError:
-    HAS_BRAINDECODE = False
-
-
-class SyntheticEEGDataset(torch.utils.data.Dataset):
-    """
-    Generates synthetic EEG tensors matching CBraMod input specs for pipeline verification:
-    Shape: [Batch, Channels, Time_Samples] -> [B, 64, 6000] (30s @ 200 Hz)
-    """
-    def __init__(self, num_samples: int = 128, channels: int = 64, time_samples: int = 6000, num_classes: int = 2):
-        self.num_samples = num_samples
-        # Generate random Gaussian noise with synthetic 12 Hz sinusoidal bursts (simulated spindles)
-        self.data = torch.randn(num_samples, channels, time_samples, dtype=torch.float32)
-        
-        # Inject synthetic 12 Hz sine wave in central channels for half the batch
-        t = torch.linspace(0, 30, time_samples)
-        spindle_wave = 2.0 * torch.sin(2 * np.pi * 12 * t)
-        for i in range(num_samples // 2):
-            self.data[i, :4, 2000:2400] += spindle_wave[2000:2400] # Inject 2-second burst
-            
-        self.labels = torch.cat([torch.ones(num_samples // 2, dtype=torch.long), 
-                                 torch.zeros(num_samples - num_samples // 2, dtype=torch.long)])
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        return self.data[idx], self.labels[idx]
-
-
-def build_cbramod_benchmark_model(device: torch.device, num_classes: int = 2) -> nn.Module:
-    """Instantiates CBraMod encoder coupled with a linear probing head for sanity checks."""
-    if HAS_BRAINDECODE:
-        # Load CBraMod backbone (200 Hz temporal patch size = 200 samples)
-        model = CBraMod(
-            n_outputs=num_classes,
-            n_chans=64,
-            sfreq=200.0,
-            return_encoder_output=False
-        )
-    else:
-        print("[Warning] Braindecode not detected. Falling back to Mock CBraMod Architecture for pipeline testing.")
-        class DummyCBraMod(nn.Module):
-            def __init__(self, num_classes=2):
-                super().__init__()
-                self.conv = nn.Conv1d(64, 32, kernel_size=25, stride=5)
-                self.pool = nn.AdaptiveAvgPool1d(10)
-                self.fc = nn.Linear(32 * 10, num_classes)
-            def forward(self, x):
-                out = torch.relu(self.conv(x))
-                out = self.pool(out)
-                out = torch.flatten(out, 1)
-                return self.fc(out)
-        model = DummyCBraMod(num_classes=num_classes)
-
-    return model.to(device)
+from torch.utils.data import DataLoader
+from braindecode.models import CBraMod
 
 
 def run_benchmark_verification(
@@ -81,7 +21,12 @@ def run_benchmark_verification(
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
 
     # 2. Build CBraMod Model & Optimizer
-    model = build_cbramod_benchmark_model(device=device, num_classes=2)
+    model = CBraMod(
+        n_outputs=2,
+        n_chans=64,
+        sfreq=200.0,
+        return_encoder_output=False
+    ).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
 

@@ -10,6 +10,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 
+
 def evaluate_subject_gatekeeping(
     json_path: Path, 
     max_subj_rejection_rate: float = 0.20,
@@ -89,6 +90,7 @@ def generate_manifest(meta_dir: Path, output_dir: Path):
     print(f" Rejected Subjects:        {total_subjs - accepted_subjs} ({((total_subjs - accepted_subjs)/total_subjs)*100:.1f}%)")
     print(f" Cohort Report Saved To:   {output_csv}")
     print("=" * 60)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Data Quality Screening and Subject Gatekeeping")

@@ -25,10 +25,12 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
+from cbramod_common import extract_epoch_stages, predict_epoch_stages_yasa
 import mne
 import numpy as np
 from scipy.signal import hilbert
 from tqdm import tqdm
+from cbramod_utils import load_raw_eeg, valid_regex
 
 try:
     import yasa
@@ -89,21 +91,6 @@ def discover_cbramod_channels(raw: mne.io.BaseRaw) -> List[str]:
             matched_channels.append(ch)
             
     return matched_channels
-
-
-def load_raw_eeg(file_path: Path) -> mne.io.BaseRaw:
-    """Loads raw continuous EEG recording using MNE."""
-    ext = file_path.suffix.lower()
-    if ext == ".fif":
-        return mne.io.read_raw_fif(file_path, preload=True, verbose=False)
-    elif ext == ".edf":
-        return mne.io.read_raw_edf(file_path, preload=True, verbose=False)
-    elif ext == ".bdf":
-        return mne.io.read_raw_bdf(file_path, preload=True, verbose=False)
-    elif ext == ".vhdr":
-        return mne.io.read_raw_brainvision(file_path, preload=True, verbose=False)
-    else:
-        raise ValueError(f"Unsupported file format: {ext}")
 
 
 def apply_eeg_referencing(raw: mne.io.BaseRaw, subject_id: str = "") -> mne.io.BaseRaw:
@@ -376,63 +363,6 @@ def process_and_normalize_slice(
 
     normalized[nonzero_mask] = (normalized[nonzero_mask] - means) / (stds + 1e-8)
     return normalized, True, "OK"
-
-
-def extract_epoch_stages(raw: mne.io.BaseRaw, num_windows: int, window_sec: float = 30.0) -> List[str]:
-    """Parses annotations for sleep stage labels."""
-    if len(raw.annotations) == 0:
-        return ["UNKNOWN"] * num_windows
-
-    stages = []
-    annotations = raw.annotations
-
-    for idx in range(num_windows):
-        t_mid = (idx * window_sec) + (window_sec / 2.0)
-        stage_label = "UNKNOWN"
-
-        for ann in annotations:
-            ann_start = ann["onset"]
-            ann_end = ann_start + ann["duration"]
-            if ann_start <= t_mid < ann_end:
-                raw_desc = str(ann["description"]).strip().lower()
-                stage_label = STAGE_NORM_MAP.get(raw_desc, ann["description"])
-                break
-
-        stages.append(stage_label)
-
-    return stages
-
-
-def select_best_eeg_channel(eeg_chs: List[str]) -> str:
-    """Selects central channel for YASA."""
-    preferences = ["C4", "C3", "CZ"]
-    for pref in preferences:
-        pattern = re.compile(rf"\b{pref}\b", re.IGNORECASE)
-        for ch in eeg_chs:
-            if pattern.search(ch):
-                return ch
-    return eeg_chs[0]
-
-
-def predict_epoch_stages_yasa(raw: mne.io.BaseRaw, num_windows: int) -> List[str]:
-    """YASA fallback predictor."""
-    try:
-        eeg_chs = raw.copy().pick('eeg').ch_names
-        if not eeg_chs:
-            eeg_chs = raw.ch_names
-        target_ch = select_best_eeg_channel(eeg_chs)
-
-        sls = yasa.SleepStaging(raw, eeg_name=target_ch)
-        stages = list(sls.predict().hypno)
-
-        if len(stages) < num_windows:
-            stages.extend(["UNKNOWN"] * (num_windows - len(stages)))
-        elif len(stages) > num_windows:
-            stages = stages[:num_windows]
-
-        return stages
-    except Exception:
-        return ["UNKNOWN"] * num_windows
 
 
 def slice_strategy_a_macro(
@@ -769,13 +699,6 @@ def run_slicing_pipeline(
     print(f" - Skipped Subjects:   {results['SKIPPED']}")
     print(f" - Errors:             {results['ERROR']}")
     print(f" - Total Extracted Slices: {results['TOTAL_WINDOWS']}")
-
-
-def valid_regex(pattern_string):
-    try:
-        return re.compile(pattern_string)
-    except re.error:
-        raise argparse.ArgumentTypeError(f"Invalid regex: '{pattern_string}'")
 
 
 if __name__ == "__main__":

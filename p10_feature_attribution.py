@@ -16,7 +16,7 @@ except ImportError:
     HAS_CAPTUM = False
 
 # Import model architecture setup from our benchmark module
-from cbramod_common import CBraModRealWorldBenchmark
+from cbramod_common import CBraModE2EClassifier
 
 
 def compute_integrated_gradients(
@@ -76,7 +76,7 @@ def analyze_channel_attribution(
     print(f"\n=== Running Integrated Gradients Attribution Analysis on [{device}] ===")
 
     # 1. Instantiate Model & Load Weights
-    model = CBraModRealWorldBenchmark(num_channels=num_channels, num_classes=2).to(device)
+    model = CBraModE2EClassifier(num_channels=num_channels, num_classes=2).to(device)
     checkpoint = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()

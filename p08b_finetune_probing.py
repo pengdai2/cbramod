@@ -30,14 +30,11 @@ import gc
 import json
 import logging
 from pathlib import Path
-import random
 import sys
 import time
 from typing import Dict, List, Optional, Tuple, Union
 
-from einops.layers.torch import Rearrange
 import numpy as np
-import pandas as pd
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -48,6 +45,7 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
+from cbramod_utils import seed_everything, setup_logger
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -55,11 +53,10 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset
 from tqdm import tqdm
 
 try:
-    from braindecode.models import CBraMod
 except ImportError:
     raise ImportError("The 'braindecode' library is required. Install via: pip install braindecode")
 
-from cbramod_common import RealSleepEEGDataset
+from cbramod_common import CBraModFeatureExtractor, LinearProbeHead, PANSleepEEGDataset, compute_pooled_scores
 
 
 # =====================================================================
@@ -193,133 +190,7 @@ def parse_cli_args() -> PipelineConfig:
 
 
 # =====================================================================
-# 2. LOGGING & UTILITIES
-# =====================================================================
-
-def setup_logger(log_path: Path) -> logging.Logger:
-    """Configures structured logging to stdout and file."""
-    logger = logging.getLogger("CBraModPipeline")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-
-    c_handler = logging.StreamHandler(sys.stdout)
-    c_handler.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s', '%Y-%m-%d %H:%M:%S'))
-    logger.addHandler(c_handler)
-
-    f_handler = logging.FileHandler(log_path)
-    f_handler.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s'))
-    logger.addHandler(f_handler)
-
-    return logger
-
-
-def seed_everything(seed: int = 42) -> None:
-    """Ensures end-to-end reproducibility across NumPy and PyTorch."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
-# =====================================================================
-# 3. POOLING FUNCTIONS (BINARY & MULTI-CLASS)
-# =====================================================================
-
-def compute_pooled_scores(
-    window_probs: np.ndarray,
-    method: str = "p85_score",
-    top_percentile: float = 0.10,
-    t_window: float = 0.60
-) -> Union[float, np.ndarray]:
-    """
-    Aggregates window probabilities into subject-level class scores.
-    Supports 1D arrays (binary) and 2D matrices [Num_Windows, Num_Classes].
-    """
-    if len(window_probs) == 0:
-        return 0.0 if window_probs.ndim == 1 else np.array([])
-
-    is_1d = (window_probs.ndim == 1)
-    N = len(window_probs)
-    k_len = max(1, int(np.ceil(N * top_percentile)))
-
-    if method == "p85_score":
-        if is_1d:
-            return float(np.percentile(window_probs, 85))
-        return np.percentile(window_probs, 85, axis=0)
-
-    elif method == "top_10_mean":
-        if is_1d:
-            sorted_p = np.sort(window_probs)[::-1]
-            return float(np.mean(sorted_p[:k_len]))
-        sorted_p = np.sort(window_probs, axis=0)[::-1, :]
-        return np.mean(sorted_p[:k_len, :], axis=0)
-
-    elif method == "trimmed_top_10":
-        skip = int(N * 0.02)
-        if is_1d:
-            sorted_p = np.sort(window_probs)[::-1]
-            return float(np.mean(sorted_p[skip : skip + k_len]))
-        sorted_p = np.sort(window_probs, axis=0)[::-1, :]
-        return np.mean(sorted_p[skip : skip + k_len, :], axis=0)
-
-    elif method == "burden_ratio":
-        if is_1d:
-            return float(np.mean(window_probs >= t_window))
-        dominant_class = np.argmax(window_probs, axis=1)
-        K = window_probs.shape[1]
-        scores = np.zeros(K, dtype=np.float64)
-        for c in range(K):
-            scores[c] = np.mean((dominant_class == c) & (window_probs[:, c] >= t_window))
-        return scores
-
-    else:
-        raise ValueError(f"Unsupported pooling method: {method}")
-
-
-# =====================================================================
-# 4. ARCHITECTURES
-# =====================================================================
-
-class CBraModFeatureExtractor(nn.Module):
-    """Backbone extractor that channel-pools [B, C, S, P] -> [B, S, P]."""
-    def __init__(self, num_channels: int = 64, sfreq: float = 200.0):
-        super().__init__()
-        self.backbone = CBraMod.from_pretrained(
-            "braindecode/cbramod-pretrained",
-            n_chans=num_channels,
-            sfreq=sfreq,
-            return_encoder_output=True
-        )
-
-    @torch.no_grad()
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        feats = self.backbone(x)
-        return feats.mean(dim=1)
-
-
-class LinearProbeHead(nn.Module):
-    """2-Layer MLP Head with LayerNorm and Dropout."""
-    def __init__(self, num_patches: int = 30, emb_dim: int = 200, hidden_dim: int = 128, num_classes: int = 2, dropout: float = 0.3):
-        super().__init__()
-        in_features = num_patches * emb_dim
-
-        self.head = nn.Sequential(
-            Rearrange("b s p -> b (s p)"),
-            nn.LayerNorm(in_features),
-            nn.Linear(in_features, hidden_dim),
-            nn.ELU(),
-            nn.Dropout(p=dropout),
-            nn.Linear(hidden_dim, num_classes)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.head(x)
-
-
-# =====================================================================
-# 5. EMBEDDING EXTRACTION ENGINE WITH STAGE FILTERING & SUBJECT ID TRACKING
+# 2. EMBEDDING EXTRACTION ENGINE WITH STAGE FILTERING & SUBJECT ID TRACKING
 # =====================================================================
 
 class EmbeddingManager:
@@ -334,7 +205,7 @@ class EmbeddingManager:
         filter_str = f" [Filter: {self.config.filter_stage}]" if self.config.filter_stage else ""
         self.logger.info(f"[{split_name.upper()}] Initializing RealSleepEEGDataset from: {manifest_path}{filter_str}")
         
-        dataset = RealSleepEEGDataset(
+        dataset = PANSleepEEGDataset(
             manifest_csv=manifest_path, 
             data_dir=self.config.data_dir,
             filter_stage=self.config.filter_stage

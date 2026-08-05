@@ -18,69 +18,7 @@ from sklearn.metrics import (
 from tqdm import tqdm
 
 # Import architecture from benchmark module
-from cbramod_common import CBraModRealWorldBenchmark
-
-
-def compute_pooled_scores(
-    window_probs: np.ndarray,
-    method: str = "p85_score",
-    top_percentile: float = 0.10,
-    t_window: float = 0.60
-) -> Union[float, np.ndarray]:
-    """
-    Aggregates window-level probabilities into subject-level class scores.
-    Supports both 1D arrays (binary positive class probabilities) and 
-    2D arrays (shape: [Num_Windows, Num_Classes]).
-
-    Args:
-        window_probs: Array of probabilities [N] or [N, K].
-        method: Pooling strategy ('p85_score', 'top_10_mean', 'trimmed_top_10', 'burden_ratio').
-        top_percentile: Fraction of top windows to evaluate (default: 0.10).
-        t_window: Window-level probability threshold for burden ratio.
-
-    Returns:
-        float if 1D input (binary), or np.ndarray [K] if 2D input (multi-class).
-    """
-    if len(window_probs) == 0:
-        return 0.0 if window_probs.ndim == 1 else np.array([])
-
-    is_1d = (window_probs.ndim == 1)
-    N = len(window_probs)
-    k_len = max(1, int(np.ceil(N * top_percentile)))
-
-    if method == "p85_score":
-        if is_1d:
-            return float(np.percentile(window_probs, 85))
-        return np.percentile(window_probs, 85, axis=0)
-
-    elif method == "top_10_mean":
-        if is_1d:
-            sorted_p = np.sort(window_probs)[::-1]
-            return float(np.mean(sorted_p[:k_len]))
-        sorted_p = np.sort(window_probs, axis=0)[::-1, :]
-        return np.mean(sorted_p[:k_len, :], axis=0)
-
-    elif method == "trimmed_top_10":
-        skip = int(N * 0.02)
-        if is_1d:
-            sorted_p = np.sort(window_probs)[::-1]
-            return float(np.mean(sorted_p[skip : skip + k_len]))
-        sorted_p = np.sort(window_probs, axis=0)[::-1, :]
-        return np.mean(sorted_p[skip : skip + k_len, :], axis=0)
-
-    elif method == "burden_ratio":
-        if is_1d:
-            return float(np.mean(window_probs >= t_window))
-        # Multi-class burden: proportion of windows where class k is argmax and >= t_window
-        dominant_class = np.argmax(window_probs, axis=1)
-        K = window_probs.shape[1]
-        scores = np.zeros(K, dtype=np.float64)
-        for c in range(K):
-            scores[c] = np.mean((dominant_class == c) & (window_probs[:, c] >= t_window))
-        return scores
-
-    else:
-        raise ValueError(f"Unsupported pooling method: {method}")
+from cbramod_common import CBraModE2EClassifier, compute_pooled_scores
 
 
 def evaluate_all_pooling_strategies(
@@ -230,7 +168,7 @@ def evaluate_clinical_cohort(
     print(f"Loaded test set manifest with {len(test_df)} subject recordings.")
 
     # 2. Instantiate Model Architecture
-    model = CBraModRealWorldBenchmark(
+    model = CBraModE2EClassifier(
         num_classes=num_classes,
         num_channels=num_channels,
         num_patches=30,
