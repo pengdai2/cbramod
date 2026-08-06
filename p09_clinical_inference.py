@@ -98,6 +98,7 @@ def run_subject_inference(
     npy_path: Path,
     meta_path: Path,
     device: torch.device,
+    batch_size: int = 32,
     filter_stage: Optional[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
@@ -123,7 +124,6 @@ def run_subject_inference(
         return np.array([]), np.array([])
 
     model.eval()
-    batch_size = 32
     window_probs = []
 
     with torch.no_grad():
@@ -219,6 +219,7 @@ def evaluate_clinical_cohort(
             npy_path=npy_path,
             meta_path=meta_path,
             device=device,
+            batch_size=args.batch_size,
             filter_stage=args.filter_stage
         )
 
