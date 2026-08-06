@@ -229,6 +229,8 @@ class EndToEndTrainer(CBraModTrainer):
                 train_correct += (logits.argmax(dim=1) == y_b).sum().item()
                 total_train_samples += len(y_b)
 
+                pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
+
             train_loss /= total_train_samples
             train_acc = (train_correct / total_train_samples) * 100.0
 
@@ -239,8 +241,9 @@ class EndToEndTrainer(CBraModTrainer):
             val_targets = []
             val_subject_ids = []
 
+            val_pbar = tqdm(val_loader, desc=f"Epoch {epoch:02d}/{self.config.epochs:02d} [Val]", leave=False)
             with torch.no_grad():
-                for batch in tqdm(val_loader, desc=f"Epoch {epoch:02d}/{self.config.epochs:02d} [Val]", leave=False):
+                for batch in val_pbar:
                     x_b, y_b, s_b = batch[0], batch[1], batch[2]
                     x_b = x_b.to(self.device, non_blocking=True)
                     y_b = y_b.to(self.device, non_blocking=True)
@@ -254,6 +257,8 @@ class EndToEndTrainer(CBraModTrainer):
                     val_probs.append(probs.cpu().numpy())
                     val_targets.append(y_b.cpu().numpy())
                     val_subject_ids.append(s_b.cpu().numpy())
+
+                    val_pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
             val_loss /= len(val_ds)
             val_probs = np.concatenate(val_probs, axis=0)
