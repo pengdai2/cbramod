@@ -247,10 +247,13 @@ class EndToEndTrainer(CBraModTrainer):
                 with torch.amp.autocast(device_type="cuda", enabled=self.config.use_amp):
                     logits = model(x_b)
                     loss = criterion(logits, y_b)
-                    loss = loss / self.config.grad_accum_steps
+                    # Scale loss down for gradient accumulation
+                    scaled_loss = loss / self.config.grad_accum_steps
 
-                scaler.scale(loss).backward()
+                # Backward pass on scaled loss
+                scaler.scale(scaled_loss).backward()
 
+                # Step optimizer on accumulation boundary or final batch
                 if (step + 1) % self.config.grad_accum_steps == 0 or (step + 1) == len(train_loader):
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -258,10 +261,12 @@ class EndToEndTrainer(CBraModTrainer):
                     scaler.update()
                     optimizer.zero_grad()
 
-                train_loss += loss.item() * self.config.grad_accum_steps * len(y_b)
+                # Accumulate unscaled loss across total samples
+                train_loss += loss.item() * len(y_b)
                 train_correct += (logits.argmax(dim=1) == y_b).sum().item()
                 total_train_samples += len(y_b)
 
+                # Display true unscaled loss in tqdm
                 pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
             train_loss /= total_train_samples
