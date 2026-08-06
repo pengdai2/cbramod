@@ -44,7 +44,7 @@ from cbramod_common import (
     MLPProbeHead,
     PANSleepEEGDataset,
     setup_data_loader_and_criterion,
-    setup_pipeline_cli_parser
+    setup_training_cli_parser
 )
 
 
@@ -54,7 +54,7 @@ from cbramod_common import (
 
 def parse_cli_args() -> argparse.Namespace:
     """Parses command-line arguments for the CBraMod manifest-based pipeline."""
-    parser = setup_pipeline_cli_parser(
+    parser = setup_training_cli_parser(
         description="CBraMod Manifest-Based Pipeline for Embedding Extraction & Probe Training"
     )
 
@@ -214,7 +214,7 @@ class ProbeTrainer(CBraModTrainer):
 
             # 1. Window-Level Training Loop
             head.train()
-            train_loss, train_correct = 0.0, 0
+            train_loss, train_correct, train_total_samples = 0.0, 0, 0
             for x_b, y_b in train_loader:
                 x_b = x_b.to(self.device, non_blocking=True).float()
                 y_b = y_b.to(self.device, non_blocking=True)
@@ -227,9 +227,10 @@ class ProbeTrainer(CBraModTrainer):
 
                 train_loss += loss.item() * len(y_b)
                 train_correct += (out.argmax(dim=1) == y_b).sum().item()
+                train_total_samples += len(y_b)
 
-            train_acc = train_correct / len(train_ds)
-            train_loss /= len(train_ds)
+            train_loss /= train_total_samples
+            train_acc = (train_correct / train_total_samples) * 100.0
 
             # 2. Window-Level Inference on Validation
             head.eval()

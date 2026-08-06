@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
+from cbramod_utils import seed_everything
 import torch
 from sklearn.metrics import (
     accuracy_score,
@@ -16,7 +17,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 from tqdm import tqdm
-from cbramod_common import CBraModE2EClassifier, compute_pooled_scores
+from cbramod_common import CBraModE2EClassifier, compute_pooled_scores, setup_common_cli_parser
 
 
 def evaluate_all_pooling_strategies(
@@ -157,23 +158,14 @@ def get_operating_threshold(
 
 
 def evaluate_clinical_cohort(
-    checkpoint_path: Path,
-    test_manifest_path: Path,
-    data_dir: Optional[Path] = None,
-    num_channels: int = 64,
-    num_classes: int = 2,
-    filter_stage: Optional[str] = "N2,N3",
-    pooling_strategy: str = "p85_score",
-    top_percentile: float = 0.10,
-    t_window: float = 0.60,
-    override_threshold: Optional[float] = None,
-    device_str: str = "cuda"
-):
+    args: argparse.Namespace
+) -> None:
     """Executes full test set inference and clinical cohort evaluation."""
-    device = torch.device(device_str if torch.cuda.is_available() else "cpu")
-    print(f"=== Running Clinical Inference Pipeline ({num_classes}-Class) on [{device}] ===")
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    print(f"=== Running Clinical Inference Pipeline ({args.num_classes}-Class) on [{device}] ===")
 
     # 1. Load Test Manifest
+    test_manifest_path = Path(args.test_manifest)
     if not test_manifest_path.exists():
         raise FileNotFoundError(f"Test manifest not found: {test_manifest_path}")
     test_df = pd.read_csv(test_manifest_path)
@@ -181,24 +173,32 @@ def evaluate_clinical_cohort(
 
     # 2. Instantiate Model Architecture
     model = CBraModE2EClassifier(
-        num_classes=num_classes,
-        num_channels=num_channels
+        num_channels=args.num_channels,
+        sfreq=args.sfreq,
+        num_patches=args.num_patches,
+        emb_dim=args.cbra_dim,
+        hidden_dim=args.head_dim,
+        num_classes=args.num_classes,
+        dropout=args.dropout,
+        head_type=args.head_type
     )
 
     # 3. Load Model Checkpoint (Head-Only or Full-Model)
-    model, ckpt_thresholds, epoch = load_model_checkpoint(model, checkpoint_path, device)
+    model, ckpt_thresholds, epoch = load_model_checkpoint(model, Path(args.checkpoint), device)
     model.to(device)
     model.eval()
 
     # Determine Active Strategies
-    if pooling_strategy == "all":
+    if args.pooling_strategy == "all":
         active_strategies = ["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"]
     else:
-        active_strategies = [pooling_strategy]
+        active_strategies = [args.pooling_strategy]
 
     subject_results = {strat: [] for strat in active_strategies}
 
     # 4. Patient-Level Inference Loop
+    data_dir = Path(args.data_dir) if args.data_dir else None
+    
     for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Processing Subjects"):
         raw_npy_path = Path(row["npy_path"])
         ground_truth_label = int(row["label"])
@@ -220,21 +220,21 @@ def evaluate_clinical_cohort(
             npy_path=npy_path,
             meta_path=meta_path,
             device=device,
-            filter_stage=filter_stage
+            filter_stage=args.filter_stage
         )
 
         if len(probs) == 0:
             continue
 
         # Extract pooled scores for active strategies
-        if num_classes == 2:
+        if args.num_classes == 2:
             pos_probs = probs[:, 1]  # Class 1 probabilities
-            if pooling_strategy == "all":
-                pooled_dict = evaluate_all_pooling_strategies(pos_probs, top_percentile=top_percentile, t_window=t_window)
+            if args.pooling_strategy == "all":
+                pooled_dict = evaluate_all_pooling_strategies(pos_probs, top_percentile=args.top_percentile, t_window=args.t_window)
             else:
                 pooled_dict = {
-                    pooling_strategy: compute_pooled_scores(
-                        pos_probs, method=pooling_strategy, top_percentile=top_percentile, t_window=t_window
+                    args.pooling_strategy: compute_pooled_scores(
+                        pos_probs, method=args.pooling_strategy, top_percentile=args.top_percentile, t_window=args.t_window
                     )
                 }
 
@@ -242,7 +242,7 @@ def evaluate_clinical_cohort(
                 score = pooled_dict[strat]
                 operating_threshold = get_operating_threshold(
                     pooling_strategy=strat,
-                    override_threshold=override_threshold,
+                    override_threshold=args.override_threshold,
                     ckpt_thresholds=ckpt_thresholds
                 )
                 pred_class = 1 if score >= operating_threshold else 0
@@ -256,12 +256,12 @@ def evaluate_clinical_cohort(
                 })
         else:
             # Multi-Class Evaluation (> 2 classes)
-            if pooling_strategy == "all":
-                pooled_dict = evaluate_all_pooling_strategies(probs, top_percentile=top_percentile, t_window=t_window)
+            if args.pooling_strategy == "all":
+                pooled_dict = evaluate_all_pooling_strategies(probs, top_percentile=args.top_percentile, t_window=args.t_window)
             else:
                 pooled_dict = {
-                    pooling_strategy: compute_pooled_scores(
-                        probs, method=pooling_strategy, top_percentile=top_percentile, t_window=t_window
+                    args.pooling_strategy: compute_pooled_scores(
+                        probs, method=args.pooling_strategy, top_percentile=args.top_percentile, t_window=args.t_window
                     )
                 }
 
@@ -276,7 +276,7 @@ def evaluate_clinical_cohort(
                     "total_windows": num_windows,
                     "total_windows_evaluated": len(probs)
                 }
-                for c in range(num_classes):
+                for c in range(args.num_classes):
                     res_entry[f"prob_class_{c}"] = float(class_scores[c])
 
                 subject_results[strat].append(res_entry)
@@ -285,14 +285,14 @@ def evaluate_clinical_cohort(
     for strat in active_strategies:
         operating_threshold = get_operating_threshold(
             pooling_strategy=strat,
-            override_threshold=override_threshold,
+            override_threshold=args.override_threshold,
             ckpt_thresholds=ckpt_thresholds
         )
         analyze_subject_results(
             subject_results=subject_results[strat],
             strategy=strat,
-            num_classes=num_classes,
-            filter_stage=filter_stage,
+            num_classes=args.num_classes,
+            filter_stage=args.filter_stage,
             threshold=operating_threshold,
             test_manifest_path=test_manifest_path
         )
@@ -367,40 +367,22 @@ def analyze_subject_results(
     print(f"Detailed subject predictions saved to: {output_csv}")
 
 
-if __name__ == "__main__":
+def parse_cli_args()-> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Multi-Class Patient-Level Clinical Inference")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
-    parser.add_argument("--test_manifest", type=str, required=True, help="Path to test_manifest.csv")
-    parser.add_argument("--data_dir", type=str, default=None, help="Root directory for relative paths")
-    parser.add_argument("--num_channels", type=int, default=64, help="EEG Channels count")
-    parser.add_argument("--num_classes", type=int, default=2, help="Number of target classes")
-    parser.add_argument("--filter_stage", type=str, default="N2,N3", help="Sleep stage filter (e.g., 'N2,N3')")
-    parser.add_argument(
-        "--pooling_strategy", 
-        type=str, 
-        default="p85_score", 
-        choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio", "all"],
-        help="Pooling strategy choice (default: 'p85_score', or 'all' for full comparative report)"
-    )
-    parser.add_argument("--top_percentile", type=float, default=0.10, help="Top percentile ratio (default: 0.10)")
-    parser.add_argument("--t_window", type=float, default=0.60, help="Window threshold for burden ratio")
-    parser.add_argument("--threshold", type=float, default=None, help="Override operating decision threshold")
-    parser.add_argument("--device", type=str, default="cuda", help="Target computing device")
+
+    setup_common_cli_parser(parser)
+
+    inf_group = parser.add_argument_group("Inference Controls")
+    inf_group.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+    inf_group.add_argument("--test_manifest", type=str, required=True, help="Path to test_manifest.csv")
+    inf_group.add_argument("--threshold", type=float, default=None, help="Override operating decision threshold")
 
     args = parser.parse_args()
+    return args
 
-    data_dir = Path(args.data_dir) if args.data_dir else None
 
-    evaluate_clinical_cohort(
-        checkpoint_path=Path(args.checkpoint),
-        test_manifest_path=Path(args.test_manifest),
-        data_dir=data_dir,
-        num_channels=args.num_channels,
-        num_classes=args.num_classes,
-        filter_stage=args.filter_stage,
-        pooling_strategy=args.pooling_strategy,
-        top_percentile=args.top_percentile,
-        t_window=args.t_window,
-        override_threshold=args.threshold,
-        device_str=args.device
-    )
+if __name__ == "__main__":
+    args = parse_cli_args()
+    seed_everything(args.seed)
+
+    evaluate_clinical_cohort(args)

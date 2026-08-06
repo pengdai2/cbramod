@@ -676,14 +676,7 @@ class CBraModTrainer:
         pass  # Placeholder for training loop implementation  
 
 
-def setup_pipeline_cli_parser(
-    description: str = "CBraMod Pipeline"
-) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=description,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
+def setup_common_cli_parser(parser: argparse.ArgumentParser)-> None:
     # CBraMod Architecture Controls    
     cbra_group = parser.add_argument_group("CBraMod Architecture Controls")
     cbra_group.add_argument("--num-channels", type=int, default=64, help="EEG Channel count")
@@ -694,14 +687,12 @@ def setup_pipeline_cli_parser(
     cbra_group.add_argument("--head-dim", type=int, default=128, help="Head dimension")
     cbra_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
 
-    # Manifest & Data Paths
+    # Data Sources
     data_group = parser.add_argument_group("Data Sources")
-    data_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON)")
-    data_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON)")
     data_group.add_argument("--data-dir", type=str, default=None, help="Root directory containing .npy files")
 
-    # Imbalance & Stage Controls
-    strat_group = parser.add_argument_group("Imbalance & Stage Controls")
+    # Strategy Controls
+    strat_group = parser.add_argument_group("Strategy Controls")
     strat_group.add_argument(
         "--imbalance-strategy",
         type=str,
@@ -710,18 +701,37 @@ def setup_pipeline_cli_parser(
         help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
     )
     strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into PANSleepEEGDataset (e.g., N2,N3)")
-
-    # Pooling Configurations
-    pool_group = parser.add_argument_group("Subject-Level Pooling Options")
-    pool_group.add_argument(
+    strat_group.add_argument(
         "--primary-pooling",
         type=str,
         default="p85_score",
         choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"],
         help="Primary pooling strategy used for early stopping and model selection"
     )
-    pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio for top-K pooling methods")
-    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for pathology burden ratio")
+    strat_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio for top-K pooling methods")
+    strat_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for pathology burden ratio")
+
+    # System Controls
+    sys_group = parser.add_argument_group("System Controls")
+    sys_group.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers for disk reads")
+    sys_group.add_argument("--seed", type=int, default=42, help="Random seed for deterministic execution")
+    sys_group.add_argument("--no-amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
+
+
+def setup_training_cli_parser(
+    description: str = "CBraMod Pipeline"
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    setup_common_cli_parser(parser)
+
+    # Training Manifests
+    manifest_group = parser.add_argument_group("Training Manifests")
+    manifest_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON)")
+    manifest_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON)")
 
     # Hyperparameters
     hp_group = parser.add_argument_group("Common Hyperparameters")
@@ -731,12 +741,8 @@ def setup_pipeline_cli_parser(
     hp_group.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing scheduler")
     hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay regularizer")
     hp_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
-
-    # System Controls
-    sys_group = parser.add_argument_group("System Controls")
-    sys_group.add_argument("--num-workers", type=int, default=4, help="DataLoader CPU workers for disk reads")
-    sys_group.add_argument("--seed", type=int, default=42, help="Random seed for deterministic execution")
-    sys_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without Subject F1 improvement)")
-    sys_group.add_argument("--no-amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
+    hp_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without Subject F1 improvement)")
 
     return parser
+
+

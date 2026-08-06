@@ -27,7 +27,7 @@ from cbramod_common import (
     CBraModTrainer,
     PANSleepEEGDataset,
     setup_data_loader_and_criterion,
-    setup_pipeline_cli_parser
+    setup_training_cli_parser
 )
 from cbramod_utils import seed_everything, setup_logger
 
@@ -155,7 +155,7 @@ def load_probing_head_checkpoint(
     target_head = getattr(model, "head", getattr(model, "classifier", None))
     if target_head is not None:
         target_head.load_state_dict(head_state_dict, strict=True)
-        logger.info("✓ Linear probe head weights successfully warm-started.")
+        logger.info("✓ Probe head weights successfully warm-started.")
     else:
         logger.warning("Could not identify classification head on model to load checkpoint weights.")
 
@@ -428,7 +428,7 @@ class EndToEndTrainer(CBraModTrainer):
 
 def parse_cli_args() -> argparse.Namespace:
     """Parses command-line arguments for the E2E fine-tuning pipeline."""
-    parser = setup_pipeline_cli_parser(
+    parser = setup_training_cli_parser(
         description="CBraMod End-to-End Fine-Tuning Pipeline"
     )
 
