@@ -388,7 +388,7 @@ def parse_cli_args()-> argparse.Namespace:
     )
     pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio (default: 0.10)")
     pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for burden ratio")
-    pool_group.add_argument("--threshold", type=float, default=None, help="Override operating decision threshold")
+    pool_group.add_argument("--override-threshold", type=float, default=None, help="Override operating decision threshold")
 
     args = parser.parse_args()
     return args
