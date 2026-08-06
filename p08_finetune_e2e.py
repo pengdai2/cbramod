@@ -41,35 +41,66 @@ def configure_backbone_unfreezing(
     unfreeze_last_n: int = 2,
     logger: Optional[logging.Logger] = None
 ) -> None:
-    """Configures parameter trainable status for partial or full fine-tuning."""
+    """
+    Configures parameter trainable status for partial or full fine-tuning.
+    Correctly reaches inside backbone.encoder to target the final Transformer blocks.
+    """
     backbone = getattr(model, "backbone", model)
     head = getattr(model, "head", getattr(model, "classifier", None))
 
-    # Freeze all backbone parameters by default
+    # 1. Freeze entire backbone by default
     for param in backbone.parameters():
         param.requires_grad = False
 
-    # Ensure classification head is trainable
+    # 2. Classification head is always trainable
     if head is not None:
         for param in head.parameters():
             param.requires_grad = True
 
     if unfreeze_mode == "head_only":
         msg = "Unfreeze Mode [HEAD_ONLY]: Entire CBraMod backbone is frozen."
+        
     elif unfreeze_mode == "full":
         for param in backbone.parameters():
             param.requires_grad = True
         msg = "Unfreeze Mode [FULL]: Entire CBraMod backbone is unfrozen."
+        
     elif unfreeze_mode == "partial":
-        children = list(backbone.named_children())
-        unfrozen_modules = children[-unfreeze_last_n:] if len(children) >= unfreeze_last_n else children
+        unfrozen_names = []
+
+        # Always unfreeze output tail layers so gradients reach the backbone blocks
+        for tail_name in ["proj_out", "final_layer", "norm"]:
+            if hasattr(backbone, tail_name):
+                tail_mod = getattr(backbone, tail_name)
+                for param in tail_mod.parameters():
+                    param.requires_grad = True
+                unfrozen_names.append(tail_name)
+
+        # Locate the Transformer block container inside backbone
+        encoder_container = getattr(backbone, "encoder", getattr(backbone, "blocks", None))
+
+        if encoder_container is not None:
+            # Extract individual Transformer block modules
+            if isinstance(encoder_container, (nn.ModuleList, nn.Sequential)):
+                blocks = list(encoder_container)
+            elif hasattr(encoder_container, "layers"):
+                blocks = list(encoder_container.layers)
+            elif hasattr(encoder_container, "blocks"):
+                blocks = list(encoder_container.blocks)
+            else:
+                blocks = list(encoder_container.children())
+
+            # Slice the last N Transformer blocks
+            start_idx = max(0, len(blocks) - unfreeze_last_n)
+            target_blocks = blocks[start_idx:]
+
+            for idx, block in enumerate(target_blocks, start=start_idx):
+                for param in block.parameters():
+                    param.requires_grad = True
+                unfrozen_names.append(f"encoder.block_{idx}")
+
+        msg = f"Unfreeze Mode [PARTIAL]: Unfrozen last {unfreeze_last_n} Transformer blocks + tail -> {unfrozen_names}"
         
-        for name, module in unfrozen_modules:
-            for param in module.parameters():
-                param.requires_grad = True
-        
-        unfrozen_names = [name for name, _ in unfrozen_modules]
-        msg = f"Unfreeze Mode [PARTIAL]: Unfrozen last {len(unfrozen_names)} backbone blocks -> {unfrozen_names}"
     else:
         raise ValueError(f"Invalid unfreeze_mode: {unfreeze_mode}")
 
@@ -289,7 +320,7 @@ class EndToEndTrainer(CBraModTrainer):
             log_str = (
                 f"Epoch [{epoch:02d}/{self.config.epochs:02d}] ({elapsed:.1f}s) | LR: {current_lr:.2e} | "
                 f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.2f}% | "
-                f"Val Loss: {val_loss:.4f}, Acc: {val_acc * 100:.2f}% | "
+                f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.2f}% | "
                 f"Subj Acc: {primary_acc*100:.2f}% | "
                 f"Subj F1 ({self.config.primary_pooling}@{primary_t:.2f}): {primary_f1:.4f} | "
                 f"Subj AUC: {primary_auc:.4f}"

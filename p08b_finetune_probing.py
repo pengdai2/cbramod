@@ -266,7 +266,7 @@ class ProbeTrainer(CBraModTrainer):
             # Format log string showing window loss + subject-level pooled metrics across strategies
             log_str = (
                 f"Epoch [{epoch:02d}/{self.config.epochs:02d}] ({elapsed:.2f}s) | LR: {current_lr:.2e} | "
-                f"Train Loss: {train_loss:.4f}, Acc: {primary_acc*100:.2f}% | "
+                f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.2f}% | "
                 f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.2f}% | "
                 f"Subj Acc: {primary_acc*100:.2f}% | "
                 f"Subj F1 ({self.config.primary_pooling}@{primary_t:.2f}): {primary_f1:.4f} | "
