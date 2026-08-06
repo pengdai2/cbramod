@@ -279,8 +279,11 @@ class EndToEndTrainer(CBraModTrainer):
                     freeze_layernorm=self.config.freeze_layernorm,
                     logger=self.logger
                 )
-                # Re-assign parameter groups dynamically to AdamW
-                optimizer.param_groups = self._get_optimizer_param_groups(model)
+
+                # Correctly re-add parameter groups using optimizer.add_param_group
+                optimizer.param_groups.clear()
+                for group in self._get_optimizer_param_groups(model):
+                    optimizer.add_param_group(group)
 
             current_lr = scheduler.get_last_lr()[0]
             
