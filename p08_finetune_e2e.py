@@ -107,12 +107,13 @@ def configure_backbone_unfreezing(
     else:
         raise ValueError(f"Invalid unfreeze_mode: {unfreeze_mode}")
 
-    # 3. Lock LayerNorm parameters across the entire network if requested
+    # 3. Lock LayerNorm parameters strictly within the backbone if requested
     if freeze_layernorm:
         frozen_norm_modules = []
         frozen_norm_count = 0
 
-        for name, module in model.named_modules():
+        # Scope strictly to backbone to leave head normalizations trainable
+        for name, module in backbone.named_modules():
             if isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm1d, nn.BatchNorm2d)) or "norm" in module.__class__.__name__.lower():
                 has_trainable_params = False
                 for param in module.parameters():
@@ -121,9 +122,10 @@ def configure_backbone_unfreezing(
                         frozen_norm_count += 1
                         has_trainable_params = True
                 if has_trainable_params:
-                    frozen_norm_modules.append(name if name else module.__class__.__name__)
+                    mod_name = f"backbone.{name}" if name else "backbone"
+                    frozen_norm_modules.append(mod_name)
 
-        msg += f" | LayerNorm Freezing ACTIVE ({frozen_norm_count} params in {len(frozen_norm_modules)} modules locked -> {frozen_norm_modules})"
+        msg += f" | Backbone LayerNorm Freezing ACTIVE ({frozen_norm_count} params in {len(frozen_norm_modules)} modules locked -> {frozen_norm_modules})"
 
     if logger:
         logger.info(msg)
