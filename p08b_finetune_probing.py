@@ -192,7 +192,8 @@ class ProbeTrainer(CBraModTrainer):
 
         self.logger.info(
             f"Starting Probe Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | "
-            f"Primary Pooling: {self.config.primary_pooling})"
+            f"Imbalance: {self.config.imbalance_strategy} | Pooling: {self.config.pooling_strategy} | "
+            f"Head LR: {self.config.head_lr} | Weight Decay: {self.config.weight_decay})"
         )
         self.logger.info("=" * 125)
 

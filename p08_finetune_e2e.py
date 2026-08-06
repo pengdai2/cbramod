@@ -258,7 +258,8 @@ class EndToEndTrainer(CBraModTrainer):
 
         self.logger.info(
             f"Starting E2E Training ({self.config.epochs} Epochs | Batch Size: {self.config.batch_size} | "
-            f"Strategy: {self.config.imbalance_strategy} | Backbone LR: {self.config.backbone_lr} | Head LR: {self.config.head_lr} | "
+            f"Imbalance: {self.config.imbalance_strategy} | Pooling: {self.config.pooling_strategy} | "
+            f"Backbone LR: {self.config.backbone_lr} | Head LR: {self.config.head_lr} | "
             f"Freeze LN: {self.config.freeze_layernorm} | Warmup Epochs: {self.config.warmup_epochs})"
         )
         self.logger.info("=" * 125)
@@ -280,10 +281,21 @@ class EndToEndTrainer(CBraModTrainer):
                     logger=self.logger
                 )
 
+                # Reset patience counter so the backbone has its full patience budget to adapt
+                patience_counter = 0
+
                 # Correctly re-add parameter groups using optimizer.add_param_group
                 optimizer.param_groups.clear()
                 for group in self._get_optimizer_param_groups(model):
                     optimizer.add_param_group(group)
+
+                # Re-instantiate scheduler for the remaining epochs
+                remaining_epochs = self.config.epochs - self.config.warmup_epochs
+                scheduler = CosineAnnealingLR(
+                    optimizer, 
+                    T_max=remaining_epochs, 
+                    eta_min=self.config.min_lr
+                )
 
             current_lr = scheduler.get_last_lr()[0]
             
