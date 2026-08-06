@@ -374,7 +374,7 @@ def parse_cli_args()-> argparse.Namespace:
 
     inf_group = parser.add_argument_group("Inference Controls")
     inf_group.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
-    inf_group.add_argument("--test_manifest", type=str, required=True, help="Path to test_manifest.csv")
+    inf_group.add_argument("--test-manifest", type=str, required=True, help="Path to test_manifest.csv")
     inf_group.add_argument("--threshold", type=float, default=None, help="Override operating decision threshold")
 
     args = parser.parse_args()
