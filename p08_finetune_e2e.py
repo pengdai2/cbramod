@@ -119,7 +119,7 @@ class EndToEndTrainer(CBraModTrainer):
         super().__init__(config, logger)
 
     def train(self, train_path: Path, val_path: Path) -> float:
-        allowed_stages = [s.strip() for s in self.config.filter_stage.split(",") if s.strip()] if self.config.stages else None
+        allowed_stages = [s.strip() for s in self.config.filter_stage.split(",") if s.strip()] if self.config.filter_stage else None
 
         # 1. Instantiate Datasets using built-in stage filtering
         train_ds = PANSleepEEGDataset(
