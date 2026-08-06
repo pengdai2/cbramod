@@ -179,7 +179,6 @@ def evaluate_clinical_cohort(
         emb_dim=args.cbra_dim,
         hidden_dim=args.head_dim,
         num_classes=args.num_classes,
-        dropout=args.dropout,
         head_type=args.head_type
     )
 
