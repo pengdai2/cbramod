@@ -41,6 +41,7 @@ from cbramod_common import (
     CBraModFeatureExtractor,
     CBraModTrainer,
     LinearProbeHead,
+    MLPProbeHead,
     PANSleepEEGDataset,
     setup_data_loader_and_criterion,
     setup_pipeline_cli_parser
@@ -174,13 +175,22 @@ class ProbeTrainer(CBraModTrainer):
 
         val_subject_ids = val_data.get("subject_ids", [str(i) for i in range(len(val_ds))])
 
-        head = LinearProbeHead(
-            num_patches=self.config.num_patches,
-            emb_dim=self.config.cbra_dim,
-            hidden_dim=self.config.head_dim,
-            num_classes=self.config.num_classes,
-            dropout=self.config.dropout
-        ).to(self.device)
+        if self.config.head_type == "linear":
+            head = LinearProbeHead(
+                num_patches=self.config.num_patches,
+                emb_dim=self.config.cbra_dim,
+                num_classes=self.config.num_classes
+            )
+        elif self.config.head_type == "mlp":
+            head = MLPProbeHead(
+                num_patches=self.config.num_patches,
+                emb_dim=self.config.cbra_dim,
+                hidden_dim=self.config.head_dim,
+                num_classes=self.config.num_classes,
+                dropout=self.config.dropout
+            )
+
+        head.to(self.device)
 
         optimizer = torch.optim.AdamW(head.parameters(), lr=self.config.head_lr, weight_decay=self.config.weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=self.config.epochs, eta_min=self.config.min_lr)
@@ -192,6 +202,7 @@ class ProbeTrainer(CBraModTrainer):
 
         self.logger.info(
             f"Starting Probe Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | "
+            f"Head Type: {self.config.head_type} | "
             f"Imbalance: {self.config.imbalance_strategy} | Pooling: {self.config.primary_pooling} | "
             f"Head LR: {self.config.head_lr} | Weight Decay: {self.config.weight_decay})"
         )

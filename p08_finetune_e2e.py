@@ -224,7 +224,8 @@ class EndToEndTrainer(CBraModTrainer):
             emb_dim=self.config.cbra_dim,
             hidden_dim=self.config.head_dim,
             num_classes=self.config.num_classes,
-            dropout=self.config.dropout
+            dropout=self.config.dropout,
+            head_type=self.config.head_type
         ).to(self.device)
 
         # Load Probing Head Checkpoint if specified
@@ -258,6 +259,7 @@ class EndToEndTrainer(CBraModTrainer):
 
         self.logger.info(
             f"Starting E2E Training ({self.config.epochs} Epochs | Batch Size: {self.config.batch_size} | "
+            f"Head Type: {self.config.head_type} | "
             f"Imbalance: {self.config.imbalance_strategy} | Pooling: {self.config.primary_pooling} | "
             f"Backbone LR: {self.config.backbone_lr} | Head LR: {self.config.head_lr} | "
             f"Freeze LN: {self.config.freeze_layernorm} | Warmup Epochs: {self.config.warmup_epochs})"
