@@ -221,7 +221,7 @@ class ProbeTrainer(CBraModTrainer):
 
             # 2. Window-Level Inference on Validation
             head.eval()
-            val_loss = 0.0
+            val_loss, val_correct, val_total_samples = 0.0, 0, 0
             val_preds, val_targets, val_probs = [], [], []
 
             with torch.no_grad():
@@ -234,11 +234,16 @@ class ProbeTrainer(CBraModTrainer):
                     probs = torch.softmax(out, dim=1)
 
                     val_loss += loss.item() * len(y_b)
+                    val_correct += (out.argmax(dim=1) == y_b).sum().item()
+                    val_total_samples += len(y_b)
+
                     val_preds.append(out.argmax(dim=1).cpu().numpy())
                     val_targets.append(y_b.cpu().numpy())
                     val_probs.append(probs.cpu().numpy())
 
-            val_loss /= len(val_ds)
+            val_loss /= val_total_samples
+            val_acc = (val_correct / val_total_samples) * 100.0
+
             val_targets = np.concatenate(val_targets)
             val_probs = np.concatenate(val_probs)
 
@@ -253,6 +258,7 @@ class ProbeTrainer(CBraModTrainer):
             primary_f1 = primary_metrics["subject_macro_f1"]
             primary_t = primary_metrics["optimal_threshold"]
             primary_acc = primary_metrics["subject_accuracy"]
+            primary_auc = primary_metrics["subject_auc"]
 
             scheduler.step()
             elapsed = time.time() - t0
@@ -260,8 +266,11 @@ class ProbeTrainer(CBraModTrainer):
             # Format log string showing window loss + subject-level pooled metrics across strategies
             log_str = (
                 f"Epoch [{epoch:02d}/{self.config.epochs:02d}] ({elapsed:.2f}s) | LR: {current_lr:.2e} | "
-                f"Win Loss: {train_loss:.4f} | Subj Acc: {primary_acc*100:.2f}% | "
-                f"Subj F1 ({self.config.primary_pooling}@{primary_t:.2f}): {primary_f1:.4f}"
+                f"Train Loss: {train_loss:.4f}, Acc: {primary_acc*100:.2f}% | "
+                f"Val Loss: {val_loss:.4f}, Acc: {val_acc:.2f}% | "
+                f"Subj Acc: {primary_acc*100:.2f}% | "
+                f"Subj F1 ({self.config.primary_pooling}@{primary_t:.2f}): {primary_f1:.4f} | "
+                f"Subj AUC: {primary_auc:.4f}"
             )
 
             # Model Selection & Checkpointing based on Primary Subject-Level Macro F1

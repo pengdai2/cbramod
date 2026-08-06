@@ -199,6 +199,7 @@ class EndToEndTrainer(CBraModTrainer):
 
         for epoch in range(1, self.config.epochs + 1):
             t0 = time.time()
+            current_lr = scheduler.get_last_lr()[0]
             
             # Training Phase
             model.train()
@@ -236,7 +237,7 @@ class EndToEndTrainer(CBraModTrainer):
 
             # Validation Inference Phase
             model.eval()
-            val_loss = 0.0
+            val_loss, val_correct, total_val_samples = 0.0, 0, 0
             val_probs = []
             val_targets = []
             val_subject_ids = []
@@ -254,13 +255,18 @@ class EndToEndTrainer(CBraModTrainer):
                         probs = torch.softmax(logits, dim=1)
 
                     val_loss += loss.item() * len(y_b)
+                    val_correct += (logits.argmax(dim=1) == y_b).sum().item()
+                    total_val_samples += len(y_b)
+
                     val_probs.append(probs.cpu().numpy())
                     val_targets.append(y_b.cpu().numpy())
                     val_subject_ids.append(s_b)
 
                     val_pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
-            val_loss /= len(val_ds)
+            val_loss /= total_val_samples
+            val_acc = (val_correct / total_val_samples) * 100.0
+
             val_probs = np.concatenate(val_probs, axis=0)
             val_targets = np.concatenate(val_targets, axis=0)
             val_subject_ids = np.concatenate(val_subject_ids, axis=0).tolist()
@@ -275,15 +281,18 @@ class EndToEndTrainer(CBraModTrainer):
             primary_f1 = primary_metrics["subject_macro_f1"]
             primary_t = primary_metrics["optimal_threshold"]
             primary_acc = primary_metrics["subject_accuracy"]
+            primary_auc = primary_metrics["subject_roc_auc"]
 
             scheduler.step()
             elapsed = time.time() - t0
 
             log_str = (
-                f"Epoch [{epoch:02d}/{self.config.epochs:02d}] ({elapsed:.1f}s) | "
+                f"Epoch [{epoch:02d}/{self.config.epochs:02d}] ({elapsed:.1f}s) | LR: {current_lr:.2e} | "
                 f"Train Loss: {train_loss:.4f}, Acc: {train_acc:.2f}% | "
+                f"Val Loss: {val_loss:.4f}, Acc: {val_acc * 100:.2f}% | "
                 f"Subj Acc: {primary_acc*100:.2f}% | "
-                f"Subj F1 ({self.config.primary_pooling}@{primary_t:.2f}): {primary_f1:.4f}"
+                f"Subj F1 ({self.config.primary_pooling}@{primary_t:.2f}): {primary_f1:.4f} | "
+                f"Subj AUC: {primary_auc:.4f}"
             )
 
             if primary_f1 > best_primary_f1:
