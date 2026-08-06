@@ -263,10 +263,14 @@ class EndToEndTrainer(CBraModTrainer):
             val_loss /= len(val_ds)
             val_probs = np.concatenate(val_probs, axis=0)
             val_targets = np.concatenate(val_targets, axis=0)
-            val_subject_ids = np.concatenate(val_subject_ids, axis=0)
+            val_subject_ids = np.concatenate(val_subject_ids, axis=0).tolist()
 
             # Subject-Level Multi-Strategy Pooling Evaluation
-            pooling_results = self.evaluate_subject_pooling(val_probs, val_subject_ids, val_targets)
+            pooling_results = self.evaluate_subject_pooling(
+                val_probs=val_probs,
+                val_targets=val_targets,
+                val_subject_ids=val_subject_ids
+            )
             primary_metrics = pooling_results[self.config.primary_pooling]
             primary_f1 = primary_metrics["subject_macro_f1"]
             primary_t = primary_metrics["optimal_threshold"]

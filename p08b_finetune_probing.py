@@ -243,7 +243,11 @@ class ProbeTrainer(CBraModTrainer):
             val_probs = np.concatenate(val_probs)
 
             # 3. Fast Subject-Level Multi-Strategy Pooling & Threshold Calibration
-            pooling_results = self.evaluate_subject_pooling(val_probs, val_targets, val_subject_ids)
+            pooling_results = self.evaluate_subject_pooling(
+                val_probs=val_probs,
+                val_targets=val_targets,
+                val_subject_ids=val_subject_ids
+            )
             
             primary_metrics = pooling_results[self.config.primary_pooling]
             primary_f1 = primary_metrics["subject_macro_f1"]
