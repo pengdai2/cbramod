@@ -140,7 +140,7 @@ def analyze_sample_attributions(
 
     # 1. Load Model
     model = CBraModE2EClassifier(num_channels=num_channels, num_classes=2).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     # 2. Load Sample

@@ -46,7 +46,7 @@ def load_model_checkpoint(
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint state dict not found: {checkpoint_path}")
 
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     
     # Extract state dict dict structure if wrapped inside checkpoint metadata
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:

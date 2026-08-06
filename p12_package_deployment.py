@@ -72,7 +72,7 @@ def create_deployment_package(
         print("  [*] Running pre-export sanity check...")
         try:
             model = CBraModE2EClassifier(num_channels=num_channels, num_classes=num_classes)
-            checkpoint = torch.load(weights_file, map_location="cpu")
+            checkpoint = torch.load(weights_file, map_location="cpu", weights_only=True)
             state_dict = checkpoint["model_state_dict"] if "model_state_dict" in checkpoint else checkpoint
             model.load_state_dict(state_dict)
             model.eval()

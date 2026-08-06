@@ -77,7 +77,7 @@ def analyze_channel_attribution(
 
     # 1. Instantiate Model & Load Weights
     model = CBraModE2EClassifier(num_channels=num_channels, num_classes=2).to(device)
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 

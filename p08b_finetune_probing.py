@@ -156,8 +156,8 @@ class ProbeTrainer(CBraModTrainer):
 
     def train(self, train_path: Path, val_path: Path) -> float:
         self.logger.info("Loading cached feature tensors into RAM...")
-        train_data = torch.load(train_path, map_location="cpu")
-        val_data = torch.load(val_path, map_location="cpu")
+        train_data = torch.load(train_path, map_location="cpu", weights_only=True)
+        val_data = torch.load(val_path, map_location="cpu", weights_only=True)
 
         train_ds = TensorDataset(train_data["feats"], train_data["labels"])
         val_ds = TensorDataset(val_data["feats"], val_data["labels"])
