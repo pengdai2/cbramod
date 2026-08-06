@@ -95,10 +95,7 @@ def load_probing_head_checkpoint(
     head_state_dict = {}
 
     for k, v in state_dict.items():
-        if k.startswith("head.") or k.startswith("classifier."):
-            clean_k = k.replace("head.", "").replace("classifier.", "")
-            head_state_dict[clean_k] = v
-        elif not k.startswith("backbone."):
+        if not k.startswith("backbone."):
             head_state_dict[k] = v
 
     target_head = getattr(model, "head", getattr(model, "classifier", None))
