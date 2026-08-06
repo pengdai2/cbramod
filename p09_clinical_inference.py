@@ -325,6 +325,7 @@ def analyze_subject_results(
     print(f"Number of Target Classes:       {num_classes}")
     print(f"Pooling Method:                 {strategy}")
     print(f"Stage Filtering Applied:        {filter_stage if filter_stage else 'None (All Windows)'}")
+    print(f"Total Windows Evaluated:        {results_df['total_windows_evaluated'].sum()} / {results_df['total_windows'].sum()}")
     print(f"Operating Threshold Applied:    {threshold:.4f}")
     print("-" * 65)
     print(f"Accuracy:                       {acc * 100:.2f}%")
@@ -388,8 +389,11 @@ def parse_cli_args()-> argparse.Namespace:
         help="Pooling strategy choice (default: 'p85_score', or 'all' for full comparative report)"
     )
     pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio (default: 0.10)")
-    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for burden ratio")
-    pool_group.add_argument("--override-threshold", type=float, default=None, help="Override operating decision threshold")
+    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for burden ratio (default: 0.60)")
+
+    misc_group = parser.add_argument_group("Miscellaneous")
+    misc_group.add_argument("--override-threshold", type=float, default=None, help="Override operating decision threshold")
+    misc_group.add_argument("--batch-size", type=int, default=512, help="Batch size for inference (default: 512)")
 
     args = parser.parse_args()
     return args
