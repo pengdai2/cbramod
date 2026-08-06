@@ -161,11 +161,47 @@ class PANSleepEEGDataset(Dataset):
         return x_tensor, y_tensor, subject_id
 
 
+# =====================================================================
+# CLASSIFICATION HEAD ARCHITECTURES
+# =====================================================================
+
 class LinearProbeHead(nn.Module):
-    """2-Layer MLP Head with LayerNorm and Dropout."""
+    """
+    1-Layer True Linear Classification Head.
+    Flattens spatial/temporal embeddings and projects directly to output logits.
+    """
     def __init__(
-            self,
-            num_patches: int = 30, emb_dim: int = 200, hidden_dim: int = 128, num_classes: int = 2, dropout: float = 0.3):
+        self,
+        num_patches: int = 30,
+        emb_dim: int = 200,
+        num_classes: int = 2,
+        **kwargs
+    ):
+        super().__init__()
+        in_features = num_patches * emb_dim
+
+        self.head = nn.Sequential(
+            Rearrange("b s p -> b (s p)"),
+            nn.Linear(in_features, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(x)
+
+
+class MLPProbeHead(nn.Module):
+    """
+    2-Layer Non-Linear MLP Head with LayerNorm and Dropout.
+    """
+    def __init__(
+        self,
+        num_patches: int = 30,
+        emb_dim: int = 200,
+        hidden_dim: int = 128,
+        num_classes: int = 2,
+        dropout: float = 0.3,
+        **kwargs
+    ):
         super().__init__()
         in_features = num_patches * emb_dim
 
@@ -185,7 +221,7 @@ class LinearProbeHead(nn.Module):
 class CBraModE2EClassifier(nn.Module):
     """
     Unified End-to-End Architecture wrapping the CBraMod backbone
-    and the LinearProbeHead into a single backward pass graph.
+    and a configurable probing head (Linear or MLP) into a single module.
     """
     def __init__(
         self,
@@ -195,7 +231,8 @@ class CBraModE2EClassifier(nn.Module):
         emb_dim: int = 200,
         hidden_dim: int = 128,
         num_classes: int = 2,
-        dropout: float = 0.3
+        dropout: float = 0.3,
+        head_type: str = "mlp"
     ):
         super().__init__()
         self.backbone = CBraMod.from_pretrained(
@@ -204,13 +241,24 @@ class CBraModE2EClassifier(nn.Module):
             sfreq=sfreq,
             return_encoder_output=True
         )
-        self.head = LinearProbeHead(
-            num_patches=num_patches,
-            emb_dim=emb_dim,
-            hidden_dim=hidden_dim,
-            num_classes=num_classes,
-            dropout=dropout
-        )
+
+        head_type_lower = head_type.lower()
+        if head_type_lower == "linear":
+            self.head = LinearProbeHead(
+                num_patches=num_patches,
+                emb_dim=emb_dim,
+                num_classes=num_classes
+            )
+        elif head_type_lower == "mlp":
+            self.head = MLPProbeHead(
+                num_patches=num_patches,
+                emb_dim=emb_dim,
+                hidden_dim=hidden_dim,
+                num_classes=num_classes,
+                dropout=dropout
+            )
+        else:
+            raise ValueError(f"Invalid head_type: '{head_type}'. Choose 'linear' or 'mlp'.")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Backbone output shape: [Batch, Channels, Patches, EmbDim]
@@ -642,6 +690,7 @@ def setup_pipeline_cli_parser(
     cbra_group.add_argument("--num-patches", type=int, default=30, help="Number of temporal patches in CBraMod")
     cbra_group.add_argument("--sfreq", type=float, default=200.0, help="EEG sampling frequency")
     cbra_group.add_argument("--cbra-dim", type=int, default=200, help="CBraMod embedding dimension per patch")
+    cbra_group.add_argument("--head-type", type=str, choices=["linear", "mlp"], default="mlp", help="Classification head architecture: 'linear' (1-layer) or 'mlp' (2-layer)")
     cbra_group.add_argument("--head-dim", type=int, default=128, help="Head dimension")
     cbra_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
 
