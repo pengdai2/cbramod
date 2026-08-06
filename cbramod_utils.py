@@ -53,6 +53,9 @@ def setup_logger(log_path: Path) -> logging.Logger:
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
+    # 🌟 STOP LOGS FROM BUBBLING UP TO THE ROOT LOGGER
+    logger.propagate = False
+
     c_handler = logging.StreamHandler(sys.stdout)
     c_handler.setFormatter(logging.Formatter('%(asctime)s - [%(levelname)s] - %(message)s', '%Y-%m-%d %H:%M:%S'))
     logger.addHandler(c_handler)

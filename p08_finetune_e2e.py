@@ -256,7 +256,7 @@ class EndToEndTrainer(CBraModTrainer):
                     val_loss += loss.item() * len(y_b)
                     val_probs.append(probs.cpu().numpy())
                     val_targets.append(y_b.cpu().numpy())
-                    val_subject_ids.append(s_b.cpu().numpy())
+                    val_subject_ids.append(s_b)
 
                     val_pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
