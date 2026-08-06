@@ -2,8 +2,8 @@
 Production End-to-End Fine-Tuning Pipeline for CBraMod.
 Uses PANSleepEEGDataset's native stage filtering, CBraModE2EClassifier,
 class imbalance handling (WeightedRandomSampler, class loss weighting, or none),
-flexible backbone unfreezing, warm-start probing head initialization, and 
-vectorized subject-level validation pooling.
+flexible backbone unfreezing, LayerNorm locking, backbone warmup, 
+warm-start probing head initialization, and vectorized subject-level validation pooling.
 """
 
 import argparse
@@ -40,11 +40,13 @@ def configure_backbone_unfreezing(
     model: CBraModE2EClassifier,
     unfreeze_mode: str = "full",
     unfreeze_last_n: int = 2,
+    freeze_layernorm: bool = False,
     logger: Optional[logging.Logger] = None
 ) -> None:
     """
     Configures parameter trainable status for partial or full fine-tuning.
     Correctly reaches inside backbone.encoder to target the final Transformer blocks.
+    Optionally locks all LayerNorm parameters to prevent training instability.
     """
     backbone = getattr(model, "backbone", model)
     head = getattr(model, "head", getattr(model, "classifier", None))
@@ -105,6 +107,24 @@ def configure_backbone_unfreezing(
     else:
         raise ValueError(f"Invalid unfreeze_mode: {unfreeze_mode}")
 
+    # 3. Lock LayerNorm parameters across the entire network if requested
+    if freeze_layernorm:
+        frozen_norm_modules = []
+        frozen_norm_count = 0
+
+        for name, module in model.named_modules():
+            if isinstance(module, (nn.LayerNorm, nn.GroupNorm, nn.BatchNorm1d, nn.BatchNorm2d)) or "norm" in module.__class__.__name__.lower():
+                has_trainable_params = False
+                for param in module.parameters():
+                    if param.requires_grad:
+                        param.requires_grad = False
+                        frozen_norm_count += 1
+                        has_trainable_params = True
+                if has_trainable_params:
+                    frozen_norm_modules.append(name if name else module.__class__.__name__)
+
+        msg += f" | LayerNorm Freezing ACTIVE ({frozen_norm_count} params in {len(frozen_norm_modules)} modules locked -> {frozen_norm_modules})"
+
     if logger:
         logger.info(msg)
     else:
@@ -121,7 +141,7 @@ def load_probing_head_checkpoint(
         raise FileNotFoundError(f"Probing head checkpoint not found: {checkpoint_path}")
 
     logger.info(f"Loading pre-trained linear probing head from: {checkpoint_path}")
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     
     state_dict = ckpt.get("model_state_dict", ckpt.get("head_state_dict", ckpt))
     head_state_dict = {}
@@ -146,6 +166,21 @@ class EndToEndTrainer(CBraModTrainer):
     """Manages full/partial E2E backpropagation and subject-level threshold calibration."""
     def __init__(self, config: argparse.Namespace, logger: logging.Logger):
         super().__init__(config, logger)
+
+    def _get_optimizer_param_groups(self, model: nn.Module) -> List[Dict]:
+        """Extracts active parameter groups for AdamW based on requires_grad state."""
+        backbone = getattr(model, "backbone", model)
+        head = getattr(model, "head", getattr(model, "classifier", None))
+
+        backbone_trainable = [p for p in backbone.parameters() if p.requires_grad]
+        head_trainable = [p for p in head.parameters() if p.requires_grad] if head else []
+
+        param_groups = []
+        if backbone_trainable:
+            param_groups.append({"params": backbone_trainable, "lr": self.config.backbone_lr})
+        if head_trainable:
+            param_groups.append({"params": head_trainable, "lr": self.config.head_lr})
+        return param_groups
 
     def train(self, train_path: Path, val_path: Path) -> float:
         allowed_stages = [s.strip() for s in self.config.filter_stage.split(",") if s.strip()] if self.config.filter_stage else None
@@ -194,28 +229,24 @@ class EndToEndTrainer(CBraModTrainer):
         if self.config.probe_head_ckpt:
             load_probing_head_checkpoint(model, Path(self.config.probe_head_ckpt), self.logger)
 
-        # Configure Backbone Unfreezing Mode
+        # Determine Initial Unfreeze Strategy (Force HEAD_ONLY if warmup_epochs > 0)
+        initial_unfreeze_mode = "head_only" if self.config.warmup_epochs > 0 else self.config.unfreeze_mode
+        if self.config.warmup_epochs > 0:
+            self.logger.info(f"Warmup Active: Training HEAD ONLY for the first {self.config.warmup_epochs} epoch(s).")
+
         configure_backbone_unfreezing(
             model=model,
-            unfreeze_mode=self.config.unfreeze_mode,
+            unfreeze_mode=initial_unfreeze_mode,
             unfreeze_last_n=self.config.unfreeze_last_n,
+            freeze_layernorm=self.config.freeze_layernorm,
             logger=self.logger
         )
 
-        # Configure Parameter Groups with Differential Learning Rates
-        backbone = getattr(model, "backbone", model)
-        head = getattr(model, "head", getattr(model, "classifier", None))
-
-        backbone_trainable = [p for p in backbone.parameters() if p.requires_grad]
-        head_trainable = [p for p in head.parameters() if p.requires_grad] if head else []
-
-        optimizer_grouped_parameters = []
-        if backbone_trainable:
-            optimizer_grouped_parameters.append({"params": backbone_trainable, "lr": self.config.backbone_lr})
-        if head_trainable:
-            optimizer_grouped_parameters.append({"params": head_trainable, "lr": self.config.head_lr})
-
-        optimizer = torch.optim.AdamW(optimizer_grouped_parameters, weight_decay=self.config.weight_decay)
+        # Configure Optimizer and Scheduler
+        optimizer = torch.optim.AdamW(
+            self._get_optimizer_param_groups(model), 
+            weight_decay=self.config.weight_decay
+        )
         scheduler = CosineAnnealingLR(optimizer, T_max=self.config.epochs, eta_min=self.config.min_lr)
         scaler = torch.amp.GradScaler(device="cuda", enabled=self.config.use_amp)
 
@@ -225,12 +256,30 @@ class EndToEndTrainer(CBraModTrainer):
 
         self.logger.info(
             f"Starting E2E Training ({self.config.epochs} Epochs | Batch Size: {self.config.batch_size} | "
-            f"Strategy: {self.config.imbalance_strategy} | Backbone LR: {self.config.backbone_lr} | Head LR: {self.config.head_lr})"
+            f"Strategy: {self.config.imbalance_strategy} | Backbone LR: {self.config.backbone_lr} | Head LR: {self.config.head_lr} | "
+            f"Freeze LN: {self.config.freeze_layernorm} | Warmup Epochs: {self.config.warmup_epochs})"
         )
         self.logger.info("=" * 125)
 
         for epoch in range(1, self.config.epochs + 1):
             t0 = time.time()
+
+            # Handle Warmup Phase Transition
+            if self.config.warmup_epochs > 0 and epoch == self.config.warmup_epochs + 1:
+                self.logger.info(
+                    f"--> Warmup phase completed ({self.config.warmup_epochs} epochs). "
+                    f"Unfreezing backbone with mode [{self.config.unfreeze_mode}]."
+                )
+                configure_backbone_unfreezing(
+                    model=model,
+                    unfreeze_mode=self.config.unfreeze_mode,
+                    unfreeze_last_n=self.config.unfreeze_last_n,
+                    freeze_layernorm=self.config.freeze_layernorm,
+                    logger=self.logger
+                )
+                # Re-assign parameter groups dynamically to AdamW
+                optimizer.param_groups = self._get_optimizer_param_groups(model)
+
             current_lr = scheduler.get_last_lr()[0]
             
             # Training Phase
@@ -247,13 +296,10 @@ class EndToEndTrainer(CBraModTrainer):
                 with torch.amp.autocast(device_type="cuda", enabled=self.config.use_amp):
                     logits = model(x_b)
                     loss = criterion(logits, y_b)
-                    # Scale loss down for gradient accumulation
                     scaled_loss = loss / self.config.grad_accum_steps
 
-                # Backward pass on scaled loss
                 scaler.scale(scaled_loss).backward()
 
-                # Step optimizer on accumulation boundary or final batch
                 if (step + 1) % self.config.grad_accum_steps == 0 or (step + 1) == len(train_loader):
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -261,12 +307,10 @@ class EndToEndTrainer(CBraModTrainer):
                     scaler.update()
                     optimizer.zero_grad()
 
-                # Accumulate unscaled loss across total samples
                 train_loss += loss.item() * len(y_b)
                 train_correct += (logits.argmax(dim=1) == y_b).sum().item()
                 total_train_samples += len(y_b)
 
-                # Display true unscaled loss in tqdm
                 pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
             train_loss /= total_train_samples
@@ -275,9 +319,7 @@ class EndToEndTrainer(CBraModTrainer):
             # Validation Inference Phase
             model.eval()
             val_loss, val_correct, total_val_samples = 0.0, 0, 0
-            val_probs = []
-            val_targets = []
-            val_subject_ids = []
+            val_probs, val_targets, val_subject_ids = [], [], []
 
             val_pbar = tqdm(val_loader, desc=f"Epoch {epoch:02d}/{self.config.epochs:02d} [Val]", leave=False)
             with torch.no_grad():
@@ -297,7 +339,7 @@ class EndToEndTrainer(CBraModTrainer):
 
                     val_probs.append(probs.cpu().numpy())
                     val_targets.append(y_b.cpu().numpy())
-                    val_subject_ids.append(s_b)
+                    val_subject_ids.extend(s_b)
 
                     val_pbar.set_postfix({"Loss": f"{loss.item():.4f}"})
 
@@ -306,7 +348,6 @@ class EndToEndTrainer(CBraModTrainer):
 
             val_probs = np.concatenate(val_probs, axis=0)
             val_targets = np.concatenate(val_targets, axis=0)
-            val_subject_ids = np.concatenate(val_subject_ids, axis=0).tolist()
 
             # Subject-Level Multi-Strategy Pooling Evaluation
             pooling_results = self.evaluate_subject_pooling(
@@ -377,13 +418,15 @@ def parse_cli_args() -> argparse.Namespace:
     ckpt_group.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save fine-tuned checkpoints")
     ckpt_group.add_argument("--probe-head-ckpt", type=str, default=None, help="Optional path to warm-start linear probe head checkpoint")
 
-    # Unfreezing Controls
-    unfreeze_group = parser.add_argument_group("Backbone Unfreezing Controls")
+    # Unfreezing & Stabilization Controls
+    unfreeze_group = parser.add_argument_group("Backbone Unfreezing & Stabilization Controls")
     unfreeze_group.add_argument(
         "--unfreeze-mode", type=str, default="partial", choices=["head_only", "partial", "full"],
         help="Unfreezing strategy for backbone parameters"
     )
     unfreeze_group.add_argument("--unfreeze-last-n", type=int, default=2, help="Number of top backbone submodules to unfreeze in 'partial' mode")
+    unfreeze_group.add_argument("--freeze-layernorm", action="store_true", help="Freeze LayerNorm parameters across the entire model to prevent gradient shock")
+    unfreeze_group.add_argument("--warmup-epochs", type=int, default=0, help="Number of initial epochs to train with frozen backbone before applying unfreezing mode")
 
     # Hyperparameters
     hp_group = parser.add_argument_group("Pipeline Specific Hyperparameters")
