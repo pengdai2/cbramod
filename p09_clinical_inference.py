@@ -372,10 +372,24 @@ def parse_cli_args()-> argparse.Namespace:
 
     setup_common_cli_parser(parser)
 
-    inf_group = parser.add_argument_group("Inference Controls")
-    inf_group.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
-    inf_group.add_argument("--test-manifest", type=str, required=True, help="Path to test_manifest.csv")
-    inf_group.add_argument("--threshold", type=float, default=None, help="Override operating decision threshold")
+    manifest_group = parser.add_argument_group("Test Manifest")
+    manifest_group.add_argument("--test-manifest", type=str, required=True, help="Path to test_manifest.csv")
+
+    ckpt_group = parser.add_argument_group("Model Checkpoint")
+    ckpt_group.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+
+    # Pooling Strategy
+    pool_group = parser.add_argument_group("Pooling Strategy")
+    pool_group.add_argument(
+        "--pooling-strategy", 
+        type=str, 
+        default="p85_score", 
+        choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio", "all"],
+        help="Pooling strategy choice (default: 'p85_score', or 'all' for full comparative report)"
+    )
+    pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio (default: 0.10)")
+    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for burden ratio")
+    pool_group.add_argument("--threshold", type=float, default=None, help="Override operating decision threshold")
 
     args = parser.parse_args()
     return args

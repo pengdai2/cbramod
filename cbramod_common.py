@@ -687,29 +687,10 @@ def setup_common_cli_parser(parser: argparse.ArgumentParser)-> None:
     cbra_group.add_argument("--head-dim", type=int, default=128, help="Head dimension")
     cbra_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
 
-    # Data Sources
-    data_group = parser.add_argument_group("Data Sources")
+    # Data and Filtering Controls
+    data_group = parser.add_argument_group("Data and Filtering")
     data_group.add_argument("--data-dir", type=str, default=None, help="Root directory containing .npy files")
-
-    # Strategy Controls
-    strat_group = parser.add_argument_group("Strategy Controls")
-    strat_group.add_argument(
-        "--imbalance-strategy",
-        type=str,
-        choices=["sampler", "loss_weights", "none"],
-        default="loss_weights",
-        help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
-    )
-    strat_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into PANSleepEEGDataset (e.g., N2,N3)")
-    strat_group.add_argument(
-        "--primary-pooling",
-        type=str,
-        default="p85_score",
-        choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"],
-        help="Primary pooling strategy used for early stopping and model selection"
-    )
-    strat_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio for top-K pooling methods")
-    strat_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for pathology burden ratio")
+    data_group.add_argument("--filter-stage", type=str, default="N2,N3", help="Comma-separated sleep stages to pass into PANSleepEEGDataset (e.g., N2,N3)")
 
     # System Controls
     sys_group = parser.add_argument_group("System Controls")
@@ -733,6 +714,18 @@ def setup_training_cli_parser(
     manifest_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON)")
     manifest_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON)")
 
+    # Pooling Strategy
+    pool_group = parser.add_argument_group("Pooling Strategy")
+    pool_group.add_argument(
+        "--primary-pooling",
+        type=str,
+        default="p85_score",
+        choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"],
+        help="Primary pooling strategy used for early stopping and model selection"
+    )
+    pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio for top-K pooling methods")
+    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for pathology burden ratio")
+
     # Hyperparameters
     hp_group = parser.add_argument_group("Common Hyperparameters")
     hp_group.add_argument("--epochs", type=int, default=40, help="Maximum training epochs for linear probe head")
@@ -742,6 +735,13 @@ def setup_training_cli_parser(
     hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay regularizer")
     hp_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
     hp_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without Subject F1 improvement)")
+    hp_group.add_argument(
+        "--imbalance-strategy",
+        type=str,
+        choices=["sampler", "loss_weights", "none"],
+        default="loss_weights",
+        help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
+    )
 
     return parser
 
