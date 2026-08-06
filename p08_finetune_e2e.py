@@ -340,7 +340,7 @@ def parse_cli_args() -> argparse.Namespace:
     unfreeze_group.add_argument("--unfreeze-last-n", type=int, default=2, help="Number of top backbone submodules to unfreeze in 'partial' mode")
 
     # Hyperparameters
-    hp_group = parser.get_argument_group("Pipeline Specific Hyperparameters")
+    hp_group = parser.add_argument_group("Pipeline Specific Hyperparameters")
     hp_group.add_argument("--backbone-lr", type=float, default=1e-5, help="Learning rate for trainable backbone parameters")
     hp_group.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
 
