@@ -689,6 +689,5 @@ def setup_pipeline_cli_parser(
     sys_group.add_argument("--seed", type=int, default=42, help="Random seed for deterministic execution")
     sys_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without Subject F1 improvement)")
     sys_group.add_argument("--no-amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
-    sys_group.add_argument("--log-filename", type=str, default=__file__.replace(".py", ".log"), help="Filename for pipeline log output")
-
+    
     return parser

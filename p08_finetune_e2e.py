@@ -344,6 +344,10 @@ def parse_cli_args() -> argparse.Namespace:
     hp_group.add_argument("--backbone-lr", type=float, default=1e-5, help="Learning rate for trainable backbone parameters")
     hp_group.add_argument("--grad-accum-steps", type=int, default=1, help="Gradient accumulation steps")
 
+    # Logging Controls
+    log_group = parser.add_argument_group("Logging")
+    log_group.add_argument("--log-filename", type=str, default=__file__.replace(".py", ".log"), help="Filename for pipeline log output")
+
     args = parser.parse_args()
     args.use_amp = not args.no_amp
     return args

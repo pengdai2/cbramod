@@ -65,6 +65,10 @@ def parse_cli_args() -> argparse.Namespace:
     ckpt_group.add_argument("--best-head-filename", type=str, default="cbramod_head_best.pt", help="Filename for best probe head checkpoint")
     ckpt_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
 
+    # Logging Controls
+    log_group = parser.add_argument_group("Logging")
+    log_group.add_argument("--log-filename", type=str, default=__file__.replace(".py", ".log"), help="Filename for pipeline log output")
+
     args = parser.parse_args()
     args.use_amp = not args.no_amp
     return args

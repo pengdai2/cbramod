@@ -97,6 +97,7 @@ def verify_cbramod_pipeline(subject_id: int = 0, epochs: int = 10, batch_size: i
     print("="*50)
 
     stage_names = ["Wake", "N1", "N2", "N3", "REM"]
+    stage_labels = {i: name for i, name in enumerate(stage_names)}  
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -162,7 +163,7 @@ def verify_cbramod_pipeline(subject_id: int = 0, epochs: int = 10, batch_size: i
     print(f"\nValidation Accuracy: {val_acc:.2f}%")
     print(f"Validation Macro F1: {macro_f1:.4f}\n")
     print("Detailed Classification Report:")
-    print(classification_report(val_targets, val_preds, target_names=stage_names, zero_division=0))
+    print(classification_report(val_targets, val_preds, labels=list(stage_labels.keys()), target_names=list(stage_labels.values()), zero_division=0))
 
 
 if __name__ == "__main__":
