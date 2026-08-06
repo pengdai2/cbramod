@@ -232,7 +232,7 @@ class CBraModE2EClassifier(nn.Module):
         hidden_dim: int = 128,
         num_classes: int = 2,
         dropout: float = 0.3,
-        head_type: str = "mlp"
+        head_type: str = "linear"
     ):
         super().__init__()
         self.backbone = CBraMod.from_pretrained(
