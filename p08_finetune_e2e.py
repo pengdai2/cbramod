@@ -281,7 +281,7 @@ class EndToEndTrainer(CBraModTrainer):
             primary_f1 = primary_metrics["subject_macro_f1"]
             primary_t = primary_metrics["optimal_threshold"]
             primary_acc = primary_metrics["subject_accuracy"]
-            primary_auc = primary_metrics["subject_roc_auc"]
+            primary_auc = primary_metrics["roc_auc"]
 
             scheduler.step()
             elapsed = time.time() - t0
