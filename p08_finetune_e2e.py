@@ -258,7 +258,7 @@ class EndToEndTrainer(CBraModTrainer):
 
         self.logger.info(
             f"Starting E2E Training ({self.config.epochs} Epochs | Batch Size: {self.config.batch_size} | "
-            f"Imbalance: {self.config.imbalance_strategy} | Pooling: {self.config.pooling_strategy} | "
+            f"Imbalance: {self.config.imbalance_strategy} | Pooling: {self.config.primary_pooling} | "
             f"Backbone LR: {self.config.backbone_lr} | Head LR: {self.config.head_lr} | "
             f"Freeze LN: {self.config.freeze_layernorm} | Warmup Epochs: {self.config.warmup_epochs})"
         )
