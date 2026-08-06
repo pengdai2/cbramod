@@ -182,6 +182,7 @@ class LinearProbeHead(nn.Module):
 
         self.head = nn.Sequential(
             Rearrange("b s p -> b (s p)"),
+            nn.LayerNorm(in_features),  # Standardizes embedding drift per sample
             nn.Linear(in_features, num_classes)
         )
 
