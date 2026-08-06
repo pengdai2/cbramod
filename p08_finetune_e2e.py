@@ -362,7 +362,7 @@ def main():
     logger = setup_logger(checkpoint_dir / args.log_filename)
 
     trainer = EndToEndTrainer(args, logger)
-    trainer.fit(train_manifest=Path(args.train_manifest), val_manifest=Path(args.val_manifest))
+    trainer.train(train_manifest=Path(args.train_manifest), val_manifest=Path(args.val_manifest))
 
 
 if __name__ == "__main__":
