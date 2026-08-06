@@ -346,7 +346,7 @@ def parse_cli_args() -> argparse.Namespace:
 
     # Logging Controls
     log_group = parser.add_argument_group("Logging")
-    log_group.add_argument("--log-filename", type=str, default=Path(__file__).stem.replace(".py", ".log"), help="Filename for pipeline log output")
+    log_group.add_argument("--log-filename", type=str, default=Path(__file__).stem + ".log", help="Filename for pipeline log output")
 
     args = parser.parse_args()
     args.use_amp = not args.no_amp
