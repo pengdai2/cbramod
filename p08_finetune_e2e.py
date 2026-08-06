@@ -147,18 +147,6 @@ class EndToEndTrainer(CBraModTrainer):
             persistent_workers=True if self.config.num_workers > 0 else False
         )
 
-        # Extract Subject IDs for validation pooling
-        df_val = pd.read_csv(val_path)
-        if allowed_stages and "stage" in df_val.columns:
-            df_val = df_val[df_val["stage"].astype(str).str.upper().isin([s.upper() for s in allowed_stages])]
-
-        val_subject_ids = (
-            df_val["subject_id"].astype(str).tolist()
-            if "subject_id" in df_val.columns
-            else [Path(p).stem for p in df_val["npy_path"]]
-        )
-        val_targets = np.array([sample[1] for sample in val_ds.samples])
-
         # 3. Build Model Architecture
         model = CBraModE2EClassifier(
             num_channels=self.config.num_channels,
@@ -248,10 +236,12 @@ class EndToEndTrainer(CBraModTrainer):
             model.eval()
             val_loss = 0.0
             val_probs = []
+            val_targets = []
+            val_subject_ids = []
 
             with torch.no_grad():
                 for batch in tqdm(val_loader, desc=f"Epoch {epoch:02d}/{self.config.epochs:02d} [Val]", leave=False):
-                    x_b, y_b = batch[0], batch[1]
+                    x_b, y_b, s_b = batch[0], batch[1], batch[2]
                     x_b = x_b.to(self.device, non_blocking=True)
                     y_b = y_b.to(self.device, non_blocking=True)
 
@@ -262,9 +252,13 @@ class EndToEndTrainer(CBraModTrainer):
 
                     val_loss += loss.item() * len(y_b)
                     val_probs.append(probs.cpu().numpy())
+                    val_targets.append(y_b.cpu().numpy())
+                    val_subject_ids.append(s_b.cpu().numpy())
 
             val_loss /= len(val_ds)
             val_probs = np.concatenate(val_probs, axis=0)
+            val_targets = np.concatenate(val_targets, axis=0)
+            val_subject_ids = np.concatenate(val_subject_ids, axis=0)
 
             # Subject-Level Multi-Strategy Pooling Evaluation
             pooling_results = self.evaluate_subject_pooling(val_probs, val_subject_ids, val_targets)

@@ -421,7 +421,7 @@ def setup_data_loader_and_criterion(
     if imbalance_strategy == "sampler":
         logger.info("--> Imbalance Strategy: WeightedRandomSampler (Resampling minority class batches)")
         class_weights_raw = 1.0 / np.maximum(class_counts, 1)
-        sample_weights = class_weights_raw[train_labels]
+        sample_weights = class_weights_raw[labels]
         sampler = WeightedRandomSampler(
             weights=torch.from_numpy(sample_weights).double(),
             num_samples=len(sample_weights),
@@ -689,5 +689,5 @@ def setup_pipeline_cli_parser(
     sys_group.add_argument("--seed", type=int, default=42, help="Random seed for deterministic execution")
     sys_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without Subject F1 improvement)")
     sys_group.add_argument("--no-amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
-    
+
     return parser
