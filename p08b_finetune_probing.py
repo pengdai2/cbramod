@@ -89,7 +89,7 @@ class EmbeddingManager:
     def __init__(self, config: argparse.Namespace, logger: logging.Logger):
         self.config = config
         self.logger = logger
-        self.device = torch.device(config.device)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def extract_and_cache(self, manifest_path: Path, output_cache_path: Path, split_name: str) -> None:
         """Reads .npy files, applies stage filtering, extracts backbone embeddings, and caches feats + labels + subject_ids."""
