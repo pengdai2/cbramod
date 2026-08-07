@@ -162,7 +162,7 @@ class ProbeTrainer(CBraModTrainer):
 
     def train(self, train_path: Path, val_path: Path) -> dict:
         """Main training loop that handles both fixed split and optional SGKF cross-validation."""
-        if self.args.enable_sgkf:
+        if self.config.enable_sgkf:
             return self.train_cross_validation(train_path, val_path)
         else:
             return self.train_fixed_split(train_path, val_path)
@@ -399,7 +399,7 @@ class ProbeTrainer(CBraModTrainer):
             }, fold_val_cache)
 
             # Update checkpoint filename per fold to prevent overwriting
-            self.args.best_head_filename = f"cbramod_head_fold_{fold+1}_best.pt"
+            self.config.best_head_filename = f"cbramod_head_fold_{fold+1}_best.pt"
 
             results = self.train_fixed_split(fold_train_cache, fold_val_cache)
             fold_results.append(results)
