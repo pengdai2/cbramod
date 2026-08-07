@@ -23,40 +23,198 @@ from sklearn.metrics import (
 )
 
 
+# =====================================================================
+# DATASETS
+# =====================================================================
+
+def parse_stage_filter(
+    filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]]
+) -> Optional[Set[str]]:
+    """Standardizes optional stage filter formats into a set of stage strings."""
+    if isinstance(filter_stage, str):
+        return {s.strip() for s in filter_stage.split(",")}
+    elif isinstance(filter_stage, (list, tuple, set)):
+        return {str(s).strip() for s in filter_stage}
+    return None
+
+
+def extract_valid_window_indices(
+    meta_path: Optional[Path],
+    npy_path: Path,
+    filter_stage: Optional[Set[str]] = None,
+    memory_map: bool = True
+) -> Tuple[List[int], int]:
+    """
+    Parses subject metadata to extract valid window row indices matching 
+    quality and stage filter criteria.
+    
+    Returns:
+        Tuple of (valid_window_indices, excluded_window_count)
+    """
+    valid_indices = []
+    excluded_count = 0
+
+    if meta_path and meta_path.exists():
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+
+            stages_list = meta.get("stages", [])
+
+            for slice_info in meta.get("slices", []):
+                # Check slice validity
+                if not slice_info.get("is_valid", True):
+                    excluded_count += 1
+                    continue
+
+                window_idx = slice_info["window_idx"]  # Direct row index in .npy array
+
+                # Resolve sleep stage for window
+                slice_stage = slice_info.get("stage")
+                if slice_stage is None and window_idx < len(stages_list):
+                    slice_stage = stages_list[window_idx]
+
+                # Apply sleep stage filtering
+                if filter_stage is not None and slice_stage not in filter_stage:
+                    excluded_count += 1
+                    continue
+
+                valid_indices.append(window_idx)
+
+            return valid_indices, excluded_count
+        except Exception as e:
+            print(f"  [Warning] Failed to parse meta JSON {meta_path}: {e}. Falling back to array bounds.")
+
+    # Fallback if meta_path is missing or invalid
+    try:
+        if memory_map:
+            mmap_data = np.load(npy_path, mmap_mode="r")
+            actual_slices = mmap_data.shape[0]
+        else:
+            data = np.load(npy_path)
+            actual_slices = data.shape[0]
+
+        return list(range(actual_slices)), 0
+    except Exception as e:
+        print(f"  [Warning] Failed to read array shape from {npy_path}: {e}")
+        return [], 0
+
+
+class PANSubjectEEGDataset(Dataset):
+    """
+    PyTorch Dataset that loads subject recordings from manifest CSVs.
+    Returns all valid windows for a subject in a single tensor.
+    """
+    def __init__(
+        self,
+        manifest_csv: Union[str, Path],
+        data_dir: Optional[Union[str, Path]] = None,
+        memory_map: bool = True,
+        filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]] = None
+    ):
+        self.manifest_csv = Path(manifest_csv)
+        self.data_dir = Path(data_dir) if data_dir else None
+        self.memory_map = memory_map
+        self.filter_stage = parse_stage_filter(filter_stage)
+
+        if not self.manifest_csv.exists():
+            raise FileNotFoundError(f"Manifest file not found: {self.manifest_csv}")
+
+        self.df = pd.read_csv(self.manifest_csv)
+        self.subjects: List[Tuple[str, Path, List[int], int]] = []
+        self._index_dataset()
+
+    def _index_dataset(self) -> None:
+        print(f"Indexing subject recordings from manifest: {self.manifest_csv.name}...")
+        total_valid_windows = 0
+        total_skipped_slices = 0
+        skipped_subjects = 0
+
+        for _, row in self.df.iterrows():
+            subject_id = str(row["subject_id"])
+            raw_npy_path = Path(row["npy_path"])
+            raw_meta_path = Path(row["meta_path"]) if "meta_path" in row and pd.notna(row["meta_path"]) else None
+            label = int(row["label"])
+
+            if label == -1:
+                print(f"  [Warning] Subject {subject_id} missing label, skipping...")
+                skipped_subjects += 1
+                continue
+
+            if self.data_dir:
+                npy_path = self.data_dir / raw_npy_path if not raw_npy_path.is_absolute() else raw_npy_path
+                meta_path = self.data_dir / raw_meta_path if raw_meta_path and not raw_meta_path.is_absolute() else raw_meta_path
+            else:
+                npy_path = raw_npy_path
+                meta_path = raw_meta_path
+
+            if not npy_path.exists():
+                print(f"  [Warning] Subject {subject_id} missing tensor file: {npy_path}, skipping...")
+                skipped_subjects += 1
+                continue
+
+            valid_indices, excluded_count = extract_valid_window_indices(
+                meta_path=meta_path,
+                npy_path=npy_path,
+                filter_stage=self.filter_stage,
+                memory_map=self.memory_map
+            )
+            total_skipped_slices += excluded_count
+
+            if not valid_indices:
+                print(f"  [Warning] Subject {subject_id} has 0 valid windows after filtering, skipping...")
+                skipped_subjects += 1
+                continue
+
+            self.subjects.append((subject_id, npy_path, valid_indices, label))
+            total_valid_windows += len(valid_indices)
+
+        filter_info = f" [Filter Stage: {','.join(sorted(self.filter_stage))}]" if self.filter_stage else ""
+        print(
+            f"  -> Indexing complete{filter_info}: {len(self.subjects)} subjects loaded "
+            f"({total_valid_windows:,} total valid windows, {total_skipped_slices:,} excluded/filtered windows, "
+            f"{skipped_subjects} subjects skipped)."
+        )
+
+    def __len__(self) -> int:
+        return len(self.subjects)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
+        subject_id, npy_path, valid_indices, label = self.subjects[idx]
+
+        if self.memory_map:
+            mmap_data = np.load(npy_path, mmap_mode="r")
+            subj_data = np.array(mmap_data[valid_indices], dtype=np.float32)
+        else:
+            data = np.load(npy_path)
+            subj_data = data[valid_indices].astype(np.float32)
+
+        x_tensor = torch.from_numpy(subj_data)
+        y_tensor = torch.tensor(label, dtype=torch.long)
+
+        return x_tensor, y_tensor, subject_id
+
+
 class PANSleepEEGDataset(Dataset):
     """
-    PyTorch Dataset that loads real preprocessed sleep EEG tensors (.npy) 
-    using manifest CSVs generated by 03_label_dataset.py.
-    
-    Reads *_meta.json files to filter out corrupted or flatlined slices 
-    ('is_valid': False) and optional sleep stages ('filter_stage') while 
-    preserving exact array row index mapping.
+    PyTorch Dataset returning individual 30s window slices.
     """
     def __init__(
         self,
         manifest_csv: Path,
         data_dir: Optional[Union[str, Path]] = None,
         memory_map: bool = True,
-        filter_stage: Optional[Union[str, List[str], Set[str]]] = None
+        filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]] = None
     ):
         self.manifest_csv = Path(manifest_csv)
         self.data_dir = Path(data_dir) if data_dir else None
         self.memory_map = memory_map
-
-        # Parse and standardize optional stage filter (e.g., "N2,N3" or ["N2", "N3"] -> {"N2", "N3"})
-        if isinstance(filter_stage, str):
-            self.filter_stage: Optional[Set[str]] = {s.strip() for s in filter_stage.split(",")}
-        elif isinstance(filter_stage, (list, tuple, set)):
-            self.filter_stage = {str(s).strip() for s in filter_stage}
-        else:
-            self.filter_stage = None
+        self.filter_stage = parse_stage_filter(filter_stage)
 
         if not self.manifest_csv.exists():
             raise FileNotFoundError(f"Manifest file not found: {self.manifest_csv}")
-            
+
         self.df = pd.read_csv(self.manifest_csv)
-        
-        # Index map: (npy_file_path, slice_index_inside_npy, label, subject_id)
         self.samples: List[Tuple[Path, int, int, str]] = []
         self._index_dataset()
 
@@ -75,7 +233,6 @@ class PANSleepEEGDataset(Dataset):
                 print(f"  [Warning] Subject {subject_id} missing label, skipping...")
                 continue
 
-            # Resolve relative paths against data_dir
             if self.data_dir:
                 npy_path = self.data_dir / raw_npy_path if not raw_npy_path.is_absolute() else raw_npy_path
                 meta_path = self.data_dir / raw_meta_path if raw_meta_path and not raw_meta_path.is_absolute() else raw_meta_path
@@ -87,59 +244,22 @@ class PANSleepEEGDataset(Dataset):
                 print(f"  [Warning] Subject {subject_id} missing tensor file: {npy_path}, skipping...")
                 continue
 
-            # Read JSON metadata to unroll valid slices and skip corrupted/flatline/non-matching stage windows
-            if meta_path and meta_path.exists():
-                try:
-                    with open(meta_path, "r") as f:
-                        meta = json.load(f)
+            valid_indices, excluded_count = extract_valid_window_indices(
+                meta_path=meta_path,
+                npy_path=npy_path,
+                filter_stage=self.filter_stage,
+                memory_map=self.memory_map
+            )
+            total_skipped_slices += excluded_count
 
-                    stages_list = meta.get("stages", [])
-
-                    for slice_info in meta.get("slices", []):
-                        if not slice_info.get("is_valid", True):
-                            total_skipped_slices += 1
-                            continue
-
-                        window_idx = slice_info["window_idx"]  # Direct row index in .npy tensor
-
-                        # Resolve stage for current window
-                        slice_stage = slice_info.get("stage")
-                        if slice_stage is None and window_idx < len(stages_list):
-                            slice_stage = stages_list[window_idx]
-
-                        # Apply stage filtering if specified
-                        if self.filter_stage is not None and slice_stage not in self.filter_stage:
-                            total_skipped_slices += 1
-                            continue
-
-                        self.samples.append((npy_path, window_idx, label, subject_id))
-                        total_valid_slices += 1
-                    continue
-                except Exception as e:
-                    print(f"  [Warning] Failed to parse meta JSON {meta_path}: {e}. Falling back to array bounds.")
-
-            # Fallback if meta_path is missing
-            try:
-                if self.memory_map:
-                    mmap_data = np.load(npy_path, mmap_mode="r")
-                    actual_slices = mmap_data.shape[0]
-                else:
-                    data = np.load(npy_path)
-                    actual_slices = data.shape[0]
-
-                num_slices_manifest = int(row.get("num_slices", actual_slices))
-                valid_slices = min(num_slices_manifest, actual_slices)
-
-                for idx in range(valid_slices):
-                    self.samples.append((npy_path, idx, label, subject_id))
-                    total_valid_slices += 1
-            except Exception as e:
-                print(f"  [Warning] Subject {subject_id} failed to read tensor from {npy_path}: {e}, skipping...")
+            for w_idx in valid_indices:
+                self.samples.append((npy_path, w_idx, label, subject_id))
+                total_valid_slices += 1
 
         filter_info = f" [Filter Stage: {','.join(sorted(self.filter_stage))}]" if self.filter_stage else ""
         print(
-            f"  -> Indexing complete{filter_info}: {total_valid_slices:,} valid windows loaded across {len(self.df)} subjects "
-            f"({total_skipped_slices:,} excluded/filtered windows)."
+            f"  -> Indexing complete{filter_info}: {total_valid_slices:,} valid windows loaded "
+            f"across {len(self.df)} subjects ({total_skipped_slices:,} excluded/filtered windows)."
         )
 
     def __len__(self) -> int:
@@ -147,8 +267,7 @@ class PANSleepEEGDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
         npy_path, window_idx, label, subject_id = self.samples[idx]
-        
-        # Load single slice from disk using memory-mapping
+
         if self.memory_map:
             data = np.load(npy_path, mmap_mode="r")
             slice_data = np.array(data[window_idx], dtype=np.float32)
@@ -156,10 +275,59 @@ class PANSleepEEGDataset(Dataset):
             data = np.load(npy_path)
             slice_data = data[window_idx].astype(np.float32)
 
-        x_tensor = torch.from_numpy(slice_data)  # Shape: [Channels, Time_Samples]
+        x_tensor = torch.from_numpy(slice_data)
         y_tensor = torch.tensor(label, dtype=torch.long)
-        
+
         return x_tensor, y_tensor, subject_id
+
+
+class CachedFeatureSubjectDataset(Dataset):
+    """Dataset that groups pre-extracted features by subject ID for patient-level inference."""
+    def __init__(self, pt_path: Union[str, Path]):
+        data = torch.load(pt_path, map_location="cpu", weights_only=True)
+        self.feats = data["feats"]
+        self.labels = data["labels"]
+        self.subject_ids = np.array(data["subject_ids"])
+        self.unique_subjects = np.unique(self.subject_ids)
+
+    def __len__(self) -> int:
+        return len(self.unique_subjects)
+
+    def __getitem__(self, idx: int) -> Tuple[str, torch.Tensor, int]:
+        subject_id = self.unique_subjects[idx]
+        mask = (self.subject_ids == subject_id)
+        subj_feats = self.feats[mask]
+        
+        # All windows for a given subject share the same patient-level ground truth
+        subj_label = int(self.labels[mask][0].item())
+        
+        return subject_id, subj_feats, subj_label
+
+
+class SyntheticEEGDataset(torch.utils.data.Dataset):
+    """
+    Generates synthetic EEG tensors matching CBraMod input specs for pipeline verification:
+    Shape: [Batch, Channels, Time_Samples] -> [B, 64, 6000] (30s @ 200 Hz)
+    """
+    def __init__(self, num_samples: int = 128, channels: int = 64, time_samples: int = 6000, num_classes: int = 2):
+        self.num_samples = num_samples
+        # Generate random Gaussian noise with synthetic 12 Hz sinusoidal bursts (simulated spindles)
+        self.data = torch.randn(num_samples, channels, time_samples, dtype=torch.float32)
+
+        # Inject synthetic 12 Hz sine wave in central channels for half the batch
+        t = torch.linspace(0, 30, time_samples)
+        spindle_wave = 2.0 * torch.sin(2 * np.pi * 12 * t)
+        for i in range(num_samples // 2):
+            self.data[i, :4, 2000:2400] += spindle_wave[2000:2400] # Inject 2-second burst
+
+        self.labels = torch.cat([torch.ones(num_samples // 2, dtype=torch.long),
+                                 torch.zeros(num_samples - num_samples // 2, dtype=torch.long)])
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.labels[idx]
 
 
 # =====================================================================
@@ -266,32 +434,6 @@ class CBraModE2EClassifier(nn.Module):
         # Backbone output shape: [Batch, Channels, Patches, EmbDim]
         feats = self.backbone(x).mean(dim=1)  # Spatial channel mean -> [Batch, Patches, EmbDim]
         return self.head(feats)
-
-
-class SyntheticEEGDataset(torch.utils.data.Dataset):
-    """
-    Generates synthetic EEG tensors matching CBraMod input specs for pipeline verification:
-    Shape: [Batch, Channels, Time_Samples] -> [B, 64, 6000] (30s @ 200 Hz)
-    """
-    def __init__(self, num_samples: int = 128, channels: int = 64, time_samples: int = 6000, num_classes: int = 2):
-        self.num_samples = num_samples
-        # Generate random Gaussian noise with synthetic 12 Hz sinusoidal bursts (simulated spindles)
-        self.data = torch.randn(num_samples, channels, time_samples, dtype=torch.float32)
-
-        # Inject synthetic 12 Hz sine wave in central channels for half the batch
-        t = torch.linspace(0, 30, time_samples)
-        spindle_wave = 2.0 * torch.sin(2 * np.pi * 12 * t)
-        for i in range(num_samples // 2):
-            self.data[i, :4, 2000:2400] += spindle_wave[2000:2400] # Inject 2-second burst
-
-        self.labels = torch.cat([torch.ones(num_samples // 2, dtype=torch.long),
-                                 torch.zeros(num_samples - num_samples // 2, dtype=torch.long)])
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, idx):
-        return self.data[idx], self.labels[idx]
 
 
 class CBraModFeatureExtractor(nn.Module):
