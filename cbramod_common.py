@@ -43,7 +43,7 @@ def extract_valid_window_indices(
     npy_path: Path,
     filter_stage: Optional[Set[str]] = None,
     memory_map: bool = True
-) -> Tuple[List[int], int]:
+) -> Tuple[List[int], int, List[str]]:
     """
     Parses subject metadata to extract valid window row indices matching 
     quality and stage filter criteria.
@@ -81,7 +81,7 @@ def extract_valid_window_indices(
 
                 valid_indices.append(window_idx)
 
-            return valid_indices, excluded_count
+            return valid_indices, excluded_count, np.array(stages_list)[valid_indices].tolist()
         except Exception as e:
             print(f"  [Warning] Failed to parse meta JSON {meta_path}: {e}. Falling back to array bounds.")
 
@@ -129,7 +129,7 @@ class PANSubjectEEGDataset(Dataset):
             df = df[df["subject_id"].isin(target_ids)].copy()
         self.df = df
 
-        self.subjects: List[Tuple[str, Path, List[int], int]] = []
+        self.subjects: List[Tuple[str, Path, List[int], int, List[str]]] = []
         self._index_dataset()
 
     def _index_dataset(self) -> None:
@@ -161,7 +161,7 @@ class PANSubjectEEGDataset(Dataset):
                 skipped_subjects += 1
                 continue
 
-            valid_indices, excluded_count = extract_valid_window_indices(
+            valid_indices, excluded_count, stages = extract_valid_window_indices(
                 meta_path=meta_path,
                 npy_path=npy_path,
                 filter_stage=self.filter_stage,
@@ -174,7 +174,7 @@ class PANSubjectEEGDataset(Dataset):
                 skipped_subjects += 1
                 continue
 
-            self.subjects.append((subject_id, npy_path, valid_indices, label))
+            self.subjects.append((subject_id, npy_path, valid_indices, label, stages))
             total_valid_windows += len(valid_indices)
 
         filter_stage_info = f" [Filter Stage: {','.join(sorted(self.filter_stage))}]" if self.filter_stage else ""
@@ -189,7 +189,7 @@ class PANSubjectEEGDataset(Dataset):
         return len(self.subjects)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        subject_id, npy_path, valid_indices, label = self.subjects[idx]
+        subject_id, npy_path, valid_indices, label, stages = self.subjects[idx]
 
         if self.memory_map:
             mmap_data = np.load(npy_path, mmap_mode="r")
@@ -201,7 +201,7 @@ class PANSubjectEEGDataset(Dataset):
         x_tensor = torch.from_numpy(subj_data)
         y_tensor = torch.tensor(label, dtype=torch.long)
 
-        return x_tensor, y_tensor, subject_id
+        return x_tensor, y_tensor, subject_id, stages
 
 
 class PANSleepEEGDataset(Dataset):
@@ -901,5 +901,63 @@ def setup_training_cli_parser(
     )
 
     return parser
+
+
+def load_model_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: Path,
+    device: torch.device
+) -> Tuple[torch.nn.Module, dict, Union[int, str]]:
+    """
+    Loads checkpoint weights into the model architecture.
+    Handles both head-only (backbone frozen / LP-FT) state dicts and full model state dicts.
+    """
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint state dict not found: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
+
+    # Extract state dict dict structure if wrapped inside checkpoint metadata
+    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
+        state_dict = checkpoint["state_dict"]
+    else:
+        state_dict = checkpoint
+
+    optimal_thresholds = checkpoint.get("optimal_thresholds", {}) if isinstance(checkpoint, dict) else {}
+    epoch = checkpoint.get("epoch", "N/A") if isinstance(checkpoint, dict) else "N/A"
+
+    # Strategy 1: Attempt direct full-model state dict load (Full Fine-Tuning)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print(f"Successfully loaded full model checkpoint (strict=True) from epoch {epoch}.")
+        return model, optimal_thresholds, epoch
+    except Exception:
+        pass
+
+    # Strategy 2: Attempt head-only state dict load into model.head (Linear Probe / Head Frozen)
+    head_state_dict = {}
+    for k, v in state_dict.items():
+        if not k.startswith("backbone.") and not k.startswith("encoder."):
+            head_state_dict[k] = v
+
+    if hasattr(model, "head") and head_state_dict:
+        try:
+            model.head.load_state_dict(head_state_dict, strict=True)
+            print(f"Successfully loaded head-only state dict into model.head from epoch {epoch}.")
+            return model, optimal_thresholds, epoch
+        except Exception:
+            pass
+
+    # Strategy 3: Fallback load with strict=False
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    print(f"Loaded checkpoint with strict=False from epoch {epoch}.")
+    if missing_keys:
+        print(f"  [Info] Missing keys: {len(missing_keys)}")
+    if unexpected_keys:
+        print(f"  [Info] Unexpected keys: {len(unexpected_keys)}")
+
+    return model, optimal_thresholds, epoch
 
 

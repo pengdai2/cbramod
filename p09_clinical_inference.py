@@ -18,65 +18,7 @@ from sklearn.metrics import (
     roc_curve,
 )
 from tqdm import tqdm
-from cbramod_common import CBraModE2EClassifier, CachedFeatureSubjectDataset, LinearProbeHead, MLPProbeHead, PANSubjectEEGDataset, compute_pooled_scores, setup_common_cli_parser
-
-
-def load_model_checkpoint(
-    model: torch.nn.Module, 
-    checkpoint_path: Path, 
-    device: torch.device
-) -> Tuple[torch.nn.Module, dict, Union[int, str]]:
-    """
-    Loads checkpoint weights into the model architecture.
-    Handles both head-only (backbone frozen / LP-FT) state dicts and full model state dicts.
-    """
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint state dict not found: {checkpoint_path}")
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-    
-    # Extract state dict dict structure if wrapped inside checkpoint metadata
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
-
-    optimal_thresholds = checkpoint.get("optimal_thresholds", {}) if isinstance(checkpoint, dict) else {}
-    epoch = checkpoint.get("epoch", "N/A") if isinstance(checkpoint, dict) else "N/A"
-
-    # Strategy 1: Attempt direct full-model state dict load (Full Fine-Tuning)
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print(f"Successfully loaded full model checkpoint (strict=True) from epoch {epoch}.")
-        return model, optimal_thresholds, epoch
-    except Exception:
-        pass
-
-    # Strategy 2: Attempt head-only state dict load into model.head (Linear Probe / Head Frozen)
-    head_state_dict = {}
-    for k, v in state_dict.items():
-        if not k.startswith("backbone.") and not k.startswith("encoder."):
-            head_state_dict[k] = v
-
-    if hasattr(model, "head") and head_state_dict:
-        try:
-            model.head.load_state_dict(head_state_dict, strict=True)
-            print(f"Successfully loaded head-only state dict into model.head from epoch {epoch}.")
-            return model, optimal_thresholds, epoch
-        except Exception:
-            pass
-
-    # Strategy 3: Fallback load with strict=False
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    print(f"Loaded checkpoint with strict=False from epoch {epoch}.")
-    if missing_keys:
-        print(f"  [Info] Missing keys: {len(missing_keys)}")
-    if unexpected_keys:
-        print(f"  [Info] Unexpected keys: {len(unexpected_keys)}")
-
-    return model, optimal_thresholds, epoch
+from cbramod_common import CBraModE2EClassifier, CachedFeatureSubjectDataset, LinearProbeHead, MLPProbeHead, PANSubjectEEGDataset, compute_pooled_scores, load_model_checkpoint, setup_common_cli_parser
 
 
 @torch.no_grad()
@@ -127,7 +69,7 @@ def generate_subject_predictions(
         print(f"Loaded raw EEG recording dataset for {len(dataset)} subjects.")
 
         for i in tqdm(range(len(dataset)), desc="Processing Subjects (Raw EEG)"):
-            x_tensor, y_tensor, subject_id = dataset[i]
+            x_tensor, y_tensor, subject_id, _ = dataset[i]
             label = int(y_tensor.item())
             probs = infer_subject_windows(model, x_tensor, args.batch_size, device)
             yield subject_id, label, probs
