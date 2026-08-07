@@ -253,7 +253,9 @@ class EndToEndTrainer(CBraModTrainer):
         scheduler = CosineAnnealingLR(optimizer, T_max=self.config.epochs, eta_min=self.config.min_lr)
         scaler = torch.amp.GradScaler(device="cuda", enabled=self.config.use_amp)
 
+        best_primary_metrics = {}
         best_primary_f1 = 0.0
+        best_thresholds = {}
         patience_counter = 0
         best_model_path = Path(self.config.checkpoint_dir) / "cbramod_e2e_best.pt"
 
@@ -394,6 +396,9 @@ class EndToEndTrainer(CBraModTrainer):
 
             if primary_f1 > best_primary_f1:
                 best_primary_f1 = primary_f1
+                best_primary_metrics = primary_metrics
+                best_thresholds = {strat: res["optimal_threshold"] for strat, res in pooling_results.items()}
+
                 patience_counter = 0
                 torch.save(
                     {
@@ -418,8 +423,12 @@ class EndToEndTrainer(CBraModTrainer):
                 break
 
         self.logger.info("=" * 125)
-        self.logger.info(f"E2E Fine-Tuning Complete. Best Subject Macro F1: {best_primary_f1:.4f}")
-        return best_primary_f1
+        self.logger.info(
+            f"Training Complete. Best Validation Subject Macro F1 ({self.config.primary_pooling}): {best_primary_f1:.4f}"
+        )
+        self.logger.info(f"Calibrated Strategy Thresholds: {best_thresholds}")
+
+        return best_primary_metrics
 
 
 # =====================================================================

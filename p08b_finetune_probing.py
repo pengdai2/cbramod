@@ -35,6 +35,7 @@ from cbramod_utils import seed_everything, setup_logger
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
+from sklearn.model_selection import StratifiedGroupKFold
 from tqdm import tqdm
 
 from cbramod_common import (
@@ -65,6 +66,11 @@ def parse_cli_args() -> argparse.Namespace:
     ckpt_group.add_argument("--val-cache-name", type=str, default="cached_val_embeddings.pt", help="Filename for cached validation embeddings")
     ckpt_group.add_argument("--best-head-filename", type=str, default="cbramod_head_best.pt", help="Filename for best probe head checkpoint")
     ckpt_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
+
+    # Run Options
+    run_group = parser.add_argument_group("Run Options")
+    run_group.add_argument("--enable-sgkf", action="store_true", help="Enable stratified group k-fmax old cross-validation (overrides train/val split)")
+    run_group.add_argument("--sgkf-folds", type=int, default=5, min_value=3, max_value=10, help="Number of folds for stratified group k-fold CV (default: 5)")
 
     # Logging Controls
     log_group = parser.add_argument_group("Logging")
@@ -154,7 +160,15 @@ class ProbeTrainer(CBraModTrainer):
     def __init__(self, config: argparse.Namespace, logger: logging.Logger):
         super().__init__(config, logger)
 
-    def train(self, train_path: Path, val_path: Path) -> float:
+    def train(self, train_path: Path, val_path: Path) -> dict:
+        """Main training loop that handles both fixed split and optional SGKF cross-validation."""
+        if self.args.enable_sgkf:
+            return self.train_cross_validation(train_path, val_path)
+        else:
+            return self.train_fixed_split(train_path, val_path)
+    
+    def train_fixed_split(self, train_path: Path, val_path: Path) -> dict:
+        """Trains the probe head on a fixed train/val split and evaluates subject-level pooling metrics."""
         self.logger.info("Loading cached feature tensors into RAM...")
         train_data = torch.load(train_path, map_location="cpu", weights_only=True)
         val_data = torch.load(val_path, map_location="cpu", weights_only=True)
@@ -195,6 +209,7 @@ class ProbeTrainer(CBraModTrainer):
         optimizer = torch.optim.AdamW(head.parameters(), lr=self.config.head_lr, weight_decay=self.config.weight_decay)
         scheduler = CosineAnnealingLR(optimizer, T_max=self.config.epochs, eta_min=self.config.min_lr)
 
+        best_primary_metrics = {}
         best_primary_f1 = 0.0
         best_thresholds = {}
         patience_counter = 0
@@ -289,9 +304,10 @@ class ProbeTrainer(CBraModTrainer):
             # Model Selection & Checkpointing based on Primary Subject-Level Macro F1
             if primary_f1 > best_primary_f1:
                 best_primary_f1 = primary_f1
-                patience_counter = 0
+                best_primary_metrics = primary_metrics
                 best_thresholds = {strat: res["optimal_threshold"] for strat, res in pooling_results.items()}
-                
+
+                patience_counter = 0
                 torch.save(
                     {
                         "epoch": epoch,
@@ -319,7 +335,90 @@ class ProbeTrainer(CBraModTrainer):
             f"Training Complete. Best Validation Subject Macro F1 ({self.config.primary_pooling}): {best_primary_f1:.4f}"
         )
         self.logger.info(f"Calibrated Strategy Thresholds: {best_thresholds}")
-        return best_primary_f1
+
+        return best_primary_metrics
+
+    def train_cross_validation(self, train_cache_path: Path, val_cache_path: Path) -> dict:
+        """Executes Stratified Group K-Fold Cross-Validation on subject-level splits."""
+        # Load and concatenate both train and val caches to form a unified pool for SGKF
+        self.logger.info("Loading cached embeddings into memory for SGKF splitting...")
+        train_data = torch.load(train_cache_path, map_location="cpu", weights_only=True)
+        val_data = torch.load(val_cache_path, map_location="cpu", weights_only=True)
+
+        all_feats = torch.cat([train_data["feats"], val_data["feats"]], dim=0)
+        all_labels = torch.cat([train_data["labels"], val_data["labels"]], dim=0)
+    
+        # Combine subject IDs safely
+        train_sids = train_data.get("subject_ids", [])
+        val_sids = val_data.get("subject_ids", [])
+        all_subject_ids = np.array(train_sids + val_sids)
+
+        # Build unique subject-to-label mapping for StratifiedGroupKFold
+        unique_sids = np.unique(all_subject_ids)
+        subject_labels = {}
+        for sid in unique_sids:
+            mask = (all_subject_ids == sid)
+            # Take the majority label or first window label as the subject label representation
+            subject_labels[sid] = int(all_labels[mask][0].item())
+
+        unique_labels = np.array([subject_labels[s] for s in unique_sids])
+
+        # Execute k-Fold Stratified Group K-Fold
+        sgkf = StratifiedGroupKFold(n_splits=self.config.k_folds, shuffle=True, random_state=self.config.seed)
+    
+        fold_results = []
+    
+        self.logger.info(f"=" * 100)
+        self.logger.info(f"STARTING {self.config.k_folds}-FOLD STRATIFIED GROUP K-FOLD CROSS-VALIDATION ACROSS {len(unique_sids)} TOTAL SUBJECTS")
+        self.logger.info(f"=" * 100)
+
+        for fold, (train_subj_idx, val_subj_idx) in enumerate(
+            sgkf.split(unique_sids, unique_labels, groups=unique_sids)):
+            self.logger.info(f"\n--- Fold [{fold+1}/{self.config.k_folds}] ---")
+            train_sids_fold = set(unique_sids[train_subj_idx])
+            val_sids_fold = set(unique_sids[val_subj_idx])
+
+            train_mask = np.isin(all_subject_ids, list(train_sids_fold))
+            val_mask = np.isin(all_subject_ids, list(val_sids_fold))
+
+            # Save temporary fold-specific cache paths to leverage existing ProbeTrainer class directly
+            cache_dir = Path(self.config.cache_dir)
+            fold_train_cache = cache_dir / f"fold_{fold+1}_train.pt"
+            fold_val_cache = cache_dir / f"fold_{fold+1}_val.pt"
+
+            torch.save({
+                "feats": all_feats[train_mask],
+                "labels": all_labels[train_mask],
+                "subject_ids": all_subject_ids[train_mask].tolist()
+            }, fold_train_cache)
+
+            torch.save({
+                "feats": all_feats[val_mask],
+                "labels": all_labels[val_mask],
+                "subject_ids": all_subject_ids[val_mask].tolist()
+            }, fold_val_cache)
+
+            # Update checkpoint filename per fold to prevent overwriting
+            self.args.best_head_filename = f"cbramod_head_fold_{fold+1}_best.pt"
+
+            results = self.train_fixed_split(fold_train_cache, fold_val_cache)
+            fold_results.append(results)
+
+        # Aggregate OOF Summary Statistics
+        stats = {}
+        for metric in fold_results[0].keys():
+            metric_values = [res[metric] for res in fold_results]
+            mean_val = np.mean(metric_values)
+            std_val = np.std(metric_values)
+            stats[metric] = {"mean": mean_val, "std": std_val}
+
+        self.logger.info(f"=" * 100)
+        self.logger.info(f"{self.config.k_folds}-FOLD CROSS-VALIDATION COMPLETE")
+        for metric, value in stats:
+            self.logger.info(f"{metric}: {value["mean"]:.4f} +/- {value["std"]:.4f}")
+        self.logger.info(f"=" * 100)
+
+        return stats
 
 
 # =====================================================================
@@ -355,7 +454,6 @@ def main():
     else:
         logger.info(f"Found existing cached feature files at '{cache_dir}'. Skipping .npy extraction phase.")
 
-    # Phase 2: Probe Training on Windows + Multi-Strategy Subject Pooling Validation
     trainer = ProbeTrainer(args, logger)
     trainer.train(train_cache_path, val_cache_path)
 

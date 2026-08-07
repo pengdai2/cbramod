@@ -18,6 +18,7 @@ from braindecode.models import CBraMod
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
+    recall_score,
     roc_auc_score
 )
 
@@ -59,7 +60,7 @@ class PANSleepEEGDataset(Dataset):
         self.samples: List[Tuple[Path, int, int, str]] = []
         self._index_dataset()
 
-    def _index_dataset(self):
+    def _index_dataset(self) -> None:
         print(f"Indexing samples from manifest: {self.manifest_csv.name}...")
         total_valid_slices = 0
         total_skipped_slices = 0
@@ -652,11 +653,15 @@ class CBraModTrainer:
                 final_preds = (scores >= best_t).astype(int)
                 acc = accuracy_score(subject_labels, final_preds)
                 roc_auc = roc_auc_score(subject_labels, scores) if len(np.unique(subject_labels)) > 1 else 0.5
+                sensitivity = recall_score(subject_labels, scores)
+                specificity = recall_score(subject_labels, scores, pos_label=0)
 
                 results[strat] = {
                     "subject_macro_f1": best_f1,
-                    "optimal_threshold": float(best_t),
                     "subject_accuracy": acc,
+                    "subject_sensitivity": sensitivity,
+                    "subject_specificity": specificity,
+                    "optimal_threshold": float(best_t),
                     "roc_auc": roc_auc
                 }
             else:
@@ -673,11 +678,11 @@ class CBraModTrainer:
 
         return results  
 
-    def train(self, train_path: Path, val_path: Path):
+    def train(self, train_path: Path, val_path: Path) -> dict:
         pass  # Placeholder for training loop implementation  
 
 
-def setup_common_cli_parser(parser: argparse.ArgumentParser)-> None:
+def setup_common_cli_parser(parser: argparse.ArgumentParser) -> None:
     # CBraMod Architecture Controls    
     cbra_group = parser.add_argument_group("CBraMod Architecture Controls")
     cbra_group.add_argument("--num-channels", type=int, default=64, help="EEG Channel count")
