@@ -27,7 +27,7 @@ from sklearn.metrics import (
 # DATASETS
 # =====================================================================
 
-def parse_stage_filter(
+def parse_filter(
     filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]]
 ) -> Optional[Set[str]]:
     """Standardizes optional stage filter formats into a set of stage strings."""
@@ -110,17 +110,25 @@ class PANSubjectEEGDataset(Dataset):
         manifest_csv: Union[str, Path],
         data_dir: Optional[Union[str, Path]] = None,
         memory_map: bool = True,
+        filter_subject: Optional[List[str]] = None,
         filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]] = None
     ):
         self.manifest_csv = Path(manifest_csv)
         self.data_dir = Path(data_dir) if data_dir else None
         self.memory_map = memory_map
-        self.filter_stage = parse_stage_filter(filter_stage)
+        self.filter_subject = parse_filter(filter_subject)
+        self.filter_stage = parse_filter(filter_stage)
 
         if not self.manifest_csv.exists():
             raise FileNotFoundError(f"Manifest file not found: {self.manifest_csv}")
 
-        self.df = pd.read_csv(self.manifest_csv)
+        df = pd.read_csv(self.manifest_csv)
+        if self.filter_subject:
+            target_ids = set(self.filter_subject)
+            df["subject_id"] = df["subject_id"].astype(str)
+            df = df[df["subject_id"].isin(target_ids)].copy()
+        self.df = df
+
         self.subjects: List[Tuple[str, Path, List[int], int]] = []
         self._index_dataset()
 
@@ -169,9 +177,10 @@ class PANSubjectEEGDataset(Dataset):
             self.subjects.append((subject_id, npy_path, valid_indices, label))
             total_valid_windows += len(valid_indices)
 
-        filter_info = f" [Filter Stage: {','.join(sorted(self.filter_stage))}]" if self.filter_stage else ""
+        filter_stage_info = f" [Filter Stage: {','.join(sorted(self.filter_stage))}]" if self.filter_stage else ""
+        filter_subject_info = f" [Filter Subject: {','.join(sorted(self.filter_subject))}]" if self.filter_subject else ""
         print(
-            f"  -> Indexing complete{filter_info}: {len(self.subjects)} subjects loaded "
+            f"  -> Indexing complete{filter_stage_info}{filter_subject_info}: {len(self.subjects)} subjects loaded "
             f"({total_valid_windows:,} total valid windows, {total_skipped_slices:,} excluded/filtered windows, "
             f"{skipped_subjects} subjects skipped)."
         )
@@ -209,7 +218,7 @@ class PANSleepEEGDataset(Dataset):
         self.manifest_csv = Path(manifest_csv)
         self.data_dir = Path(data_dir) if data_dir else None
         self.memory_map = memory_map
-        self.filter_stage = parse_stage_filter(filter_stage)
+        self.filter_stage = parse_filter(filter_stage)
 
         if not self.manifest_csv.exists():
             raise FileNotFoundError(f"Manifest file not found: {self.manifest_csv}")
