@@ -381,6 +381,8 @@ class ProbeTrainer(CBraModTrainer):
             train_mask = np.isin(all_subject_ids, list(train_sids_fold))
             val_mask = np.isin(all_subject_ids, list(val_sids_fold))
 
+            self.sanity_check(all_feats, all_subject_ids, fold, train_sids_fold, val_sids_fold, train_mask, val_mask)
+
             # Save temporary fold-specific cache paths to leverage existing ProbeTrainer class directly
             cache_dir = Path(self.config.cache_dir)
             fold_train_cache = cache_dir / f"fold_{fold+1}_train.pt"
@@ -419,6 +421,46 @@ class ProbeTrainer(CBraModTrainer):
         self.logger.info(f"=" * 100)
 
         return stats
+
+    def sanity_check(self, all_feats, all_subject_ids, fold, train_sids_fold, val_sids_fold, train_mask, val_mask):
+        # =====================================================================
+        # STRICT LEAKAGE & PARTITION DEBUG CHECKS
+        # =====================================================================
+        # 1. Check Subject ID set intersection
+        id_intersection = train_sids_fold.intersection(val_sids_fold)
+        assert len(id_intersection) == 0, (
+            f"[CRITICAL LEAKAGE] Fold {fold+1}: Found {len(id_intersection)} overlapping subject IDs in group split! "
+            f"Leaked IDs: {id_intersection}"
+        )
+
+        # 2. Check window mask mutual exclusivity (no window in both train and val)
+        mask_overlap = np.sum(train_mask & val_mask)
+        assert mask_overlap == 0, (
+            f"[CRITICAL LEAKAGE] Fold {fold+1}: {mask_overlap} window samples assigned to BOTH train and val splits!"
+        )
+
+        # 3. Check partition completeness (no windows silently dropped)
+        dropped_windows = np.sum(~(train_mask | val_mask))
+        assert dropped_windows == 0, (
+            f"[DATA LOSS] Fold {fold+1}: {dropped_windows} windows unmapped during string/type masking!"
+        )
+
+        # 4. Verify actual subject IDs extracted from filtered feature arrays
+        actual_train_subjs = set(all_subject_ids[train_mask])
+        actual_val_subjs = set(all_subject_ids[val_mask])
+        array_intersection = actual_train_subjs.intersection(actual_val_subjs)
+        assert len(array_intersection) == 0, (
+            f"[CRITICAL LEAKAGE] Fold {fold+1}: Found {len(array_intersection)} overlapping subjects in feature arrays! "
+            f"Overlapping: {array_intersection}"
+        )
+
+        self.logger.info(
+            f"✓ [Leak Checks Passed] Fold {fold+1} | "
+            f"Train: {len(actual_train_subjs)} subjs ({np.sum(train_mask):,} windows) | "
+            f"Val: {len(actual_val_subjs)} subjs ({np.sum(val_mask):,} windows) | "
+            f"Total Retained: {len(all_feats):,} windows"
+        )
+        # =====================================================================
 
 
 # =====================================================================
