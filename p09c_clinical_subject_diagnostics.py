@@ -20,6 +20,7 @@ from cbramod_common import (
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
+import tqdm
 
 
 class SubjectEEGInspector:
@@ -94,7 +95,7 @@ class SubjectEEGInspector:
         # Panel 2: Sleep Stage Hypnogram Alignment
         axes[1].step(epochs, numeric_stages, where="mid", color="purple", linewidth=1.5)
         axes[1].set_yticks([0, 1, 2, 3, 4, 5])
-        axes[1].set_yticklabels(["Wake", "REM", "N2", "N3", "N3", "Unk"])  # Focus on N2/N3 target
+        axes[1].set_yticklabels(["Wake", "REM", "N1", "N2", "N3", "Unknown"])  # Focus on N2/N3 target
         axes[1].invert_yaxis()  # Standard clinical hypnogram orientation
         axes[1].set_ylabel("Stage")
         axes[1].set_title("Aligned Sleep Stage Hypnogram (Metadata)")
@@ -102,19 +103,21 @@ class SubjectEEGInspector:
 
         # Panel 3: Probability Density (KDE/Hist)
         axes[2].hist(probs, bins=30, color="teal", edgecolor="black", alpha=0.7, density=True)
-        axes[2].axvline(x=self.threshold, color="red", linestyle="--")
+        axes[2].axvline(x=self.threshold, color="red", linestyle="--", label=f"Threshold ({self.threshold})")
         axes[2].set_xlabel("Probability")
         axes[2].set_ylabel("Density")
         axes[2].set_title("Epoch Probability Density (Tail Weight Analysis)")
+        axes[2].legend(loc="upper right")
         axes[2].grid(True, alpha=0.3)
 
         # Panel 4: Sorted Epoch Profile (Scree Plot)
         sorted_probs = np.sort(probs)[::-1]
-        axes[3].plot(sorted_probs, color="darkgreen", linewidth=2)
-        axes[3].axhline(y=self.threshold, color="red", linestyle="--")
+        axes[3].plot(sorted_probs, color="darkgreen", linewidth=2, label="P(Patient | Epoch)")
+        axes[3].axhline(y=self.threshold, color="red", linestyle="--", label=f"Threshold ({self.threshold})")
         axes[3].set_xlabel("Sorted Epoch Rank")
         axes[3].set_ylabel("Probability")
         axes[3].set_title("Sorted Epoch Energy Profile (Tail Decay)")
+        axes[3].legend(loc="upper right")
         axes[3].grid(True, alpha=0.3)
 
         plt.tight_layout()
@@ -212,7 +215,7 @@ def main():
     debugger = SubjectEEGInspector(model=model, device=device, threshold=threshold)
 
     # 3. Process filtered subjects
-    for idx in range(len(dataset)):
+    for idx in tqdm(range(len(dataset)), desc="Process Subjects (Raw EEG)"):
         x_tensor, y_tensor, subj_id, stages = dataset[idx]
         if x_tensor.shape[0] == 0:
             print(f"Skipping {subj_id}: No valid windows after stage filtering.")
