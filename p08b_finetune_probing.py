@@ -364,17 +364,17 @@ class ProbeTrainer(CBraModTrainer):
         unique_labels = np.array([subject_labels[s] for s in unique_sids])
 
         # Execute k-Fold Stratified Group K-Fold
-        sgkf = StratifiedGroupKFold(n_splits=self.config.k_folds, shuffle=True, random_state=self.config.seed)
+        sgkf = StratifiedGroupKFold(n_splits=self.config.sgkf_folds, shuffle=True, random_state=self.config.seed)
     
         fold_results = []
     
         self.logger.info(f"=" * 100)
-        self.logger.info(f"STARTING {self.config.k_folds}-FOLD STRATIFIED GROUP K-FOLD CROSS-VALIDATION ACROSS {len(unique_sids)} TOTAL SUBJECTS")
+        self.logger.info(f"STARTING {self.config.sgkf_folds}-FOLD STRATIFIED GROUP K-FOLD CROSS-VALIDATION ACROSS {len(unique_sids)} TOTAL SUBJECTS")
         self.logger.info(f"=" * 100)
 
         for fold, (train_subj_idx, val_subj_idx) in enumerate(
             sgkf.split(unique_sids, unique_labels, groups=unique_sids)):
-            self.logger.info(f"\n--- Fold [{fold+1}/{self.config.k_folds}] ---")
+            self.logger.info(f"\n--- Fold [{fold+1}/{self.config.sgkf_folds}] ---")
             train_sids_fold = set(unique_sids[train_subj_idx])
             val_sids_fold = set(unique_sids[val_subj_idx])
 
@@ -413,7 +413,7 @@ class ProbeTrainer(CBraModTrainer):
             stats[metric] = {"mean": mean_val, "std": std_val}
 
         self.logger.info(f"=" * 100)
-        self.logger.info(f"{self.config.k_folds}-FOLD CROSS-VALIDATION COMPLETE")
+        self.logger.info(f"{self.config.sgkf_folds}-FOLD CROSS-VALIDATION COMPLETE")
         for metric, value in stats:
             self.logger.info(f"{metric}: {value["mean"]:.4f} +/- {value["std"]:.4f}")
         self.logger.info(f"=" * 100)
