@@ -70,7 +70,7 @@ def parse_cli_args() -> argparse.Namespace:
     # Run Options
     run_group = parser.add_argument_group("Run Options")
     run_group.add_argument("--enable-sgkf", action="store_true", help="Enable stratified group k-fmax old cross-validation (overrides train/val split)")
-    run_group.add_argument("--sgkf-folds", type=int, default=5, min_value=3, max_value=10, help="Number of folds for stratified group k-fold CV (default: 5)")
+    run_group.add_argument("--sgkf-folds", type=int, default=5, help="Number of folds for stratified group k-fold CV (default: 5)")
 
     # Logging Controls
     log_group = parser.add_argument_group("Logging")
