@@ -961,3 +961,50 @@ def load_model_checkpoint(
     return model, optimal_thresholds, epoch
 
 
+def get_operating_threshold(
+    pooling_strategy: str,
+    override_threshold: Optional[float],
+    ckpt_thresholds: Dict[str, float]
+) -> float:
+    """Determines the operating threshold based on the pooling strategy and override settings."""
+    # Determine Operating Decision Threshold
+    if override_threshold is not None:
+        operating_threshold = override_threshold
+    elif pooling_strategy in ckpt_thresholds:
+        operating_threshold = ckpt_thresholds.get(pooling_strategy)
+    else:
+        operating_threshold = 0.5
+    return operating_threshold
+
+
+def find_optimal_threshold(
+    y_true: np.ndarray,
+    y_scores: np.ndarray,
+    metric: str = "macro_f1"
+) -> Tuple[float, float]:
+    """
+    Sweeps decision threshold values from 0.01 to 0.99 to find the threshold 
+    that maximizes the specified subject-level performance metric.
+    """
+    best_t = 0.5
+    best_score = -1.0
+    thresholds = np.linspace(0.01, 0.99, 99)
+
+    for t in thresholds:
+        preds = (y_scores >= t).astype(int)
+        if metric == "macro_f1":
+            score = f1_score(y_true, preds, average="macro", zero_division=0)
+        elif metric == "balanced_accuracy":
+            sens = recall_score(y_true, preds, pos_label=1, zero_division=0)
+            spec = recall_score(y_true, preds, pos_label=0, zero_division=0)
+            score = (sens + spec) / 2.0
+        else:
+            score = accuracy_score(y_true, preds)
+
+        if score > best_score:
+            best_score = score
+            best_t = t
+
+    return float(best_t), float(best_score)
+
+

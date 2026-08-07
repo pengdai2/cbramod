@@ -2,23 +2,20 @@ import argparse
 import json
 import os
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
 from cbramod_utils import seed_everything
 import torch
 from sklearn.metrics import (
     accuracy_score,
-    auc,
-    classification_report,
     confusion_matrix,
     f1_score,
     recall_score,
     roc_auc_score,
-    roc_curve,
 )
 from tqdm import tqdm
-from cbramod_common import CBraModE2EClassifier, CachedFeatureSubjectDataset, LinearProbeHead, MLPProbeHead, PANSubjectEEGDataset, compute_pooled_scores, load_model_checkpoint, setup_common_cli_parser
+from cbramod_common import CBraModE2EClassifier, CachedFeatureSubjectDataset, LinearProbeHead, MLPProbeHead, PANSubjectEEGDataset, compute_pooled_scores, find_optimal_threshold, get_operating_threshold, load_model_checkpoint, setup_common_cli_parser
 
 
 @torch.no_grad()
@@ -73,53 +70,6 @@ def generate_subject_predictions(
             label = int(y_tensor.item())
             probs = infer_subject_windows(model, x_tensor, args.batch_size, device)
             yield subject_id, label, probs
-
-
-def get_operating_threshold(
-    pooling_strategy: str,
-    override_threshold: Optional[float],
-    ckpt_thresholds: Dict[str, float]
-) -> float:
-    """Determines the operating threshold based on the pooling strategy and override settings."""
-    # Determine Operating Decision Threshold
-    if override_threshold is not None:
-        operating_threshold = override_threshold
-    elif pooling_strategy in ckpt_thresholds:
-        operating_threshold = ckpt_thresholds.get(pooling_strategy)
-    else:
-        operating_threshold = 0.5
-    return operating_threshold
-
-
-def find_optimal_threshold(
-    y_true: np.ndarray, 
-    y_scores: np.ndarray, 
-    metric: str = "macro_f1"
-) -> Tuple[float, float]:
-    """
-    Sweeps decision threshold values from 0.01 to 0.99 to find the threshold 
-    that maximizes the specified subject-level performance metric.
-    """
-    best_t = 0.5
-    best_score = -1.0
-    thresholds = np.linspace(0.01, 0.99, 99)
-
-    for t in thresholds:
-        preds = (y_scores >= t).astype(int)
-        if metric == "macro_f1":
-            score = f1_score(y_true, preds, average="macro", zero_division=0)
-        elif metric == "balanced_accuracy":
-            sens = recall_score(y_true, preds, pos_label=1, zero_division=0)
-            spec = recall_score(y_true, preds, pos_label=0, zero_division=0)
-            score = (sens + spec) / 2.0
-        else:
-            score = accuracy_score(y_true, preds)
-
-        if score > best_score:
-            best_score = score
-            best_t = t
-
-    return float(best_t), float(best_score)
 
 
 def evaluate_clinical_cohort(

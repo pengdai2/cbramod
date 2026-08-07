@@ -13,6 +13,7 @@ from cbramod_common import (
     CBraModE2EClassifier,
     PANSubjectEEGDataset,
     compute_pooled_scores,
+    get_operating_threshold,
     setup_common_cli_parser,
     load_model_checkpoint
 )
@@ -179,7 +180,7 @@ def main():
     dataset = PANSubjectEEGDataset(
         manifest_csv=args.manifest,
         data_dir=args.data_dir,
-        subject_ids=subject_ids,
+        filter_subject=subject_ids,
         filter_stage=args.filter_stage
     )
 
@@ -202,7 +203,13 @@ def main():
     model.to(device)
     model.eval()
 
-    debugger = SubjectEEGInspector(model=model, device=device, threshold=args.threshold)
+    threshold = get_operating_threshold(
+        pooling_strategy=args.pooling_strategy,
+        override_threshold=args.override_threshold,
+        ckpt_thresholds=ckpt_thresholds
+    )
+
+    debugger = SubjectEEGInspector(model=model, device=device, threshold=threshold)
 
     # 3. Process filtered subjects
     for idx in range(len(dataset)):
