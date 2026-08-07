@@ -414,7 +414,7 @@ class ProbeTrainer(CBraModTrainer):
 
         self.logger.info(f"=" * 100)
         self.logger.info(f"{self.config.sgkf_folds}-FOLD CROSS-VALIDATION COMPLETE")
-        for metric, value in stats:
+        for metric, value in stats.items():
             self.logger.info(f"{metric}: {value["mean"]:.4f} +/- {value["std"]:.4f}")
         self.logger.info(f"=" * 100)
 
