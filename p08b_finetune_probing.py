@@ -483,12 +483,12 @@ def main():
     if not cache_exists or args.force_extract:
         logger.info("Cached embeddings not found or --force-extract specified. Initializing Feature Extraction Phase...")
 
-        if not args.train_manifest_path or not args.val_manifest_path:
+        if not args.train_manifest or not args.val_manifest:
             logger.error("Missing manifest paths! Please provide --train-manifest and --val-manifest to extract features.")
             sys.exit(1)
 
-        train_manifest_path = Path(args.train_manifest_path)
-        val_manifest_path = Path(args.val_manifest_path)
+        train_manifest_path = Path(args.train_manifest)
+        val_manifest_path = Path(args.val_manifest)
 
         extractor_mgr = EmbeddingManager(args, logger)
         extractor_mgr.extract_and_cache(train_manifest_path, train_cache_path, split_name="train")
