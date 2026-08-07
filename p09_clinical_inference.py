@@ -13,26 +13,12 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     f1_score,
+    recall_score,
     roc_auc_score,
     roc_curve,
 )
 from tqdm import tqdm
-from cbramod_common import CBraModE2EClassifier, compute_pooled_scores, setup_common_cli_parser
-
-
-def evaluate_all_pooling_strategies(
-    window_probs: np.ndarray,
-    top_percentile: float = 0.10,
-    t_window: float = 0.60
-) -> Dict[str, Union[float, np.ndarray]]:
-    """Evaluates all supported pooling strategies on a subject's window probabilities."""
-    strategies = ["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"]
-    return {
-        strat: compute_pooled_scores(
-            window_probs, method=strat, top_percentile=top_percentile, t_window=t_window
-        )
-        for strat in strategies
-    }
+from cbramod_common import CBraModE2EClassifier, CachedFeatureSubjectDataset, LinearProbeHead, MLPProbeHead, PANSubjectEEGDataset, compute_pooled_scores, setup_common_cli_parser
 
 
 def load_model_checkpoint(
@@ -93,52 +79,58 @@ def load_model_checkpoint(
     return model, optimal_thresholds, epoch
 
 
-def run_subject_inference(
-    model: torch.nn.Module,
-    npy_path: Path,
-    meta_path: Path,
-    device: torch.device,
-    batch_size: int = 32,
-    filter_stage: Optional[str] = None
-) -> Tuple[np.ndarray, np.ndarray, int]:
-    """
-    Runs model inference across all window slices for a single subject.
-    Supports single or comma-separated stage filters (e.g., 'N2,N3').
-    """
-    window_data = np.load(npy_path)  # Shape: [Num_Windows, Channels, Time_Samples]
-    num_windows = len(window_data)
-    
-    stage_mask = None
-    if filter_stage and meta_path.exists():
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
-            stages = meta.get("stages", [])
-            if stages:
-                target_stages = [s.strip() for s in filter_stage.split(",")]
-                stage_mask = np.array([s in target_stages for s in stages])
-
-    if stage_mask is not None and len(stage_mask) == len(window_data):
-        window_data = window_data[stage_mask]
-        
-    if len(window_data) == 0:
-        return np.array([]), np.array([])
-
-    model.eval()
+@torch.no_grad()
+def infer_subject_windows(
+    model: torch.nn.Module, 
+    x_tensor: torch.Tensor, 
+    batch_size: int, 
+    device: torch.device
+) -> np.ndarray:
+    """Runs batched inference over a subject's windows (raw EEG or cached features)."""
     window_probs = []
+    num_windows = x_tensor.shape[0]
 
-    with torch.no_grad():
-        for i in range(0, len(window_data), batch_size):
-            batch_np = window_data[i : i + batch_size].astype(np.float32)
-            x_batch = torch.from_numpy(batch_np).to(device)
-            logits = model(x_batch)
-            probs = torch.softmax(logits, dim=1)
-            window_probs.append(probs.cpu().numpy())
+    for j in range(0, num_windows, batch_size):
+        x_batch = x_tensor[j : j + batch_size].to(device)
+        logits = model(x_batch)
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
+        window_probs.append(probs)
 
-    if not window_probs:
-        return np.array([]), np.array([])
+    return np.concatenate(window_probs, axis=0) if window_probs else np.array([])
 
-    all_window_probs = np.concatenate(window_probs, axis=0)  # Shape: [Num_Windows, Num_Classes]
-    return all_window_probs, window_data, num_windows
+
+def generate_subject_predictions(
+    args: argparse.Namespace, model:
+    torch.nn.Module,
+    device: torch.device
+):
+    """
+    Unified generator streaming (subject_id, ground_truth_label, window_probs)
+    for both cached features (.pt) and raw EEG manifest datasets.
+    """
+    if args.test_features_pt:
+        dataset = CachedFeatureSubjectDataset(args.test_features_pt)
+        print(f"Loaded cached features for {len(dataset)} subjects.")
+
+        for i in tqdm(range(len(dataset)), desc="Processing Subjects (Cached)"):
+            subject_id, subj_feats, label = dataset[i]
+            probs = infer_subject_windows(model, subj_feats, args.batch_size, device)
+            yield subject_id, label, probs
+
+    else:
+        dataset = PANSubjectEEGDataset(
+            manifest_csv=args.test_manifest,
+            data_dir=args.data_dir,
+            filter_stage=args.filter_stage,
+            memory_map=True
+        )
+        print(f"Loaded raw EEG recording dataset for {len(dataset)} subjects.")
+
+        for i in tqdm(range(len(dataset)), desc="Processing Subjects (Raw EEG)"):
+            x_tensor, y_tensor, subject_id = dataset[i]
+            label = int(y_tensor.item())
+            probs = infer_subject_windows(model, x_tensor, args.batch_size, device)
+            yield subject_id, label, probs
 
 
 def get_operating_threshold(
@@ -157,6 +149,37 @@ def get_operating_threshold(
     return operating_threshold
 
 
+def find_optimal_threshold(
+    y_true: np.ndarray, 
+    y_scores: np.ndarray, 
+    metric: str = "macro_f1"
+) -> Tuple[float, float]:
+    """
+    Sweeps decision threshold values from 0.01 to 0.99 to find the threshold 
+    that maximizes the specified subject-level performance metric.
+    """
+    best_t = 0.5
+    best_score = -1.0
+    thresholds = np.linspace(0.01, 0.99, 99)
+
+    for t in thresholds:
+        preds = (y_scores >= t).astype(int)
+        if metric == "macro_f1":
+            score = f1_score(y_true, preds, average="macro", zero_division=0)
+        elif metric == "balanced_accuracy":
+            sens = recall_score(y_true, preds, pos_label=1, zero_division=0)
+            spec = recall_score(y_true, preds, pos_label=0, zero_division=0)
+            score = (sens + spec) / 2.0
+        else:
+            score = accuracy_score(y_true, preds)
+
+        if score > best_score:
+            best_score = score
+            best_t = t
+
+    return float(best_t), float(best_score)
+
+
 def evaluate_clinical_cohort(
     args: argparse.Namespace
 ) -> None:
@@ -164,208 +187,193 @@ def evaluate_clinical_cohort(
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     print(f"=== Running Clinical Inference Pipeline ({args.num_classes}-Class) on [{device}] ===")
 
-    # 1. Load Test Manifest
-    test_manifest_path = Path(args.test_manifest)
-    if not test_manifest_path.exists():
-        raise FileNotFoundError(f"Test manifest not found: {test_manifest_path}")
-    test_df = pd.read_csv(test_manifest_path)
-    print(f"Loaded test set manifest with {len(test_df)} subject recordings.")
+    # 1. Instantiate the appropriate Model Architecture
+    if args.test_features_pt:
+        print("Instantiating isolated Probe Head for cached feature inference.")
+        if args.head_type == "linear":
+            model = LinearProbeHead(num_patches=args.num_patches,
+                                    emb_dim=args.cbra_dim,
+                                    num_classes=args.num_classes)
+        else:
+            model = MLPProbeHead(
+                num_patches=args.num_patches, 
+                emb_dim=args.cbra_dim, 
+                hidden_dim=args.head_dim, 
+                num_classes=args.num_classes, 
+                dropout=args.dropout
+            )
+    else:
+        print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
+        model = CBraModE2EClassifier(
+            num_channels=args.num_channels,
+            sfreq=args.sfreq,
+            num_patches=args.num_patches,
+            emb_dim=args.cbra_dim,
+            hidden_dim=args.head_dim,
+            num_classes=args.num_classes,
+            head_type=args.head_type
+        )
 
-    # 2. Instantiate Model Architecture
-    model = CBraModE2EClassifier(
-        num_channels=args.num_channels,
-        sfreq=args.sfreq,
-        num_patches=args.num_patches,
-        emb_dim=args.cbra_dim,
-        hidden_dim=args.head_dim,
-        num_classes=args.num_classes,
-        head_type=args.head_type
-    )
-
-    # 3. Load Model Checkpoint (Head-Only or Full-Model)
+    # 2. Load Model Checkpoint (Head-Only or Full-Model)
     model, ckpt_thresholds, epoch = load_model_checkpoint(model, Path(args.checkpoint), device)
     model.to(device)
     model.eval()
 
-    # Determine Active Strategies
+    # 3. Determine Active Strategies
     if args.pooling_strategy == "all":
         active_strategies = ["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"]
     else:
         active_strategies = [args.pooling_strategy]
 
     subject_results = {strat: [] for strat in active_strategies}
+    ground_truths = []
+    subject_ids = []
 
-    # 4. Patient-Level Inference Loop
-    data_dir = Path(args.data_dir) if args.data_dir else None
-    
-    for _, row in tqdm(test_df.iterrows(), total=len(test_df), desc="Processing Subjects"):
-        raw_npy_path = Path(row["npy_path"])
-        ground_truth_label = int(row["label"])
-
-        npy_path = data_dir / raw_npy_path if (data_dir and not raw_npy_path.is_absolute()) else raw_npy_path
-        subject_id = row.get("subject_id", raw_npy_path.stem)
-
-        if "meta_path" in row and pd.notna(row["meta_path"]):
-            raw_meta_path = Path(row["meta_path"])
-            meta_path = data_dir / raw_meta_path if (data_dir and not raw_meta_path.is_absolute()) else raw_meta_path
-        else:
-            meta_path = npy_path.with_suffix(".json")
-
-        if not npy_path.exists() or ground_truth_label == -1:
+    # 4. Stream Dataset Predictions & Apply Pooling
+    for subject_id, ground_truth_label, window_probs in generate_subject_predictions(args, model, device):
+        if len(window_probs) == 0:
             continue
 
-        probs, _, num_windows = run_subject_inference(
-            model=model,
-            npy_path=npy_path,
-            meta_path=meta_path,
-            device=device,
-            batch_size=args.batch_size,
-            filter_stage=args.filter_stage
-        )
+        ground_truths.append(ground_truth_label)
+        subject_ids.append(subject_id)
 
-        if len(probs) == 0:
-            continue
-
-        # Extract pooled scores for active strategies
-        if args.num_classes == 2:
-            pos_probs = probs[:, 1]  # Class 1 probabilities
-            if args.pooling_strategy == "all":
-                pooled_dict = evaluate_all_pooling_strategies(pos_probs, top_percentile=args.top_percentile, t_window=args.t_window)
-            else:
-                pooled_dict = {
-                    args.pooling_strategy: compute_pooled_scores(
-                        pos_probs, method=args.pooling_strategy, top_percentile=args.top_percentile, t_window=args.t_window
-                    )
-                }
-
-            for strat in active_strategies:
-                score = pooled_dict[strat]
-                operating_threshold = get_operating_threshold(
-                    pooling_strategy=strat,
-                    override_threshold=args.override_threshold,
-                    ckpt_thresholds=ckpt_thresholds
+        for strat in active_strategies:
+            if args.num_classes == 2:
+                # Extract positive class probability array [N] for binary score aggregation
+                pos_probs = window_probs[:, 1]
+                score = compute_pooled_scores(
+                    pos_probs, method=strat, top_percentile=args.top_percentile, t_window=args.t_window
                 )
-                pred_class = 1 if score >= operating_threshold else 0
-                subject_results[strat].append({
-                    "subject_id": subject_id,
-                    "ground_truth": ground_truth_label,
-                    "patient_score": score,
-                    "predicted_class": pred_class,
-                    "total_windows": num_windows,
-                    "total_windows_evaluated": len(probs)
-                })
-        else:
-            # Multi-Class Evaluation (> 2 classes)
-            if args.pooling_strategy == "all":
-                pooled_dict = evaluate_all_pooling_strategies(probs, top_percentile=args.top_percentile, t_window=args.t_window)
             else:
-                pooled_dict = {
-                    args.pooling_strategy: compute_pooled_scores(
-                        probs, method=args.pooling_strategy, top_percentile=args.top_percentile, t_window=args.t_window
-                    )
-                }
+                score = compute_pooled_scores(
+                    window_probs, method=strat, top_percentile=args.top_percentile, t_window=args.t_window
+                )
 
-            for strat in active_strategies:
-                class_scores = pooled_dict[strat]  # Array of shape [num_classes]
-                pred_class = int(np.argmax(class_scores))
+            subject_results[strat].append(score)
 
-                res_entry = {
-                    "subject_id": subject_id,
-                    "ground_truth": ground_truth_label,
-                    "predicted_class": pred_class,
-                    "total_windows": num_windows,
-                    "total_windows_evaluated": len(probs)
-                }
-                for c in range(args.num_classes):
-                    res_entry[f"prob_class_{c}"] = float(class_scores[c])
-
-                subject_results[strat].append(res_entry)
-
-    # 5. Analyze and Report Performance Metrics
-    for strat in active_strategies:
-        operating_threshold = get_operating_threshold(
+    # 5. Cohort Metrics, Threshold Sweep, Confusion Matrix, and Exporting
+    ground_truths = np.array(ground_truths)
+    output_dir = Path(args.output_dir) if getattr(args, "output_dir", None) else None
+    operating_thresholds = {
+        strat: get_operating_threshold(
             pooling_strategy=strat,
             override_threshold=args.override_threshold,
-            ckpt_thresholds=ckpt_thresholds
-        )
-        analyze_subject_results(
-            subject_results=subject_results[strat],
-            strategy=strat,
-            num_classes=args.num_classes,
-            filter_stage=args.filter_stage,
-            threshold=operating_threshold,
-            test_manifest_path=test_manifest_path
-        )
+            ckpt_thresholds=ckpt_thresholds)
+        for strat in active_strategies}
+    
+    analyze_subject_results(
+        subject_results=subject_results,
+        ground_truths=ground_truths,
+        subject_ids=subject_ids,
+        num_classes=args.num_classes,
+        operating_thresholds=operating_thresholds,
+        output_dir=output_dir
+    )
 
 
 def analyze_subject_results(
-    subject_results: List[Dict],
-    strategy: str,
-    num_classes: int,
-    filter_stage: Optional[str],
-    threshold: float,
-    test_manifest_path: Path
-):
-    """Generates cohort diagnostic performance report and exports subject predictions."""
-    if not subject_results:
-        print(f"[Warning] No evaluation results generated for strategy: {strategy}")
-        return
+    subject_results: Dict[str, List[Union[float, np.ndarray]]],
+    ground_truths: np.ndarray,
+    subject_ids: List[str],
+    num_classes: int = 2,
+    operating_thresholds: Dict[str, float] = None,
+    output_dir: Optional[Path] = None
+) -> Dict[str, Dict[str, float]]:
+    """
+    Detailed clinical cohort analytics across all evaluated pooling strategies.
+    Computes confusion matrices, sensitivity, specificity, ROC-AUC, checkpoint vs.
+    test-optimal thresholds, and exports per-subject predictions to CSV.
+    """
+    analysis_summary = {}
 
-    results_df = pd.DataFrame(subject_results)
-    y_true = results_df["ground_truth"].values
-    y_pred = results_df["predicted_class"].values
+    print("\n" + "=" * 80)
+    print(f"  CLINICAL COHORT EVALUATION REPORT ({num_classes}-CLASS)")
+    print("=" * 80)
 
-    acc = accuracy_score(y_true, y_pred)
-    macro_f1 = f1_score(y_true, y_pred, average="macro")
+    for strat, scores in subject_results.items():
+        scores_arr = np.array(scores)
 
-    print("\n" + "=" * 65)
-    print("=== PATIENT-LEVEL CLINICAL INFERENCE REPORT ===")
-    print("=" * 65)
-    print(f"Total Test Subjects Evaluated:  {len(results_df)}")
-    print(f"Number of Target Classes:       {num_classes}")
-    print(f"Pooling Method:                 {strategy}")
-    print(f"Stage Filtering Applied:        {filter_stage if filter_stage else 'None (All Windows)'}")
-    print(f"Total Windows Evaluated:        {results_df['total_windows_evaluated'].sum()} / {results_df['total_windows'].sum()}")
-    print(f"Operating Threshold Applied:    {threshold:.4f}")
-    print("-" * 65)
-    print(f"Accuracy:                       {acc * 100:.2f}%")
-    print(f"Macro F1-Score:                 {macro_f1:.4f}")
+        if num_classes == 2:
+            # 1. Retrieve checkpoint threshold or default to 0.5
+            eval_t = operating_thresholds.get(strat, 0.5) if operating_thresholds else 0.5
 
-    if num_classes == 2:
-        y_scores = results_df["patient_score"].values
-        cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
-        tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+            # 2. Compute empirical optimal threshold on test cohort for upper-bound ceiling comparison
+            opt_t, opt_f1 = find_optimal_threshold(ground_truths, scores_arr, metric="macro_f1")
 
-        sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+            # 3. Primary metric evaluation using checkpoint decision boundary
+            eval_preds = (scores_arr >= eval_t).astype(int)
+            acc = accuracy_score(ground_truths, eval_preds)
+            macro_f1 = f1_score(ground_truths, eval_preds, average="macro", zero_division=0)
+            sens = recall_score(ground_truths, eval_preds, pos_label=1, zero_division=0)
+            spec = recall_score(ground_truths, eval_preds, pos_label=0, zero_division=0)
 
-        fpr, tpr_vals, _ = roc_curve(y_true, y_scores)
-        roc_auc = auc(fpr, tpr_vals)
+            try:
+                auc = roc_auc_score(ground_truths, scores_arr) if len(np.unique(ground_truths)) > 1 else 0.5
+            except Exception:
+                auc = 0.5
 
-        print(f"ROC-AUC Score:                  {roc_auc:.4f}")
-        print(f"Sensitivity (Recall):           {sensitivity * 100:.2f}% ({tp}/{tp + fn})")
-        print(f"Specificity:                    {specificity * 100:.2f}% ({tn}/{tn + fp})")
-    else:
-        prob_cols = [f"prob_class_{c}" for c in range(num_classes)]
-        y_score_matrix = results_df[prob_cols].values
+            # Confusion matrix parameters
+            cm = confusion_matrix(ground_truths, eval_preds, labels=[0, 1])
+            tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
 
-        try:
-            roc_auc = roc_auc_score(y_true, y_score_matrix, multi_class="ovr", average="macro")
-            print(f"Multi-Class ROC-AUC (OvR):      {roc_auc:.4f}")
-        except Exception as e:
-            print(f"Multi-Class ROC-AUC (OvR):      N/A ({e})")
+            analysis_summary[strat] = {
+                "eval_threshold": eval_t,
+                "optimal_threshold": opt_t,
+                "optimal_macro_f1": opt_f1,
+                "accuracy": acc,
+                "macro_f1": macro_f1,
+                "sensitivity": sens,
+                "specificity": spec,
+                "roc_auc": auc,
+                "tp": tp, "fp": fp, "tn": tn, "fn": fn
+            }
 
-        print("-" * 65)
-        print("Detailed Classification Report:\n")
-        print(classification_report(y_true, y_pred, digits=4))
-        print("Confusion Matrix:")
-        print(confusion_matrix(y_true, y_pred))
+            print(f"\n Strategy: [{strat.upper()}]")
+            print(f"  ├─ Checkpoint Threshold:         {eval_t:.4f}")
+            print(f"  ├─ Test-Optimal Threshold:       {opt_t:.4f} (Upper Bound F1: {opt_f1:.4f})")
+            print(f"  ├─ Subject Accuracy:             {acc:.4f} ({tn + tp}/{len(ground_truths)})")
+            print(f"  ├─ Subject Macro F1:             {macro_f1:.4f}")
+            print(f"  ├─ Sensitivity (Recall):         {sens:.4f} ({tp}/{tp + fn})")
+            print(f"  ├─ Specificity:                  {spec:.4f} ({tn}/{tn + fp})")
+            print(f"  ├─ ROC-AUC:                      {auc:.4f}")
+            print(f"  └─ Confusion Matrix:             TP={tp}, FP={fp}, TN={tn}, FN={fn}")
 
-    print("=" * 65)
+            export_scores = scores_arr
+            export_preds = eval_preds
 
-    output_csv = test_manifest_path.parent / f"patient_level_test_predictions_{strategy}.csv"
-    results_df.to_csv(output_csv, index=False)
-    print(f"Detailed subject predictions saved to: {output_csv}")
+        else:
+            # Multi-class evaluation via argmax
+            eval_preds = np.argmax(scores_arr, axis=1)
+            acc = accuracy_score(ground_truths, eval_preds)
+            macro_f1 = f1_score(ground_truths, eval_preds, average="macro", zero_division=0)
+
+            analysis_summary[strat] = {
+                "accuracy": acc,
+                "macro_f1": macro_f1
+            }
+
+            print(f"\n Strategy: [{strat.upper()}]")
+            print(f"  ├─ Subject Accuracy:  {acc:.4f}")
+            print(f"  └─ Subject Macro F1:  {macro_f1:.4f}")
+
+            export_scores = [list(s) for s in scores_arr]
+            export_preds = eval_preds
+
+        # 4. Save CSV predictions if output directory specified
+        if output_dir:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = output_dir / f"subject_predictions_{strat}.csv"
+            df_out = pd.DataFrame({
+                "subject_id": subject_ids,
+                "ground_truth": ground_truths,
+                "pooled_score": export_scores,
+                "prediction": export_preds
+            })
+            df_out.to_csv(csv_path, index=False)
+            print(f"  └─ Exported Subject Predictions -> {csv_path}")
+
+    print("=" * 80 + "\n")
+    return analysis_summary
 
 
 def parse_cli_args()-> argparse.Namespace:
@@ -373,8 +381,9 @@ def parse_cli_args()-> argparse.Namespace:
 
     setup_common_cli_parser(parser)
 
-    manifest_group = parser.add_argument_group("Test Manifest")
-    manifest_group.add_argument("--test-manifest", type=str, required=True, help="Path to test_manifest.csv")
+    test_group = parser.add_mutually_exclusive_group(required=True)
+    test_group.add_argument("--test-manifest", type=str, help="Path to test_manifest.csv for raw .npy inference")
+    test_group.add_argument("--test-features-pt", type=str, help="Path to pre-extracted test features (.pt)")
 
     ckpt_group = parser.add_argument_group("Model Checkpoint")
     ckpt_group.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
@@ -394,6 +403,7 @@ def parse_cli_args()-> argparse.Namespace:
     misc_group = parser.add_argument_group("Miscellaneous")
     misc_group.add_argument("--override-threshold", type=float, default=None, help="Override operating decision threshold")
     misc_group.add_argument("--batch-size", type=int, default=512, help="Batch size for inference (default: 512)")
+    misc_group.add_argument("--output-dir", type=str, default=None, help="Output directory for the subject analysis")
 
     args = parser.parse_args()
     return args
