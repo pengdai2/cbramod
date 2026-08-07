@@ -652,16 +652,16 @@ class CBraModTrainer:
                 
                 final_preds = (scores >= best_t).astype(int)
                 acc = accuracy_score(subject_labels, final_preds)
+                sensitivity = recall_score(subject_labels, final_preds)
+                specificity = recall_score(subject_labels, final_preds, pos_label=0)
                 roc_auc = roc_auc_score(subject_labels, scores) if len(np.unique(subject_labels)) > 1 else 0.5
-                sensitivity = recall_score(subject_labels, scores)
-                specificity = recall_score(subject_labels, scores, pos_label=0)
 
                 results[strat] = {
                     "subject_macro_f1": best_f1,
+                    "optimal_threshold": float(best_t),
                     "subject_accuracy": acc,
                     "subject_sensitivity": sensitivity,
                     "subject_specificity": specificity,
-                    "optimal_threshold": float(best_t),
                     "roc_auc": roc_auc
                 }
             else:
