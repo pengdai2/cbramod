@@ -129,7 +129,7 @@ class SubjectEEGInspector:
         sns.histplot(window_probs, kde=True, ax=ax3, color='steelblue', bins=25, stat='density', alpha=0.4)
         ax3.axvline(self.threshold, color='red', linestyle='--', linewidth=2, label=f'Threshold ({self.threshold:.3f})')
 
-        if report["pooled_strategy"] == "p85_score":
+        if report["pooling_strategy"] == "p85_score":
             ax3.axvline(score, color='darkorange', linestyle='-', linewidth=2, label=f'p85 Score ({score:.3f})')
         
             # Shade region between threshold and p85 to emphasize divergence
@@ -151,7 +151,7 @@ class SubjectEEGInspector:
         ax4.plot(ranks, sorted_probs, color='teal', linewidth=2, label='Sorted Probs Profile')
         ax4.axhline(self.threshold, color='red', linestyle='--', linewidth=1.5, label=f'Threshold ({self.threshold:.3f})')
 
-        if report["pooled_strategy"] == "p85_score":
+        if report["pooling_strategy"] == "p85_score":
             ax4.axhline(score, color='darkorange', linestyle='-', linewidth=1.5, label=f'p85 Score ({score:.3f})')
 
             # 85th percentile rank position (15th percentile from the top of sorted values)
