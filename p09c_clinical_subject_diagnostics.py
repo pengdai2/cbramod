@@ -82,13 +82,17 @@ class SubjectEEGInspector:
         stages = report["stages"]
         score = report["pooled_score"]
 
-        fig, axes = plt.subplots(2, 2, figsize=figsize)
+        fig = plt.figure(figsize=figsize)
         fig.suptitle(
             f"Subject Deep-Dive: {report["subject_id"]} "
             f"(GT: {report['ground_truth']} | {report['pooling_strategy'].upper()}: {score:.3f} | Pred: {report['prediction']})",
             fontsize=14, fontweight="bold"
         )
-        ax1, ax2, ax3, ax4 = axes.flatten()
+        gs = fig.add_gridspec(3, 2, height_ratios=[2, 1, 3])
+        ax1 = fig.add_subplot(gs[0, :])
+        ax2 = fig.add_subplot(gs[1, :])
+        ax3 = fig.add_subplot(gs[2, 0])
+        ax4 = fig.add_subplot(gs[2, 1])
         
         n_epochs = len(window_probs)
         epoch_indices = np.arange(n_epochs)
