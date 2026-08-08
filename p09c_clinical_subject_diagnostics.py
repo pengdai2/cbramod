@@ -312,7 +312,7 @@ def main():
         )
 
         save_path = output_dir / f"{subj_id}_diagnostic.png"
-        debugger.plot_subject_diagnostics(report, save_path=save_path)
+        debugger.plot_subject_eeg_diagnostics(report, save_path=save_path)
 
 
 if __name__ == "__main__":
