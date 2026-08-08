@@ -21,6 +21,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
 from tqdm import tqdm
+import seaborn as sns
 
 
 class SubjectEEGInspector:
@@ -125,7 +126,7 @@ class SubjectEEGInspector:
         # -------------------------------------------------------------------------
         # Panel 3: Probability Density (KDE/Hist)
         # -------------------------------------------------------------------------
-        ax3.histplot(window_probs, kde=True, ax=ax3, color='steelblue', bins=25, stat='density', alpha=0.4)
+        sns.histplot(window_probs, kde=True, ax=ax3, color='steelblue', bins=25, stat='density', alpha=0.4)
         ax3.axvline(self.threshold, color='red', linestyle='--', linewidth=2, label=f'Threshold ({self.threshold:.3f})')
 
         if report["pooled_strategy"] == "p85_score":
