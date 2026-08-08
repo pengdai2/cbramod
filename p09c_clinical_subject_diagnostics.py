@@ -20,7 +20,7 @@ from cbramod_common import (
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset
-import tqdm
+from tqdm import tqdm
 
 
 class SubjectEEGInspector:
