@@ -66,11 +66,9 @@ class SubjectEEGInspector:
 
     def plot_subject_eeg_diagnostics(
         self,
-        subject_id: str,
-        window_probs: np.ndarray,
-        stages: list,
-        operating_threshold: float,
-        figsize: Tuple[int, int] = (16, 12)
+        report: Dict,
+        figsize: Tuple[int, int] = (16, 12),
+        save_path: Optional[Path] = None
     ) -> plt.Figure:
         """
         Generates 4-Panel EEG Diagnostic Dashboard:
@@ -79,10 +77,16 @@ class SubjectEEGInspector:
         - Panel 3: Probability Density (KDE/Hist) highlighting p85 vs. Threshold
         - Panel 4: Sorted Epoch Profile (Scree Plot) highlighting p85 rank & threshold
         """
-        # 2) Compute p85 score using common compute_pooled_scores function[cite: 1]
-        p85_val = float(compute_pooled_scores(window_probs, method="p85_score"))
-        
+        window_probs = report["window_probs"]
+        stages = report["stages"]
+        score = report["pooled_score"]
+
         fig, axes = plt.subplots(2, 2, figsize=figsize)
+        fig.suptitle(
+            f"Subject Deep-Dive: {report["subject_id"]} "
+            f"(GT: {report['ground_truth']} | {report['pooling_strategy'].upper()}: {score:.3f} | Pred: {report['prediction']})",
+            fontsize=14, fontweight="bold"
+        )
         ax1, ax2, ax3, ax4 = axes.flatten()
         
         n_epochs = len(window_probs)
@@ -97,7 +101,7 @@ class SubjectEEGInspector:
             ax1.step(epoch_indices, num_stages, where='mid', color='midnightblue', linewidth=1.5)
             ax1.set_yticks(list(stage_map.values()))
             ax1.set_yticklabels(list(stage_map.keys()))
-            ax1.set_title(f"Panel 1: Sleep Stage Hypnogram ({subject_id})")
+            ax1.set_title(f"Panel 1: Sleep Stage Hypnogram")
             ax1.set_ylabel("Stage")
             ax1.set_xlabel("Epoch Index")
             ax1.grid(True, linestyle=':', alpha=0.6)
@@ -109,8 +113,8 @@ class SubjectEEGInspector:
         # Panel 2: Epoch Probability Sequence (Probability overlay across time)
         # -------------------------------------------------------------------------
         ax2.plot(epoch_indices, window_probs, color='slategray', alpha=0.7, label='Epoch Prob')
-        ax2.axhline(operating_threshold, color='red', linestyle='--', linewidth=1.5, label=f'Threshold ({operating_threshold:.2f})')
-        ax2.axhline(p85_val, color='darkorange', linestyle='-', linewidth=1.5, label=f'p85 ({p85_val:.2f})')
+        ax2.axhline(self.threshold, color='red', linestyle='--', linewidth=1.5, label=f'Threshold ({self.threshold:.2f})')
+        ax2.axhline(score, color='darkorange', linestyle='-', linewidth=1.5, label=f'Pooled Score ({score:.2f})')
         ax2.set_title("Panel 2: Window Probability Sequence")
         ax2.set_xlabel("Epoch Index")
         ax2.set_ylabel("Probability")
@@ -119,36 +123,17 @@ class SubjectEEGInspector:
         ax2.grid(True, linestyle=':', alpha=0.6)
 
         # -------------------------------------------------------------------------
-        # Panel 3: Probability Density (KDE/Hist) - p85 vs. Threshold
+        # Panel 3: Probability Density (KDE/Hist)
         # -------------------------------------------------------------------------
-        ax3.histplot(
-            window_probs, 
-            kde=True, 
-            ax=ax3, 
-            color='steelblue', 
-            bins=25, 
-            stat='density', 
-            alpha=0.4
-        )
-        # Overlay lines contrasting p85 score with operating threshold
-        ax3.axvline(
-            operating_threshold, 
-            color='red', 
-            linestyle='--', 
-            linewidth=2, 
-            label=f'Threshold ({operating_threshold:.3f})'
-        )
-        ax3.axvline(
-            p85_val, 
-            color='darkorange', 
-            linestyle='-', 
-            linewidth=2, 
-            label=f'p85 Score ({p85_val:.3f})'
-        )
+        ax3.histplot(window_probs, kde=True, ax=ax3, color='steelblue', bins=25, stat='density', alpha=0.4)
+        ax3.axvline(self.threshold, color='red', linestyle='--', linewidth=2, label=f'Threshold ({self.threshold:.3f})')
+
+        if report["pooled_strategy"] == "p85_score":
+            ax3.axvline(score, color='darkorange', linestyle='-', linewidth=2, label=f'p85 Score ({score:.3f})')
         
-        # Shade region between threshold and p85 to emphasize divergence
-        min_line, max_line = min(p85_val, operating_threshold), max(p85_val, operating_threshold)
-        ax3.axvspan(min_line, max_line, color='gold', alpha=0.2, label='Margin Delta')
+            # Shade region between threshold and p85 to emphasize divergence
+            min_line, max_line = min(score, self.threshold), max(score, self.threshold)
+            ax3.axvspan(min_line, max_line, color='gold', alpha=0.2, label='Margin Delta')
         
         ax3.set_title("Panel 3: Probability Density (KDE/Hist)")
         ax3.set_xlabel("Window Probability")
@@ -162,41 +147,21 @@ class SubjectEEGInspector:
         sorted_probs = np.sort(window_probs)[::-1]  # Sort probabilities descending
         ranks = np.arange(1, n_epochs + 1)
 
-        # 85th percentile rank position (15th percentile from the top of sorted values)
-        p85_rank_idx = int(np.ceil(n_epochs * (1.0 - 0.85)))
-        p85_rank_idx = max(1, min(n_epochs, p85_rank_idx))
-
         ax4.plot(ranks, sorted_probs, color='teal', linewidth=2, label='Sorted Probs Profile')
-        
-        # Horizontal threshold and p85 lines
-        ax4.axhline(
-            operating_threshold, 
-            color='red', 
-            linestyle='--', 
-            linewidth=1.5, 
-            label=f'Threshold ({operating_threshold:.3f})'
-        )
-        ax4.axhline(
-            p85_val, 
-            color='darkorange', 
-            linestyle='-', 
-            linewidth=1.5, 
-            label=f'p85 Score ({p85_val:.3f})'
-        )
+        ax4.axhline(self.threshold, color='red', linestyle='--', linewidth=1.5, label=f'Threshold ({self.threshold:.3f})')
 
-        # Highlight point where p85 intersects sorted profile
-        ax4.scatter(
-            [p85_rank_idx], 
-            [p85_val], 
-            color='darkorange', 
-            s=90, 
-            zorder=5, 
-            edgecolor='black',
-            label=f'p85 Rank ({p85_rank_idx}/{n_epochs})'
-        )
+        if report["pooled_strategy"] == "p85_score":
+            ax4.axhline(score, color='darkorange', linestyle='-', linewidth=1.5, label=f'p85 Score ({score:.3f})')
+
+            # 85th percentile rank position (15th percentile from the top of sorted values)
+            p85_rank_idx = int(np.ceil(n_epochs * (1.0 - 0.85)))
+            p85_rank_idx = max(1, min(n_epochs, p85_rank_idx))
+
+            # Highlight point where p85 intersects sorted profile
+            ax4.scatter([p85_rank_idx], [score], color='darkorange', s=90, zorder=5, edgecolor='black',label=f'p85 Rank ({p85_rank_idx}/{n_epochs})')
         
-        # Vertical guideline pointing to p85 rank index
-        ax4.axvline(p85_rank_idx, color='darkorange', linestyle=':', linewidth=1.2, alpha=0.7)
+            # Vertical guideline pointing to p85 rank index
+            ax4.axvline(p85_rank_idx, color='darkorange', linestyle=':', linewidth=1.2, alpha=0.7)
 
         ax4.set_title("Panel 4: Sorted Epoch Profile (Scree Plot)")
         ax4.set_xlabel("Epoch Rank (Sorted High to Low)")
@@ -206,6 +171,11 @@ class SubjectEEGInspector:
         ax4.grid(True, linestyle=':', alpha=0.6)
 
         plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300)
+            print(f"-> Saved diagnostic plot: {save_path}")
+        plt.close()
+
         return fig
 
 
@@ -294,7 +264,7 @@ def main():
         ckpt_thresholds=ckpt_thresholds
     )
 
-    debugger = SubjectEEGInspector(model=model, device=device, threshold=threshold)
+    inspector = SubjectEEGInspector(model=model, device=device, threshold=threshold)
 
     # 3. Process filtered subjects
     for idx in tqdm(range(len(dataset)), desc="Process Subjects (Raw EEG)"):
@@ -303,7 +273,7 @@ def main():
             print(f"Skipping {subj_id}: No valid windows after stage filtering.")
             continue
 
-        report = debugger.inspect_subject(
+        report = inspector.inspect_subject(
             x_tensor=x_tensor,
             subject_id=subj_id,
             ground_truth=y_tensor.item(),
@@ -313,7 +283,7 @@ def main():
         )
 
         save_path = output_dir / f"{subj_id}_diagnostic.png"
-        debugger.plot_subject_eeg_diagnostics(report, save_path=save_path)
+        inspector.plot_subject_eeg_diagnostics(report, save_path=save_path)
 
 
 if __name__ == "__main__":
