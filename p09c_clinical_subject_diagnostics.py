@@ -64,67 +64,148 @@ class SubjectEEGInspector:
             "pooling_strategy": pooling_strategy
         }
 
-    def plot_subject_diagnostics(self, report: Dict, save_path: Optional[Path] = None):
-        """
-        Renders a 4-panel diagnostic plot incorporating sleep stage hypnograms.
-        """
-        probs = report["window_probs"]
-        stages = report["stages"]
-        epochs = np.arange(len(probs))
+def plot_subject_eeg_diagnostics(
+    subject_id: str,
+    window_probs: np.ndarray,
+    stages: list,
+    operating_threshold: float,
+    figsize: Tuple[int, int] = (16, 12)
+) -> plt.Figure:
+    """
+    Generates 4-Panel EEG Diagnostic Dashboard:
+      - Panel 1: Hypnogram / Epoch Stage Timeline
+      - Panel 2: Epoch Probability Sequence
+      - Panel 3: Probability Density (KDE/Hist) highlighting p85 vs. Threshold
+      - Panel 4: Sorted Epoch Profile (Scree Plot) highlighting p85 rank & threshold
+    """
+    # 2) Compute p85 score using common compute_pooled_scores function[cite: 1]
+    p85_val = float(compute_pooled_scores(window_probs, method="p85_score"))
+    
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    ax1, ax2, ax3, ax4 = axes.flatten()
+    
+    n_epochs = len(window_probs)
+    epoch_indices = np.arange(n_epochs)
 
-        # Requirement 3: Map sleep stages to numerical ranks for hypnogram plotting
-        stage_map = {"W": 0, "REM": 1, "N1": 2, "N2": 3, "N3": 4, "UNKNOWN": 5}
-        numeric_stages = [stage_map.get(s.upper(), 5) for s in stages]
+    # -------------------------------------------------------------------------
+    # Panel 1: Hypnogram (Epoch Sleep Stages)
+    # -------------------------------------------------------------------------
+    if stages and len(stages) == n_epochs:
+        stage_map = {"W": 4, "REM": 3, "N1": 2, "N2": 1, "N3": 0, "UNKNOWN": -1}
+        num_stages = [stage_map.get(str(s).upper(), -1) for s in stages]
+        ax1.step(epoch_indices, num_stages, where='mid', color='midnightblue', linewidth=1.5)
+        ax1.set_yticks(list(stage_map.values()))
+        ax1.set_yticklabels(list(stage_map.keys()))
+        ax1.set_title(f"Panel 1: Sleep Stage Hypnogram ({subject_id})")
+        ax1.set_ylabel("Stage")
+        ax1.set_xlabel("Epoch Index")
+        ax1.grid(True, linestyle=':', alpha=0.6)
+    else:
+        ax1.text(0.5, 0.5, "Sleep Stage Metadata Unavailable", ha='center', va='center')
+        ax1.set_title("Panel 1: Hypnogram")
 
-        fig, axes = plt.subplots(4, 1, figsize=(14, 12), sharex=False)
-        fig.suptitle(
-            f"Subject Deep-Dive: {report['subject_id']} "
-            f"(GT: {report['ground_truth']} | {report['pooling_strategy'].upper()}: {report['pooled_score']:.3f} | Pred: {report['prediction']})",
-            fontsize=14, fontweight="bold"
-        )
+    # -------------------------------------------------------------------------
+    # Panel 2: Epoch Probability Sequence (Probability overlay across time)
+    # -------------------------------------------------------------------------
+    ax2.plot(epoch_indices, window_probs, color='slategray', alpha=0.7, label='Epoch Prob')
+    ax2.axhline(operating_threshold, color='red', linestyle='--', linewidth=1.5, label=f'Threshold ({operating_threshold:.2f})')
+    ax2.axhline(p85_val, color='darkorange', linestyle='-', linewidth=1.5, label=f'p85 ({p85_val:.2f})')
+    ax2.set_title("Panel 2: Window Probability Sequence")
+    ax2.set_xlabel("Epoch Index")
+    ax2.set_ylabel("Probability")
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.legend(loc='upper right')
+    ax2.grid(True, linestyle=':', alpha=0.6)
 
-        # Panel 1: Chronological Probability Trajectory
-        axes[0].plot(epochs, probs, color="navy", alpha=0.75, linewidth=1, label="P(Patient | Epoch)")
-        axes[0].axhline(y=self.threshold, color="red", linestyle="--", label=f"Threshold ({self.threshold})")
-        axes[0].axhline(y=report["pooled_score"], color="orange", linestyle=":", label=f"Pooled Score ({report['pooled_score']:.3f})")
-        axes[0].set_ylabel("Probability")
-        axes[0].set_title("Chronological Window Probability Trajectory")
-        axes[0].legend(loc="upper right")
-        axes[0].grid(True, alpha=0.3)
+    # -------------------------------------------------------------------------
+    # Panel 3: Probability Density (KDE/Hist) - p85 vs. Threshold
+    # -------------------------------------------------------------------------
+    ax3.histplot(
+        window_probs, 
+        kde=True, 
+        ax=ax3, 
+        color='steelblue', 
+        bins=25, 
+        stat='density', 
+        alpha=0.4
+    )
+    # Overlay lines contrasting p85 score with operating threshold
+    ax3.axvline(
+        operating_threshold, 
+        color='red', 
+        linestyle='--', 
+        linewidth=2, 
+        label=f'Threshold ({operating_threshold:.3f})'
+    )
+    ax3.axvline(
+        p85_val, 
+        color='darkorange', 
+        linestyle='-', 
+        linewidth=2, 
+        label=f'p85 Score ({p85_val:.3f})'
+    )
+    
+    # Shade region between threshold and p85 to emphasize divergence
+    min_line, max_line = min(p85_val, operating_threshold), max(p85_val, operating_threshold)
+    ax3.axvspan(min_line, max_line, color='gold', alpha=0.2, label='Margin Delta')
+    
+    ax3.set_title("Panel 3: Probability Density (KDE/Hist)")
+    ax3.set_xlabel("Window Probability")
+    ax3.set_ylabel("Density")
+    ax3.legend(loc='upper right')
+    ax3.grid(True, linestyle=':', alpha=0.6)
 
-        # Panel 2: Sleep Stage Hypnogram Alignment
-        axes[1].step(epochs, numeric_stages, where="mid", color="purple", linewidth=1.5)
-        axes[1].set_yticks([0, 1, 2, 3, 4, 5])
-        axes[1].set_yticklabels(["Wake", "REM", "N1", "N2", "N3", "Unknown"])  # Focus on N2/N3 target
-        axes[1].invert_yaxis()  # Standard clinical hypnogram orientation
-        axes[1].set_ylabel("Stage")
-        axes[1].set_title("Aligned Sleep Stage Hypnogram (Metadata)")
-        axes[1].grid(True, alpha=0.3)
+    # -------------------------------------------------------------------------
+    # Panel 4: Sorted Epoch Profile (Scree Plot) - p85 Rank & Line Highlight
+    # -------------------------------------------------------------------------
+    sorted_probs = np.sort(window_probs)[::-1]  # Sort probabilities descending
+    ranks = np.arange(1, n_epochs + 1)
 
-        # Panel 3: Probability Density (KDE/Hist)
-        axes[2].hist(probs, bins=30, color="teal", edgecolor="black", alpha=0.7, density=True)
-        axes[2].axvline(x=self.threshold, color="red", linestyle="--", label=f"Threshold ({self.threshold})")
-        axes[2].set_xlabel("Probability")
-        axes[2].set_ylabel("Density")
-        axes[2].set_title("Epoch Probability Density (Tail Weight Analysis)")
-        axes[2].legend(loc="upper right")
-        axes[2].grid(True, alpha=0.3)
+    # 85th percentile rank position (15th percentile from the top of sorted values)
+    p85_rank_idx = int(np.ceil(n_epochs * (1.0 - 0.85)))
+    p85_rank_idx = max(1, min(n_epochs, p85_rank_idx))
 
-        # Panel 4: Sorted Epoch Profile (Scree Plot)
-        sorted_probs = np.sort(probs)[::-1]
-        axes[3].plot(sorted_probs, color="darkgreen", linewidth=2, label="P(Patient | Epoch)")
-        axes[3].axhline(y=self.threshold, color="red", linestyle="--", label=f"Threshold ({self.threshold})")
-        axes[3].set_xlabel("Sorted Epoch Rank")
-        axes[3].set_ylabel("Probability")
-        axes[3].set_title("Sorted Epoch Energy Profile (Tail Decay)")
-        axes[3].legend(loc="upper right")
-        axes[3].grid(True, alpha=0.3)
+    ax4.plot(ranks, sorted_probs, color='teal', linewidth=2, label='Sorted Probs Profile')
+    
+    # Horizontal threshold and p85 lines
+    ax4.axhline(
+        operating_threshold, 
+        color='red', 
+        linestyle='--', 
+        linewidth=1.5, 
+        label=f'Threshold ({operating_threshold:.3f})'
+    )
+    ax4.axhline(
+        p85_val, 
+        color='darkorange', 
+        linestyle='-', 
+        linewidth=1.5, 
+        label=f'p85 Score ({p85_val:.3f})'
+    )
 
-        plt.tight_layout()
-        if save_path:
-            plt.savefig(save_path, dpi=300)
-            print(f"-> Saved diagnostic plot: {save_path}")
-        plt.close()
+    # Highlight point where p85 intersects sorted profile
+    ax4.scatter(
+        [p85_rank_idx], 
+        [p85_val], 
+        color='darkorange', 
+        s=90, 
+        zorder=5, 
+        edgecolor='black',
+        label=f'p85 Rank ({p85_rank_idx}/{n_epochs})'
+    )
+    
+    # Vertical guideline pointing to p85 rank index
+    ax4.axvline(p85_rank_idx, color='darkorange', linestyle=':', linewidth=1.2, alpha=0.7)
+
+    ax4.set_title("Panel 4: Sorted Epoch Profile (Scree Plot)")
+    ax4.set_xlabel("Epoch Rank (Sorted High to Low)")
+    ax4.set_ylabel("Probability")
+    ax4.set_ylim(-0.05, 1.05)
+    ax4.legend(loc='upper right')
+    ax4.grid(True, linestyle=':', alpha=0.6)
+
+    plt.tight_layout()
+    return fig
 
 
 # -----------------------------------------------------------------------------
