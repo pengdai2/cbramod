@@ -88,7 +88,7 @@ class SubjectEEGInspector:
             f"(GT: {report['ground_truth']} | {report['pooling_strategy'].upper()}: {score:.3f} | Pred: {report['prediction']})",
             fontsize=14, fontweight="bold"
         )
-        gs = fig.add_gridspec(3, 2, height_ratios=[2, 1, 3])
+        gs = fig.add_gridspec(3, 2, height_ratios=[1, 2, 3])
         ax1 = fig.add_subplot(gs[0, :])
         ax2 = fig.add_subplot(gs[1, :])
         ax3 = fig.add_subplot(gs[2, 0])
