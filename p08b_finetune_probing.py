@@ -212,7 +212,7 @@ class ProbeTrainer(CBraModTrainer):
         best_primary_f1 = 0.0
         best_thresholds = {}
         patience_counter = 0
-        best_model_path = Path(self.config.cache_dir) / self.config.best_head_filename
+        best_model_path = Path(self.config.cache_dir) / self.config.checkpoint_filename
 
         self.logger.info(
             f"Starting Probe Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | "
@@ -371,6 +371,9 @@ class ProbeTrainer(CBraModTrainer):
         self.logger.info(f"STARTING {self.config.sgkf_folds}-FOLD STRATIFIED GROUP K-FOLD CROSS-VALIDATION ACROSS {len(unique_sids)} TOTAL SUBJECTS")
         self.logger.info(f"=" * 100)
 
+        # Save the original checkpoint filename
+        checkpoint_path = Path(self.config.checkpoint_filename)
+
         for fold, (train_subj_idx, val_subj_idx) in enumerate(
             sgkf.split(unique_sids, unique_labels, groups=unique_sids)):
             self.logger.info(f"\n--- Fold [{fold+1}/{self.config.sgkf_folds}] ---")
@@ -400,7 +403,7 @@ class ProbeTrainer(CBraModTrainer):
             }, fold_val_cache)
 
             # Update checkpoint filename per fold to prevent overwriting
-            self.config.best_head_filename = f"cbramod_head_fold_{fold+1}_best.pt"
+            self.config.checkpoint_filename = checkpoint_path.with_stem(f"{checkpoint_path.stem}_fold_{fold+1}")
 
             results = self.train_fixed_split(fold_train_cache, fold_val_cache)
             fold_results.append(results)
