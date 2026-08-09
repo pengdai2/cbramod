@@ -76,7 +76,7 @@ def generate_subject_predictions(
         print(f"Loaded raw EEG recording dataset for {len(dataset)} subjects.")
 
         for i in tqdm(range(len(dataset)), desc="Processing Subjects (Raw EEG)"):
-            x_tensor, y_tensor, subject_id, _ = dataset[i]
+            x_tensor, y_tensor, subject_id, _, _ = dataset[i]
             label = int(y_tensor.item())
             probs = infer_subject_windows(model, x_tensor, args.batch_size, device)
             yield subject_id, label, probs
@@ -98,10 +98,10 @@ def evaluate_clinical_cohort(
                                     num_classes=args.num_classes)
         else:
             model = MLPProbeHead(
-                num_patches=args.num_patches, 
-                emb_dim=args.cbra_dim, 
-                hidden_dim=args.head_dim, 
-                num_classes=args.num_classes, 
+                num_patches=args.num_patches,
+                emb_dim=args.cbra_dim,
+                hidden_dim=args.head_dim,
+                num_classes=args.num_classes,
                 dropout=args.dropout
             )
     else:

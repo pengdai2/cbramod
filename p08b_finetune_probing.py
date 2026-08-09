@@ -118,11 +118,11 @@ class EmbeddingManager:
         ).to(self.device)
         extractor.eval()
 
-        all_embeddings, all_labels, all_subject_ids = [], [], []
+        all_embeddings, all_labels, all_subject_ids, all_stages, all_indices = [], [], [], [], []
         start_time = time.time()
 
         with torch.no_grad():
-            for batch_x, batch_y, batch_subj in tqdm(loader, desc=f"Extracting {split_name}", unit="batch"):
+            for batch_x, batch_y, batch_subj, batch_stg, batch_idx in tqdm(loader, desc=f"Extracting {split_name}", unit="batch"):
                 batch_x = batch_x.to(self.device, non_blocking=True)
                 with torch.amp.autocast(device_type="cuda", enabled=(self.config.use_amp and self.device.type == "cuda")):
                     pooled_feats = extractor(batch_x)
@@ -130,6 +130,8 @@ class EmbeddingManager:
                 all_embeddings.append(pooled_feats.cpu().float())
                 all_labels.append(batch_y.cpu())
                 all_subject_ids.extend(batch_subj)
+                all_stages.extend(batch_stg)
+                all_indices.extend(batch_idx)
 
         cached_feats = torch.cat(all_embeddings, dim=0)
         cached_labels = torch.cat(all_labels, dim=0)
@@ -137,7 +139,9 @@ class EmbeddingManager:
         torch.save({
             "feats": cached_feats, 
             "labels": cached_labels,
-            "subject_ids": all_subject_ids
+            "subject_ids": all_subject_ids,
+            "stages": all_stages,
+            "indices": all_indices
         }, output_cache_path)
 
         del extractor, dataset, loader, all_embeddings, all_labels, all_subject_ids

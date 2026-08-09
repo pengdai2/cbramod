@@ -7,6 +7,9 @@ import pandas as pd
 from cbramod_utils import seed_everything
 from cbramod_common import (
     CBraModE2EClassifier,
+    CachedFeatureSubjectDataset,
+    LinearProbeHead,
+    MLPProbeHead,
     PANSubjectEEGDataset,
     compute_pooled_scores,
     get_operating_threshold,
@@ -33,6 +36,7 @@ class SubjectEEGInspector:
         subject_id: str,
         ground_truth: int,
         stages: List[str],
+        indices: List[int],
         pooling_strategy: str = "p85_score",
         batch_size: int = 64
     ) -> Dict:
@@ -58,6 +62,7 @@ class SubjectEEGInspector:
             "total_windows": num_windows,
             "window_probs": probs_arr,
             "stages": stages,
+            "indices": indices,
             "pooling_strategy": pooling_strategy
         }
 
@@ -202,30 +207,32 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Parse optional subject ID list
-    subject_ids = [s.strip() for s in args.subject_id.split(",")] if args.subject_id else None
-
-    # 1. Instantiate Dataset with subject filter
-    dataset = PANSubjectEEGDataset(
-        manifest_csv=args.manifest,
-        data_dir=args.data_dir,
-        filter_subject=subject_ids,
-        filter_stage=args.filter_stage
-    )
-
-    print(f"Loaded {len(dataset)} matching subject(s) for diagnostic inspection.")
-
-    # 2. Model Wrapper / Checkpoint Loader
-    print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
-    model = CBraModE2EClassifier(
-        num_channels=args.num_channels,
-        sfreq=args.sfreq,
-        num_patches=args.num_patches,
-        emb_dim=args.cbra_dim,
-        hidden_dim=args.head_dim,
-        num_classes=args.num_classes,
-        head_type=args.head_type
-    )
+    # 1. Instantiate the appropriate Model Architecture
+    if args.test_features_pt:
+        print("Instantiating isolated Probe Head for cached feature inference.")
+        if args.head_type == "linear":
+            model = LinearProbeHead(num_patches=args.num_patches,
+                                    emb_dim=args.cbra_dim,
+                                    num_classes=args.num_classes)
+        else:
+            model = MLPProbeHead(
+                num_patches=args.num_patches,
+                emb_dim=args.cbra_dim,
+                hidden_dim=args.head_dim,
+                num_classes=args.num_classes,
+                dropout=args.dropout
+            )
+    else:
+        print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
+        model = CBraModE2EClassifier(
+            num_channels=args.num_channels,
+            sfreq=args.sfreq,
+            num_patches=args.num_patches,
+            emb_dim=args.cbra_dim,
+            hidden_dim=args.head_dim,
+            num_classes=args.num_classes,
+            head_type=args.head_type
+        )
 
     # 2. Load Model Checkpoint (Head-Only or Full-Model)
     model, ckpt_thresholds, epoch = load_model_checkpoint(model, Path(args.checkpoint), device)
@@ -240,9 +247,23 @@ def main():
 
     inspector = SubjectEEGInspector(model=model, device=device, threshold=threshold)
 
-    # 3. Process filtered subjects
+    # 3. Load dataset
+    if args.test_features_pt:
+        dataset = CachedFeatureSubjectDataset(args.test_features_pt, subject_id=args.subject_id)
+        print(f"Loaded cached features for {len(dataset)} subjects.")
+    else:
+        dataset = PANSubjectEEGDataset(
+            manifest_csv=args.test_manifest,
+            data_dir=args.data_dir,
+            filter_stage=args.filter_stage,
+            subject_id=args.subject_id,
+            memory_map=True
+        )
+        print(f"Loaded raw EEG recording dataset for {len(dataset)} subjects.")
+
+    # 4. Process filtered subjects
     for idx in tqdm(range(len(dataset)), desc="Process Subjects (Raw EEG)"):
-        x_tensor, y_tensor, subj_id, stages = dataset[idx]
+        x_tensor, y_tensor, subj_id, stages, indices = dataset[idx]
         if x_tensor.shape[0] == 0:
             print(f"Skipping {subj_id}: No valid windows after stage filtering.")
             continue
@@ -252,6 +273,7 @@ def main():
             subject_id=subj_id,
             ground_truth=y_tensor.item(),
             stages=stages,
+            indices = indices,
             pooling_strategy=args.pooling_strategy,
             batch_size=args.batch_size
         )

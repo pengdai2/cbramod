@@ -28,13 +28,13 @@ from sklearn.metrics import (
 # =====================================================================
 
 def parse_filter(
-    filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]]
+    filter: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]]
 ) -> Optional[Set[str]]:
-    """Standardizes optional stage filter formats into a set of stage strings."""
-    if isinstance(filter_stage, str):
-        return {s.strip() for s in filter_stage.split(",")}
-    elif isinstance(filter_stage, (list, tuple, set)):
-        return {str(s).strip() for s in filter_stage}
+    """Standardizes optional filter formats into a set of strings."""
+    if isinstance(filter, str):
+        return {s.strip() for s in filter.split(",")}
+    elif isinstance(filter, (list, tuple, set)):
+        return {str(s).strip() for s in filter}
     return None
 
 
@@ -43,7 +43,7 @@ def extract_valid_window_indices(
     npy_path: Path,
     filter_stage: Optional[Set[str]] = None,
     memory_map: bool = True
-) -> Tuple[List[int], int, List[str]]:
+) -> Tuple[List[int], List[str], int]:
     """
     Parses subject metadata to extract valid window row indices matching 
     quality and stage filter criteria.
@@ -81,7 +81,7 @@ def extract_valid_window_indices(
 
                 valid_indices.append(window_idx)
 
-            return valid_indices, excluded_count, np.array(stages_list)[valid_indices].tolist()
+            return valid_indices, np.array(stages_list)[valid_indices].tolist(), excluded_count
         except Exception as e:
             print(f"  [Warning] Failed to parse meta JSON {meta_path}: {e}. Falling back to array bounds.")
 
@@ -161,13 +161,12 @@ class PANSubjectEEGDataset(Dataset):
                 skipped_subjects += 1
                 continue
 
-            valid_indices, excluded_count, stages = extract_valid_window_indices(
+            valid_indices, stages, excluded_count = extract_valid_window_indices(
                 meta_path=meta_path,
                 npy_path=npy_path,
                 filter_stage=self.filter_stage,
                 memory_map=self.memory_map
             )
-            total_skipped_slices += excluded_count
 
             if not valid_indices:
                 print(f"  [Warning] Subject {subject_id} has 0 valid windows after filtering, skipping...")
@@ -176,11 +175,11 @@ class PANSubjectEEGDataset(Dataset):
 
             self.subjects.append((subject_id, npy_path, valid_indices, label, stages))
             total_valid_windows += len(valid_indices)
+            total_skipped_slices += excluded_count
 
         filter_stage_info = f" [Filter Stage: {','.join(sorted(self.filter_stage))}]" if self.filter_stage else ""
-        filter_subject_info = f" [Filter Subject: {','.join(sorted(self.filter_subject))}]" if self.filter_subject else ""
         print(
-            f"  -> Indexing complete{filter_stage_info}{filter_subject_info}: {len(self.subjects)} subjects loaded "
+            f"  -> Indexing complete{filter_stage_info}: {len(self.subjects)} subjects loaded "
             f"({total_valid_windows:,} total valid windows, {total_skipped_slices:,} excluded/filtered windows, "
             f"{skipped_subjects} subjects skipped)."
         )
@@ -201,7 +200,7 @@ class PANSubjectEEGDataset(Dataset):
         x_tensor = torch.from_numpy(subj_data)
         y_tensor = torch.tensor(label, dtype=torch.long)
 
-        return x_tensor, y_tensor, subject_id, stages
+        return x_tensor, y_tensor, subject_id, stages, valid_indices
 
 
 class PANSleepEEGDataset(Dataset):
@@ -216,17 +215,22 @@ class PANSleepEEGDataset(Dataset):
         filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]] = None,
         memory_map: bool = True
     ):
-        assert filter_subject is None, "Subject filtering not implemented"
-
         self.manifest_csv = Path(manifest_csv)
         self.data_dir = Path(data_dir) if data_dir else None
         self.memory_map = memory_map
+        self.filter_subject = parse_filter(filter_subject)
         self.filter_stage = parse_filter(filter_stage)
 
         if not self.manifest_csv.exists():
             raise FileNotFoundError(f"Manifest file not found: {self.manifest_csv}")
 
-        self.df = pd.read_csv(self.manifest_csv)
+        df = pd.read_csv(self.manifest_csv)
+        if self.filter_subject:
+            target_ids = set(self.filter_subject)
+            df["subject_id"] = df["subject_id"].astype(str)
+            df = df[df["subject_id"].isin(target_ids)].copy()
+        self.df = df
+
         self.samples: List[Tuple[Path, int, int, str]] = []
         self._index_dataset()
 
@@ -256,7 +260,7 @@ class PANSleepEEGDataset(Dataset):
                 print(f"  [Warning] Subject {subject_id} missing tensor file: {npy_path}, skipping...")
                 continue
 
-            valid_indices, excluded_count = extract_valid_window_indices(
+            valid_indices, stages, excluded_count = extract_valid_window_indices(
                 meta_path=meta_path,
                 npy_path=npy_path,
                 filter_stage=self.filter_stage,
@@ -265,7 +269,7 @@ class PANSleepEEGDataset(Dataset):
             total_skipped_slices += excluded_count
 
             for w_idx in valid_indices:
-                self.samples.append((npy_path, w_idx, label, subject_id))
+                self.samples.append((npy_path, w_idx, label, subject_id, stages[w_idx]))
                 total_valid_slices += 1
 
         filter_info = f" [Filter Stage: {','.join(sorted(self.filter_stage))}]" if self.filter_stage else ""
@@ -278,7 +282,7 @@ class PANSleepEEGDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        npy_path, window_idx, label, subject_id = self.samples[idx]
+        npy_path, window_idx, label, subject_id, stage = self.samples[idx]
 
         if self.memory_map:
             data = np.load(npy_path, mmap_mode="r")
@@ -290,7 +294,7 @@ class PANSleepEEGDataset(Dataset):
         x_tensor = torch.from_numpy(slice_data)
         y_tensor = torch.tensor(label, dtype=torch.long)
 
-        return x_tensor, y_tensor, subject_id
+        return x_tensor, y_tensor, subject_id, stage, window_idx
 
 
 class CachedFeatureSubjectDataset(Dataset):
@@ -298,15 +302,18 @@ class CachedFeatureSubjectDataset(Dataset):
     def __init__(
         self,
         pt_path: Union[str, Path],
-        filter_subject: Optional[List[str]] = None, # XXX / TODO: subject filtering
+        filter_subject: Optional[List[str]] = None
     ):
-        assert filter_subject is None, "Subject filtering not implemented"
-
         data = torch.load(pt_path, map_location="cpu", weights_only=True)
         self.feats = data["feats"]
         self.labels = data["labels"]
+        self.stages = data["stages"]
+        self.indices = data["indices"]
         self.subject_ids = np.array(data["subject_ids"])
         self.unique_subjects = np.unique(self.subject_ids)
+        self.filter_subject = parse_filter(filter_subject)
+        if self.filter_subject:
+            self.unique_subjects = self.unique_subjects(np.isin(self.unique_subjects, list(self.filter_subject)))
 
     def __len__(self) -> int:
         return len(self.unique_subjects)
@@ -315,11 +322,13 @@ class CachedFeatureSubjectDataset(Dataset):
         subject_id = self.unique_subjects[idx]
         mask = (self.subject_ids == subject_id)
         subj_feats = self.feats[mask]
+        subj_stages = self.stages[mask]
+        subj_indices = self.indices[mask]
         
         # All windows for a given subject share the same patient-level ground truth
         subj_label = int(self.labels[mask][0].item())
         
-        return subject_id, subj_feats, subj_label
+        return subj_feats, subj_label, subject_id, subj_stages, subj_indices
 
 
 class SyntheticEEGDataset(torch.utils.data.Dataset):
