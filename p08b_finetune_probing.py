@@ -60,12 +60,11 @@ def parse_cli_args() -> argparse.Namespace:
     )
 
     # Checkpoint & Cache Controls
-    ckpt_group = parser.add_argument_group("Checkpoint & Cache Controls")
-    ckpt_group.add_argument("--cache-dir", type=str, default="/opt/cbra_data/checkpoints", help="Directory for cached embeddings & checkpoints")
-    ckpt_group.add_argument("--train-cache-name", type=str, default="cached_train_embeddings.pt", help="Filename for cached training embeddings")
-    ckpt_group.add_argument("--val-cache-name", type=str, default="cached_val_embeddings.pt", help="Filename for cached validation embeddings")
-    ckpt_group.add_argument("--best-head-filename", type=str, default="cbramod_head_best.pt", help="Filename for best probe head checkpoint")
-    ckpt_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
+    cache_group = parser.add_argument_group("Cache Controls")
+    cache_group.add_argument("--cache-dir", type=str, default=None, help="Directory for cached embeddings")
+    cache_group.add_argument("--train-cache-name", type=str, default="cached_train_embeddings.pt", help="Filename for cached training embeddings")
+    cache_group.add_argument("--val-cache-name", type=str, default="cached_val_embeddings.pt", help="Filename for cached validation embeddings")
+    cache_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
 
     # Run Options
     run_group = parser.add_argument_group("Run Options")

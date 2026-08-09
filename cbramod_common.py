@@ -109,9 +109,9 @@ class PANSubjectEEGDataset(Dataset):
         self,
         manifest_csv: Union[str, Path],
         data_dir: Optional[Union[str, Path]] = None,
-        memory_map: bool = True,
         filter_subject: Optional[List[str]] = None,
-        filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]] = None
+        filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]] = None,
+        memory_map: bool = True
     ):
         self.manifest_csv = Path(manifest_csv)
         self.data_dir = Path(data_dir) if data_dir else None
@@ -212,9 +212,12 @@ class PANSleepEEGDataset(Dataset):
         self,
         manifest_csv: Path,
         data_dir: Optional[Union[str, Path]] = None,
-        memory_map: bool = True,
-        filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]] = None
+        filter_subject: Optional[List[str]] = None, # XXX / TODO: subject filtering
+        filter_stage: Optional[Union[str, List[str], Set[str], Tuple[str, ...]]] = None,
+        memory_map: bool = True
     ):
+        assert filter_subject is None, "Subject filtering not implemented"
+
         self.manifest_csv = Path(manifest_csv)
         self.data_dir = Path(data_dir) if data_dir else None
         self.memory_map = memory_map
@@ -292,7 +295,13 @@ class PANSleepEEGDataset(Dataset):
 
 class CachedFeatureSubjectDataset(Dataset):
     """Dataset that groups pre-extracted features by subject ID for patient-level inference."""
-    def __init__(self, pt_path: Union[str, Path]):
+    def __init__(
+        self,
+        pt_path: Union[str, Path],
+        filter_subject: Optional[List[str]] = None, # XXX / TODO: subject filtering
+    ):
+        assert filter_subject is None, "Subject filtering not implemented"
+
         data = torch.load(pt_path, map_location="cpu", weights_only=True)
         self.feats = data["feats"]
         self.labels = data["labels"]
@@ -836,12 +845,13 @@ class CBraModTrainer:
 def setup_common_cli_parser(parser: argparse.ArgumentParser) -> None:
     # CBraMod Architecture Controls    
     cbra_group = parser.add_argument_group("CBraMod Architecture Controls")
-    cbra_group.add_argument("--num-channels", type=int, default=64, help="EEG Channel count")
-    cbra_group.add_argument("--num-patches", type=int, default=30, help="Number of temporal patches in CBraMod")
-    cbra_group.add_argument("--sfreq", type=float, default=200.0, help="EEG sampling frequency")
+    cbra_group.add_argument("--batch-size", type=int, default=512, help="[B]atch size for model execution")
+    cbra_group.add_argument("--num-channels", type=int, default=64, help="EEG [C]hannel count")
+    cbra_group.add_argument("--num-patches", type=int, default=30, help="Number of temporal patches in a [S]egment")
+    cbra_group.add_argument("--sfreq", type=float, default=200.0, help="Number of EEG samples in a [P]atch")
     cbra_group.add_argument("--cbra-dim", type=int, default=200, help="CBraMod embedding dimension per patch")
     cbra_group.add_argument("--head-type", type=str, choices=["linear", "mlp"], default="mlp", help="Classification head architecture: 'linear' (1-layer) or 'mlp' (2-layer)")
-    cbra_group.add_argument("--head-dim", type=int, default=128, help="Head dimension")
+    cbra_group.add_argument("--head-dim", type=int, default=128, help="Head dimension for 2 layer MLP")
     cbra_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
 
     # Data and Filtering Controls
@@ -857,7 +867,7 @@ def setup_common_cli_parser(parser: argparse.ArgumentParser) -> None:
 
 
 def setup_training_cli_parser(
-    description: str = "CBraMod Pipeline"
+    description: str = "CBraMod Training"
 ) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=description,
@@ -870,6 +880,11 @@ def setup_training_cli_parser(
     manifest_group = parser.add_argument_group("Training Manifests")
     manifest_group.add_argument("--train-manifest", type=str, default=None, help="Path to training manifest file (CSV/TSV/JSON)")
     manifest_group.add_argument("--val-manifest", type=str, default=None, help="Path to validation manifest file (CSV/TSV/JSON)")
+
+    # Checkpoint Output
+    ckpt_group = parser.add_argument_group("Checkpoint")
+    ckpt_group.add_argument("--checkpoint-dir", type=str, default=None, help="Directory to save the checkpoint")
+    ckpt_group.add_argument("--checkpoint-filename", type=str, default="cbramod_ckpt.pt", help="Filename for checkpoint")
 
     # Pooling Strategy
     pool_group = parser.add_argument_group("Pooling Strategy")
@@ -884,9 +899,8 @@ def setup_training_cli_parser(
     pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for pathology burden ratio")
 
     # Hyperparameters
-    hp_group = parser.add_argument_group("Common Hyperparameters")
+    hp_group = parser.add_argument_group("Hyperparameters")
     hp_group.add_argument("--epochs", type=int, default=40, help="Maximum training epochs for linear probe head")
-    hp_group.add_argument("--batch-size", type=int, default=512, help="Batch size for training and feature extraction")
     hp_group.add_argument("--head-lr", type=float, default=1e-4, help="Initial learning rate for classification head")
     hp_group.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing scheduler")
     hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay regularizer")
@@ -899,6 +913,48 @@ def setup_training_cli_parser(
         default="loss_weights",
         help="Class imbalance handling: 'sampler' (WeightedRandomSampler), 'loss_weights' (Class-Weighted CrossEntropy), or 'none'"
     )
+
+    return parser
+
+
+def setup_inference_cli_parser(
+    description: str = "CBraMod Inference"
+) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=description,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+
+    setup_common_cli_parser(parser)
+
+    # Checkpoint Input
+    ckpt_group = parser.add_argument_group("Checkpoint")
+    ckpt_group.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+
+    # Subject Data
+    data_group = parser.add_mutually_exclusive_group(required=True)
+    data_group.add_argument("--manifest", type=str, help="Path to test_manifest.csv for raw .npy inference")
+    data_group.add_argument("--features-pt", type=str, help="Path to pre-extracted test features (.pt)")
+
+    # Subject Filtering
+    subject_group = parser.add_argument_group("Subject Filtering")
+    subject_group.add_argument("--subject-id", type=str, default=None, help="Optional comma-separated list of specific Subject IDs to analyze (e.g., GRINS0322,GRINS0038).")
+
+    # Pooling Strategy
+    pool_group = parser.add_argument_group("Pooling Strategy")
+    pool_group.add_argument(
+        "--pooling-strategy",
+        type=str,
+        default="p85_score",
+        choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio", "all"],
+        help="Pooling strategy choice (default: 'p85_score', or 'all' for full comparative report)"
+    )
+    pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio (default: 0.10)")
+    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for burden ratio (default: 0.60)")
+
+    misc_group = parser.add_argument_group("Miscellaneous")
+    misc_group.add_argument("--override-threshold", type=float, default=None, help="Override operating decision threshold")
+    misc_group.add_argument("--output-dir", type=str, default=None, help="Output directory for the subject analysis")
 
     return parser
 

@@ -13,8 +13,6 @@ import time
 from typing import Dict, List, Optional
 
 import numpy as np
-import pandas as pd
-from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -257,7 +255,7 @@ class EndToEndTrainer(CBraModTrainer):
         best_primary_f1 = 0.0
         best_thresholds = {}
         patience_counter = 0
-        best_model_path = Path(self.config.checkpoint_dir) / "cbramod_e2e_best.pt"
+        best_model_path = Path(self.config.checkpoint_dir) / self.config.checkpoint_name
 
         self.logger.info(
             f"Starting E2E Training ({self.config.epochs} Epochs | Batch Size: {self.config.batch_size} | "
@@ -442,9 +440,8 @@ def parse_cli_args() -> argparse.Namespace:
     )
 
     # Checkpoints
-    ckpt_group = parser.add_argument_group("Checkpoint Controls")
-    ckpt_group.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save fine-tuned checkpoints")
-    ckpt_group.add_argument("--probe-head-ckpt", type=str, default=None, help="Optional path to warm-start linear probe head checkpoint")
+    warm_group = parser.add_argument_group("Warm Start")
+    warm_group.add_argument("--probe-head-ckpt", type=str, default=None, help="Optional path to warm-start linear probe head checkpoint")
 
     # Unfreezing & Stabilization Controls
     unfreeze_group = parser.add_argument_group("Backbone Unfreezing & Stabilization Controls")

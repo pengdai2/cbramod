@@ -1,9 +1,5 @@
-#!/usr/bin/env python3
-import argparse
-import json
-import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,8 +10,8 @@ from cbramod_common import (
     PANSubjectEEGDataset,
     compute_pooled_scores,
     get_operating_threshold,
-    setup_common_cli_parser,
-    load_model_checkpoint
+    load_model_checkpoint,
+    setup_inference_cli_parser
 )
 import torch
 import torch.nn as nn
@@ -189,36 +185,9 @@ class SubjectEEGInspector:
 # -----------------------------------------------------------------------------
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Run subject-level epoch diagnostics on specific clinical EEG cohorts."
-    )
-    setup_common_cli_parser(parser)
-
-    subject_group = parser.add_argument_group("Subject Selection")
-    subject_group.add_argument("--manifest", type=str, required=True, help="Path to manifest CSV file.")
-    subject_group.add_argument("--subject-id", type=str, default=None, help="Optional comma-separated list of specific Subject IDs to analyze (e.g., GRINS0322,GRINS0038).")
-
-    ckpt_group = parser.add_argument_group("Model Checkpoint")
-    ckpt_group.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
-
-    # Pooling Strategy
-    pool_group = parser.add_argument_group("Pooling Strategy")
-    pool_group.add_argument(
-        "--pooling-strategy", 
-        type=str, 
-        default="p85_score", 
-        choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio", "all"],
-        help="Pooling strategy choice (default: 'p85_score', or 'all' for full comparative report)"
-    )
-    pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio (default: 0.10)")
-    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for burden ratio (default: 0.60)")
-
-    misc_group = parser.add_argument_group("Miscellaneous")
-    misc_group.add_argument("--override-threshold", type=float, default=None, help="Override operating decision threshold")
-    misc_group.add_argument("--batch-size", type=int, default=512, help="Batch size for inference (default: 512)")
-    misc_group.add_argument("--output-dir", type=str, default=None, help="Output directory for the subject analysis")
-
-    return parser.parse_args()
+    parser = setup_inference_cli_parser(description="Multi-Class Patient-Level Clinical Inference")
+    args = parser.parse_args()
+    return args
 
 
 # -----------------------------------------------------------------------------
