@@ -93,9 +93,11 @@ def evaluate_clinical_cohort(
     if args.test_features_pt:
         print("Instantiating isolated Probe Head for cached feature inference.")
         if args.head_type == "linear":
-            model = LinearProbeHead(num_patches=args.num_patches,
-                                    emb_dim=args.cbra_dim,
-                                    num_classes=args.num_classes)
+            model = LinearProbeHead(
+                num_patches=args.num_patches,
+                emb_dim=args.cbra_dim,
+                num_classes=args.num_classes
+            )
         else:
             model = MLPProbeHead(
                 num_patches=args.num_patches,
