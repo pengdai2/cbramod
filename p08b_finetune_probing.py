@@ -216,7 +216,7 @@ class ProbeTrainer(CBraModTrainer):
         best_primary_f1 = 0.0
         best_thresholds = {}
         patience_counter = 0
-        best_model_path = Path(self.config.cache_dir) / self.config.checkpoint_filename
+        best_model_path = Path(self.config.checkpoint_dir) / self.config.checkpoint_filename
 
         self.logger.info(
             f"Starting Probe Training ({self.config.epochs} Epochs Max | Batch Size: {self.config.batch_size} | "
