@@ -133,16 +133,18 @@ def compute_multi_granularity_attributions(
 
 
 # -----------------------------------------------------------------------------
-# Channel concentration: is this a focal or a distributed attribution?
+# Concentration metrics: is attribution focal or distributed, sustained or a
+# transient spike?
 # -----------------------------------------------------------------------------
 
 def _gini_coefficient(values: np.ndarray) -> float:
     """
     Gini coefficient of a nonnegative array: 0.0 means attribution is spread
-    perfectly evenly across channels, 1.0 means it is concentrated entirely
-    in a single channel. Used as a cheap, threshold-able stand-in for
-    "is there a clear winning channel, or several channels driving this
-    together?" without requiring a human to eyeball the bar chart.
+    perfectly evenly, 1.0 means it is concentrated entirely in a single
+    element. Used as a cheap, threshold-able stand-in for "is there a clear
+    winner, or is this spread out?" without requiring a human to eyeball a
+    bar chart -- reused for both the channel (spatial) and patch (temporal)
+    axes below.
     """
     x = np.sort(np.abs(np.asarray(values, dtype=np.float64)))
     n = len(x)
@@ -159,7 +161,9 @@ def compute_channel_concentration(
 ) -> Tuple[float, np.ndarray, np.ndarray]:
     """
     Summarizes `channel_attr` [Channels] into:
-      - gini: concentration coefficient (see `_gini_coefficient`)
+      - gini: concentration coefficient (see `_gini_coefficient`). High ->
+        one dominant channel (focal, spatially localized source). Low -> no
+        single channel wins (distributed).
       - top_k_idx: indices of the top_k channels by attribution magnitude,
         descending
       - top_k_scores: their corresponding attribution scores
@@ -168,6 +172,190 @@ def compute_channel_concentration(
     order = np.argsort(channel_attr)[::-1]
     top_k_idx = order[:top_k]
     return _gini_coefficient(channel_attr), top_k_idx, channel_attr[top_k_idx]
+
+
+def compute_temporal_concentration(
+    patch_attr: np.ndarray,
+    top_k: int = 3
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """
+    Collapses `patch_attr` [Channels, Num_Patches] across channels (L2 norm)
+    into a per-patch energy profile over time, then summarizes it exactly
+    like `compute_channel_concentration` does for channels -- same metric,
+    different axis:
+      - gini: 0.0 -> attribution spread evenly across most/all patches: a
+        *sustained* abnormality spanning the window. 1.0 -> concentrated in
+        one or two patches: a *transient spike*. This directly operationalizes
+        the "sustained (Tier 1) vs. spike (Tier 3)" distinction -- compare
+        this value across a subject's windows from different tiers rather
+        than eyeballing the patch heatmap each time.
+      - top_k_idx: indices of the top_k patches (== seconds into the window,
+        since each patch spans 1s) by attribution energy, descending.
+      - top_k_scores: their corresponding patch energy.
+    """
+    patch_energy = np.linalg.norm(patch_attr, axis=0)  # [Num_Patches]
+    top_k = min(top_k, len(patch_energy))
+    order = np.argsort(patch_energy)[::-1]
+    top_k_idx = order[:top_k]
+    return _gini_coefficient(patch_energy), top_k_idx, patch_energy[top_k_idx]
+
+
+# -----------------------------------------------------------------------------
+# Morphology hotspot characterization: what does the model's top evidence
+# actually look like?
+# -----------------------------------------------------------------------------
+
+# Coarse frequency bands used only to *tag* a hotspot for quick triage -- not
+# a validated classifier. Always eyeball the plotted snippet before trusting
+# a tag; dominant-frequency-via-FFT on a ~1s snippet is a rough estimate, and
+# amplitude/duration heuristics will misfire on unusual morphology or noise.
+MORPHOLOGY_TAG_RULES = (
+    # (label, freq_lo, freq_hi, min_duration_sec, max_duration_sec, min_p2p_uv)
+    ("sleep_spindle", 11.0, 16.0, 0.3, 3.0, 0.0),
+    ("k_complex_or_slow_wave", 0.0, 2.0, 0.0, 1.5, 75.0),
+    ("delta_slow_wave", 0.0, 4.0, 0.0, 1e9, 100.0),
+    ("theta_burst", 4.0, 8.0, 0.0, 1e9, 0.0),
+    ("alpha_burst", 8.0, 12.0, 0.0, 1e9, 0.0),
+    ("sharp_transient_or_artifact", 20.0, 1e9, 0.0, 1e9, 100.0),
+)
+
+
+def _dominant_frequency(snippet: np.ndarray, sfreq: float) -> float:
+    """FFT-based dominant frequency (Hz) of a 1D snippet, ignoring DC."""
+    n = len(snippet)
+    if n < 4:
+        return 0.0
+    windowed = snippet * np.hanning(n)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sfreq)
+    power = np.abs(np.fft.rfft(windowed)) ** 2
+    if len(power) <= 1:
+        return 0.0
+    peak_idx = 1 + int(np.argmax(power[1:]))  # skip DC bin
+    return float(freqs[peak_idx])
+
+
+def _classify_morphology(dominant_freq_hz: float, duration_sec: float, peak_to_peak_uv: float) -> str:
+    """Heuristic morphology tag from dominant frequency / duration / amplitude. See MORPHOLOGY_TAG_RULES."""
+    for label, freq_lo, freq_hi, dur_lo, dur_hi, min_p2p in MORPHOLOGY_TAG_RULES:
+        if freq_lo <= dominant_freq_hz <= freq_hi and dur_lo <= duration_sec <= dur_hi and peak_to_peak_uv >= min_p2p:
+            return label
+    return "unclassified"
+
+
+def characterize_morphology_hotspots(
+    signal_attr: np.ndarray,
+    raw_eeg: np.ndarray,
+    sfreq: float,
+    channel_idx: Optional[int] = None,
+    top_k: int = 3,
+    snippet_sec: float = 1.0
+) -> List[Dict]:
+    """
+    Finds the top_k highest (positive) attribution samples within
+    `channel_idx` (defaults to the single most-attributed channel overall)
+    and extracts a `snippet_sec`-wide raw-EEG window centered on each,
+    tagging it with a coarse morphological guess (spindle, slow wave, sharp
+    transient, etc.) from dominant frequency + duration + amplitude.
+
+    This is a starting point for "what does the model's top evidence
+    actually look like" -- pair with `plot_morphology_hotspots` and always
+    eyeball the returned snippet against the plotted trace rather than
+    trusting the tag alone.
+
+    Hotspots are found by repeatedly taking the highest remaining positive
+    attribution sample, then "claiming" (excluding from further selection)
+    its extraction window so consecutive hotspots don't just re-describe the
+    same peak.
+    """
+    if channel_idx is None:
+        channel_idx = int(np.argmax(np.linalg.norm(signal_attr, axis=1)))
+
+    attr_1d = signal_attr[channel_idx]
+    eeg_1d = raw_eeg[channel_idx]
+    half_span = max(1, int(round(snippet_sec * sfreq / 2)))
+
+    pos_attr = np.maximum(attr_1d, 0)
+    order = np.argsort(pos_attr)[::-1]
+    claimed = np.zeros(len(attr_1d), dtype=bool)
+
+    hotspots: List[Dict] = []
+    for idx in order:
+        if len(hotspots) >= top_k or pos_attr[idx] <= 0:
+            break
+        if claimed[idx]:
+            continue
+
+        start = max(0, idx - half_span)
+        end = min(len(eeg_1d), idx + half_span)
+        claimed[start:end] = True
+
+        snippet = eeg_1d[start:end]
+        dominant_freq = _dominant_frequency(snippet, sfreq)
+        duration_sec = (end - start) / sfreq
+        peak_to_peak_uv = float(snippet.max() - snippet.min()) if len(snippet) else 0.0
+        tag = _classify_morphology(dominant_freq, duration_sec, peak_to_peak_uv)
+
+        hotspots.append({
+            "channel": channel_idx,
+            "peak_sample_idx": int(idx),
+            "peak_time_sec": float(idx / sfreq),
+            "attribution": float(attr_1d[idx]),
+            "window_start_sec": float(start / sfreq),
+            "window_end_sec": float(end / sfreq),
+            "dominant_frequency_hz": dominant_freq,
+            "duration_sec": duration_sec,
+            "peak_to_peak_uv": peak_to_peak_uv,
+            "morphology_tag": tag
+        })
+
+    return hotspots
+
+
+def plot_morphology_hotspots(
+    raw_eeg: np.ndarray,
+    signal_attr: np.ndarray,
+    hotspots: List[Dict],
+    sfreq: float,
+    output_path: Path
+) -> None:
+    """One row per hotspot: zoomed raw trace + positive attribution overlay, annotated with its morphology tag."""
+    if not hotspots:
+        print("  No positive-attribution hotspots found; skipping morphology plot.")
+        return
+
+    fig, axes = plt.subplots(len(hotspots), 1, figsize=(10, 2.6 * len(hotspots)), squeeze=False)
+
+    for i, hotspot in enumerate(hotspots):
+        ax = axes[i, 0]
+        ch = hotspot["channel"]
+        start_sample = int(round(hotspot["window_start_sec"] * sfreq))
+        end_sample = int(round(hotspot["window_end_sec"] * sfreq))
+
+        snippet_eeg = raw_eeg[ch, start_sample:end_sample]
+        snippet_attr = np.maximum(signal_attr[ch, start_sample:end_sample], 0)
+        snippet_time = np.arange(start_sample, end_sample) / sfreq
+
+        ax.plot(snippet_time, snippet_eeg, color='black', linewidth=1.0)
+        if snippet_attr.max() > 0:
+            attr_norm = snippet_attr / snippet_attr.max() * np.abs(snippet_eeg).max()
+            ax.fill_between(snippet_time, 0, attr_norm, color='crimson', alpha=0.3)
+        ax.axvline(hotspot["peak_time_sec"], color='crimson', linestyle='--', linewidth=1.0)
+
+        ax.set_title(
+            f"Hotspot {i + 1}: Ch {ch} @ {hotspot['peak_time_sec']:.2f}s -- "
+            f"{hotspot['morphology_tag']} "
+            f"(dom.freq={hotspot['dominant_frequency_hz']:.1f}Hz, "
+            f"dur={hotspot['duration_sec']:.2f}s, p2p={hotspot['peak_to_peak_uv']:.1f}uV)",
+            fontsize=10
+        )
+        ax.set_ylabel('Amplitude (µV)', fontsize=9)
+        ax.grid(True, linestyle=':', alpha=0.4)
+
+    axes[-1, 0].set_xlabel('Time (s)')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Morphology hotspot plot saved to: {output_path}")
 
 
 def plot_attribution_dashboard(
@@ -181,22 +369,31 @@ def plot_attribution_dashboard(
     concentration_threshold: float = 0.5,
     top_k_channels: int = 3,
     gini: Optional[float] = None,
-    top_k_idx: Optional[np.ndarray] = None
+    top_k_idx: Optional[np.ndarray] = None,
+    temporal_concentration_threshold: float = 0.5,
+    top_k_patches: int = 3,
+    temporal_gini: Optional[float] = None,
+    top_k_patch_idx: Optional[np.ndarray] = None
 ):
     """
     Generates a visual diagnostic dashboard comparing raw EEG signals,
     signal-level saliency, and CBraMod patch grid importance.
 
-    Panel 1 adapts to whether attribution is focal or distributed: when the
-    channel-attribution Gini coefficient is at or above
-    `concentration_threshold`, a single dominant channel drives the
-    prediction and is plotted alone (as before). Below that threshold, no
-    single channel "wins" clearly, so the top `top_k_channels` channels are
-    overlaid together instead of picking one arbitrarily.
+    Panel 1 shows one small-multiple row per channel being displayed --
+    a single channel when attribution is focal (or --target-channel-idx is
+    given), or the top `top_k_channels` channels stacked in separate rows
+    (not overlaid on one axis) when it's distributed, so multi-channel cases
+    stay readable instead of piling multiple colored fills on top of each
+    other.
 
-    `gini`/`top_k_idx` can be passed in pre-computed (e.g. from `main()`, which
+    Panel 2's patch heatmap is annotated with the temporal-concentration
+    verdict (sustained vs. spike-localized) and marks the top attributed
+    patches with vertical guides.
+
+    `gini`/`top_k_idx` (channel) and `temporal_gini`/`top_k_patch_idx`
+    (patch/time) can be passed in pre-computed (e.g. from `main()`, which
     already needs them for logging/export) to avoid recomputing; if omitted
-    they're derived here from `channel_attr`.
+    they're derived here.
     """
     time_axis = np.arange(raw_eeg.shape[1]) / sfreq
     num_channels, num_patches = patch_attr.shape
@@ -205,9 +402,11 @@ def plot_attribution_dashboard(
         gini, top_k_idx, _ = compute_channel_concentration(channel_attr, top_k=top_k_channels)
     is_focal = gini >= concentration_threshold
 
-    fig, axes = plt.subplots(3, 1, figsize=(14, 9), gridspec_kw={'height_ratios': [1, 1, 1.2]})
+    if temporal_gini is None or top_k_patch_idx is None:
+        temporal_gini, top_k_patch_idx, _ = compute_temporal_concentration(patch_attr, top_k=top_k_patches)
+    is_temporally_focal = temporal_gini >= temporal_concentration_threshold
 
-    # --- Panel 1: Raw EEG Trace with Overlay Signal Attribution ---
+    # --- Panel 1 channel selection ---
     if target_channel_idx is not None:
         # Explicit user override always wins, regardless of concentration.
         plot_channels = [target_channel_idx]
@@ -216,49 +415,69 @@ def plot_attribution_dashboard(
     else:
         plot_channels = [int(c) for c in top_k_idx]
 
-    colors = plt.cm.tab10(np.linspace(0, 1, max(len(plot_channels), 2)))
+    num_channel_rows = len(plot_channels)
+    total_rows = num_channel_rows + 2  # + patch heatmap + channel bar chart
+    height_ratios = [1.0] * num_channel_rows + [1.4, 1.2]
+
+    fig = plt.figure(figsize=(14, 2.2 * num_channel_rows + 6.5))
+    gs = fig.add_gridspec(total_rows, 1, height_ratios=height_ratios, hspace=0.6)
+
+    channel_axes = [fig.add_subplot(gs[i, 0]) for i in range(num_channel_rows)]
+    ax_patch = fig.add_subplot(gs[num_channel_rows, 0])
+    ax_bar = fig.add_subplot(gs[num_channel_rows + 1, 0])
+
+    # --- Panel 1: Raw EEG Trace with Overlay Signal Attribution (one row per channel) ---
     for i, ch in enumerate(plot_channels):
+        ax = channel_axes[i]
         eeg_signal = raw_eeg[ch]
         attr_signal = signal_attr[ch]
-        color = colors[i]
 
-        axes[0].plot(time_axis, eeg_signal, color=color, alpha=0.7, label=f'Raw EEG (Ch {ch})')
+        ax.plot(time_axis, eeg_signal, color='black', alpha=0.75, linewidth=0.9)
         pos_attr = np.maximum(0, attr_signal)
         if pos_attr.max() > 0:
             pos_attr_norm = pos_attr / pos_attr.max() * np.abs(eeg_signal).max()
-            axes[0].fill_between(time_axis, 0, pos_attr_norm, color=color, alpha=0.25)
+            ax.fill_between(time_axis, 0, pos_attr_norm, color='crimson', alpha=0.3)
 
-    axes[0].set_ylabel('Amplitude (µV)')
+        rank_note = " (Highest)" if i == 0 and num_channel_rows > 1 else ""
+        ax.set_ylabel(f'Ch {ch}{rank_note}\n(µV)', fontsize=9)
+        ax.grid(True, linestyle=':', alpha=0.4)
+        if i < num_channel_rows - 1:
+            ax.set_xticklabels([])
+
     if target_channel_idx is not None:
-        title = f'Signal-Level Attribution (Channel {target_channel_idx}, User-Selected)'
+        header = f'Signal-Level Attribution (Channel {target_channel_idx}, User-Selected)'
     elif is_focal:
-        title = f'Signal-Level Attribution (Channel {plot_channels[0]}, Highest Attribution, Gini={gini:.2f})'
+        header = f'Signal-Level Attribution (Channel {plot_channels[0]}, Highest Attribution, Gini={gini:.2f})'
     else:
-        title = f'Signal-Level Attribution (Top {len(plot_channels)} Channels, No Clear Winner, Gini={gini:.2f})'
-    axes[0].set_title(title)
-    axes[0].legend(loc='upper right')
-    axes[0].grid(True, linestyle=':', alpha=0.6)
+        header = f'Signal-Level Attribution (Top {num_channel_rows} Channels, No Clear Winner, Gini={gini:.2f})'
+    channel_axes[0].set_title(header, fontsize=12)
+    channel_axes[-1].set_xlabel('Time (s)')
 
     # --- Panel 2: CBraMod Spatial-Temporal Patch Heatmap ---
-    im = axes[1].imshow(
+    im = ax_patch.imshow(
         patch_attr,
         aspect='auto',
         cmap='magma',
         origin='lower',
         extent=[0, time_axis[-1], 0, num_channels]
     )
-    axes[1].set_ylabel('EEG Channel Index')
-    axes[1].set_title('CBraMod Token Patch Importance Heatmap (Channels x Time Patches)')
-    fig.colorbar(im, ax=axes[1], orientation='vertical', label='Patch Importance (L2 Norm)')
+    for patch_idx in top_k_patch_idx:
+        ax_patch.axvline(patch_idx + 0.5, color='cyan', linestyle='--', linewidth=1.0, alpha=0.8)
+    temporal_verdict = "Spike-Localized" if is_temporally_focal else "Sustained"
+    ax_patch.set_ylabel('EEG Channel Index')
+    ax_patch.set_title(
+        f'CBraMod Token Patch Importance Heatmap (Channels x Time Patches) -- '
+        f'{temporal_verdict} (Temporal Gini={temporal_gini:.2f})'
+    )
+    fig.colorbar(im, ax=ax_patch, orientation='vertical', label='Patch Importance (L2 Norm)')
 
     # --- Panel 3: Global Channel Importance ---
-    axes[2].bar(range(num_channels), channel_attr, color='navy', alpha=0.7)
-    axes[2].set_xlabel('EEG Channel Index')
-    axes[2].set_ylabel('Attribution L2 Norm')
-    axes[2].set_title('Global Channel Importance Profile')
-    axes[2].grid(axis='y', linestyle='--', alpha=0.7)
+    ax_bar.bar(range(num_channels), channel_attr, color='navy', alpha=0.7)
+    ax_bar.set_xlabel('EEG Channel Index')
+    ax_bar.set_ylabel('Attribution L2 Norm')
+    ax_bar.set_title('Global Channel Importance Profile')
+    ax_bar.grid(axis='y', linestyle='--', alpha=0.7)
 
-    plt.tight_layout()
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
     print(f"Multi-granularity attribution plot saved to: {output_path}")
@@ -416,11 +635,37 @@ def parse_cli_args() -> argparse.Namespace:
         "--concentration-threshold", type=float, default=0.5,
         help="Gini coefficient (0-1) on channel-level attribution above which a window is treated as "
              "'focal' (one dominant channel, plotted alone). Below this, no single channel clearly wins, "
-             "so --top-k-channels channels are overlaid together in Panel 1 instead."
+             "so --top-k-channels channels are shown in separate rows in Panel 1 instead."
     )
     attr_group.add_argument(
         "--top-k-channels", type=int, default=3,
-        help="Number of channels to overlay in Panel 1 when attribution is distributed rather than focal."
+        help="Number of channels to show (one per row) in Panel 1 when attribution is distributed rather than focal."
+    )
+    attr_group.add_argument(
+        "--temporal-concentration-threshold", type=float, default=0.5,
+        help="Gini coefficient (0-1) on patch-level (time-collapsed) attribution above which a window is "
+             "treated as 'spike-localized' (attribution concentrated in one or two patches). Below this, "
+             "it's treated as 'sustained' (spread across most/all patches)."
+    )
+    attr_group.add_argument(
+        "--top-k-patches", type=int, default=3,
+        help="Number of highest-attribution patches (time positions) to mark on the Panel 2 heatmap."
+    )
+    attr_group.add_argument(
+        "--top-k-hotspots", type=int, default=3,
+        help="Number of morphology hotspots (highest-attribution raw-signal peaks) to characterize and plot "
+             "per window, for windows whose tier matches --morphology-tiers. Set to 0 to disable."
+    )
+    attr_group.add_argument(
+        "--morphology-tiers", type=str, default="top",
+        help="Comma-separated tier filter (substring-matched, like --tiers) selecting which tiers get "
+             "morphology hotspot characterization. Default: 'top' (matches 'Tier 1: Top Drivers' only) -- "
+             "the model's most confident evidence is the natural place to start looking for the underlying "
+             "morphology (e.g. sleep spindles, sharp waves) driving the prediction."
+    )
+    attr_group.add_argument(
+        "--hotspot-snippet-sec", type=float, default=1.0,
+        help="Width (seconds) of the raw-EEG snippet extracted around each morphology hotspot peak."
     )
 
     args = parser.parse_args()
@@ -445,6 +690,7 @@ def main():
     # spans exactly `sfreq` samples — no separate window-length flag needed.
     patch_size_samples = int(round(args.sfreq))
     window_sec = float(args.num_patches)
+    morphology_tier_filter = _resolve_tier_filter(args.morphology_tiers)
 
     print("Instantiating full CBraModE2EClassifier for raw waveform attribution.")
     model = CBraModE2EClassifier(
@@ -456,7 +702,7 @@ def main():
         num_classes=args.num_classes,
         head_type=args.head_type
     )
-    model, _, _ = load_model_checkpoint(model, Path(args.checkpoint), device)
+    model, _, _, _ = load_model_checkpoint(model, Path(args.checkpoint), device)
     model.to(device)
     model.eval()
 
@@ -485,6 +731,7 @@ def main():
                 target_class = task["target_class"] if task["target_class"] is not None else 1
             window_sample = np.array(subj_data[raw_idx : raw_idx + 1], dtype=np.float32)  # [1, C, T]
             input_tensor = torch.from_numpy(window_sample)
+            raw_eeg = window_sample.squeeze(0)
 
             tier_tag = _tier_slug(task["tier"])
             print(f"\n=== {subject_id} | window {raw_idx} (@ {raw_idx * window_sec:.0f}s) | "
@@ -515,23 +762,41 @@ def main():
                 + ", ".join(f"ch{int(c)}={s:.4g}" for c, s in zip(top_k_idx, top_k_scores))
             )
 
+            temporal_gini, top_k_patch_idx, top_k_patch_scores = compute_temporal_concentration(
+                patch_attr, top_k=args.top_k_patches
+            )
+            is_temporally_focal = temporal_gini >= args.temporal_concentration_threshold
+            temporal_verdict = "spike-localized" if is_temporally_focal else "sustained"
+            print(
+                f"  Temporal concentration: Gini={temporal_gini:.3f} -> {temporal_verdict} "
+                f"[threshold={args.temporal_concentration_threshold}]"
+            )
+            print(
+                f"  Top {len(top_k_patch_idx)} patches (seconds into window): "
+                + ", ".join(f"t={int(p)}s={s:.4g}" for p, s in zip(top_k_patch_idx, top_k_patch_scores))
+            )
+
             save_path = output_dir / f"{stem}_multi_granularity_attr.npz"
             np.savez_compressed(
                 save_path,
                 signal_attribution=signal_attr,  # [C, T]
                 patch_attribution=patch_attr,    # [C, num_patches]
                 channel_attribution=channel_attr,  # [C]
-                raw_eeg=window_sample.squeeze(0),
+                raw_eeg=raw_eeg,
                 channel_gini=gini,
                 top_k_channel_indices=top_k_idx,
                 top_k_channel_scores=top_k_scores,
-                is_focal=is_focal
+                is_focal=is_focal,
+                temporal_gini=temporal_gini,
+                top_k_patch_indices=top_k_patch_idx,
+                top_k_patch_scores=top_k_patch_scores,
+                is_temporally_focal=is_temporally_focal
             )
             print(f"Attribution dataset exported to {save_path}")
 
             plot_path = output_dir / f"{stem}_dashboard.png"
             plot_attribution_dashboard(
-                raw_eeg=window_sample.squeeze(0),
+                raw_eeg=raw_eeg,
                 signal_attr=signal_attr,
                 patch_attr=patch_attr,
                 channel_attr=channel_attr,
@@ -541,8 +806,50 @@ def main():
                 concentration_threshold=args.concentration_threshold,
                 top_k_channels=args.top_k_channels,
                 gini=gini,
-                top_k_idx=top_k_idx
+                top_k_idx=top_k_idx,
+                temporal_concentration_threshold=args.temporal_concentration_threshold,
+                top_k_patches=args.top_k_patches,
+                temporal_gini=temporal_gini,
+                top_k_patch_idx=top_k_patch_idx
             )
+
+            # Morphology hotspot characterization -- only for tiers matching
+            # --morphology-tiers (default: Tier 1 / Top Drivers), since that's
+            # the model's most confident evidence and the natural starting
+            # point for "what does this actually look like."
+            run_morphology = args.top_k_hotspots > 0 and (
+                morphology_tier_filter is None or task["tier"] in morphology_tier_filter
+            )
+            if run_morphology:
+                hotspots = characterize_morphology_hotspots(
+                    signal_attr=signal_attr,
+                    raw_eeg=raw_eeg,
+                    sfreq=args.sfreq,
+                    channel_idx=int(top_k_idx[0]),
+                    top_k=args.top_k_hotspots,
+                    snippet_sec=args.hotspot_snippet_sec
+                )
+                print(f"  Morphology hotspots (Ch {int(top_k_idx[0])}):")
+                for h in hotspots:
+                    print(
+                        f"    t={h['peak_time_sec']:.2f}s -> {h['morphology_tag']} "
+                        f"(dom.freq={h['dominant_frequency_hz']:.1f}Hz, dur={h['duration_sec']:.2f}s, "
+                        f"p2p={h['peak_to_peak_uv']:.1f}uV, attribution={h['attribution']:.4g})"
+                    )
+
+                hotspots_json_path = output_dir / f"{stem}_morphology_hotspots.json"
+                with open(hotspots_json_path, "w") as f:
+                    json.dump(hotspots, f, indent=2)
+                print(f"  Morphology hotspots exported to {hotspots_json_path}")
+
+                hotspots_plot_path = output_dir / f"{stem}_morphology_hotspots.png"
+                plot_morphology_hotspots(
+                    raw_eeg=raw_eeg,
+                    signal_attr=signal_attr,
+                    hotspots=hotspots,
+                    sfreq=args.sfreq,
+                    output_path=hotspots_plot_path
+                )
 
 
 if __name__ == "__main__":
