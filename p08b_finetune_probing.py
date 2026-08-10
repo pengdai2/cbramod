@@ -482,6 +482,9 @@ def main():
     cache_dir = Path(args.cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     logger = setup_logger(cache_dir / args.log_filename)
 
     train_cache_path = cache_dir / args.train_cache_name
