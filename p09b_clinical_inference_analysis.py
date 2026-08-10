@@ -35,13 +35,13 @@ def load_and_validate_csv(csv_path: Path) -> pd.DataFrame:
         raise FileNotFoundError(f"Score file not found at: {csv_path}")
 
     df = pd.read_csv(csv_path)
-    required_cols = {"subject_id", "ground_truth", "patient_score"}
+    required_cols = {"subject_id", "ground_truth", "pooled_score"}
     missing = required_cols - set(df.columns)
     if missing:
         raise ValueError(f"Missing required columns in CSV: {missing}")
 
     df["ground_truth"] = df["ground_truth"].astype(int)
-    df["patient_score"] = df["patient_score"].astype(float)
+    df["pooled_score"] = df["pooled_score"].astype(float)
     return df
 
 
@@ -55,7 +55,7 @@ def compute_bootstrapped_ci(
     Computes non-parametric bootstrapped 95% Confidence Intervals for clinical metrics.
     """
     y_true = df["ground_truth"].values
-    y_scores = df["patient_score"].values
+    y_scores = df["pooled_score"].values
 
     rng = np.random.RandomState(seed)
     n_samples = len(y_true)
@@ -121,7 +121,7 @@ def plot_subject_score_distribution(
     fig, ax = plt.subplots(figsize=(10, 6))
 
     df = df.copy()
-    df["predicted_class"] = (df["patient_score"] >= threshold).astype(int)
+    df["predicted_class"] = (df["pooled_score"] >= threshold).astype(int)
 
     # Classify prediction status
     status = []
@@ -151,7 +151,7 @@ def plot_subject_score_distribution(
     sns.stripplot(
         data=df,
         x="Ground Truth Label",
-        y="patient_score",
+        y="pooled_score",
         hue="Classification",
         palette=palette,
         jitter=0.2,
@@ -175,8 +175,8 @@ def plot_subject_score_distribution(
         x_pos = 1 if row["ground_truth"] == 1 else 0
         ax.annotate(
             row["subject_id"],
-            xy=(x_pos, row["patient_score"]),
-            xytext=(x_pos + 0.12, row["patient_score"]),
+            xy=(x_pos, row["pooled_score"]),
+            xytext=(x_pos + 0.12, row["pooled_score"]),
             arrowprops=dict(facecolor='black', shrink=0.05, width=0.5, headwidth=4),
             fontsize=9,
             fontweight="bold",
