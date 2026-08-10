@@ -57,8 +57,8 @@ def generate_subject_predictions(
     Unified generator streaming (subject_id, ground_truth_label, window_probs)
     for both cached features (.pt) and raw EEG manifest datasets.
     """
-    if args.test_features_pt:
-        dataset = CachedFeatureSubjectDataset(args.test_features_pt, subject_id=args.subject_id)
+    if args.features_pt:
+        dataset = CachedFeatureSubjectDataset(args.features_pt, subject_id=args.subject_id)
         print(f"Loaded cached features for {len(dataset)} subjects.")
 
         for i in tqdm(range(len(dataset)), desc="Processing Subjects (Cached)"):
@@ -91,7 +91,7 @@ def evaluate_clinical_cohort(
     print(f"=== Running Clinical Inference Pipeline ({args.num_classes}-Class) on [{device}] ===")
 
     # 1. Instantiate the appropriate Model Architecture
-    if args.test_features_pt:
+    if args.features_pt:
         print("Instantiating isolated Probe Head for cached feature inference.")
         if args.head_type == "linear":
             model = LinearProbeHead(
