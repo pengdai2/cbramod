@@ -94,10 +94,10 @@ def extract_valid_window_indices(
             data = np.load(npy_path)
             actual_slices = data.shape[0]
 
-        return list(range(actual_slices)), 0
+        return list(range(actual_slices)), [None] * actual_slices, 0
     except Exception as e:
         print(f"  [Warning] Failed to read array shape from {npy_path}: {e}")
-        return [], 0
+        return [], [], 0
 
 
 class PANSubjectEEGDataset(Dataset):
@@ -268,8 +268,12 @@ class PANSleepEEGDataset(Dataset):
             )
             total_skipped_slices += excluded_count
 
-            for w_idx in valid_indices:
-                self.samples.append((npy_path, w_idx, label, subject_id, stages[w_idx]))
+            # `stages` from extract_valid_window_indices is already compacted
+            # to align positionally with `valid_indices` (stages[i] <->
+            # valid_indices[i]), not indexed by the raw window index, so we
+            # must look it up by position (i), not by w_idx itself.
+            for i, w_idx in enumerate(valid_indices):
+                self.samples.append((npy_path, w_idx, label, subject_id, stages[i]))
                 total_valid_slices += 1
 
         filter_info = f" [Filter Stage: {','.join(sorted(self.filter_stage))}]" if self.filter_stage else ""
