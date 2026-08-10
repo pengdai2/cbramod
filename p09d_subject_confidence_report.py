@@ -2,8 +2,7 @@
 p09d_subject_confidence_report.py
 
 Post-processes a `subject_predictions_<strategy>.csv` export written by
-p09_clinical_inference.py's analyze_subject_results() (columns: subject_id,
-ground_truth, pooled_score, prediction) to surface:
+p09_clinical_inference.py's analyze_subject_results() to surface:
 
   1. Misclassified subjects, tagged FP (ground_truth=0, prediction=1) or
      FN (ground_truth=1, prediction=0).
@@ -11,21 +10,21 @@ ground_truth, pooled_score, prediction) to surface:
   3. The correctly classified P and N subject(s) with the LOWEST confidence
      (i.e. the most borderline correct calls).
 
-"Confidence" is defined as |pooled_score - threshold|: distance from the
-actual decision boundary, rather than assuming pooled_score is a calibrated
-probability centered at 0.5. Pass --threshold matching the "Checkpoint
-Threshold" (or whichever threshold was actually used) that p09_clinical_inference.py
-printed when it produced this CSV, so ranking reflects the real boundary
-the "prediction" column was computed against -- if the threshold used here
-doesn't match, "is_correct"/"outcome" (derived straight from the CSV's own
-ground_truth/prediction columns) stay correct, but "confidence" will be
-computed relative to a boundary that isn't the one that actually produced
-"prediction", making the ranking misleading.
+For binary-classification runs, analyze_subject_results() now bakes an
+"outcome" (TP/TN/FP/FN) and "confidence" (|pooled_score - eval_t|, using the
+exact decision threshold that produced the "prediction" column) column
+directly into the CSV -- this script uses those columns when present, since
+they're guaranteed consistent with "prediction" (no risk of a mismatched
+threshold skewing the ranking). For older CSVs exported before that change
+(missing "outcome"/"confidence"), it falls back to deriving them here from
+--threshold, which you should then set to whatever "Checkpoint Threshold"
+p09_clinical_inference.py printed for that strategy at the time.
 
 Usage:
   python p09d_subject_confidence_report.py --csv subject_predictions_p85_score.csv
-  python p09d_subject_confidence_report.py --csv subject_predictions_p85_score.csv --threshold 0.42
   python p09d_subject_confidence_report.py --csv subject_predictions_p85_score.csv --top-n 5 --output-csv annotated.csv
+  # Older CSV missing outcome/confidence columns:
+  python p09d_subject_confidence_report.py --csv old_subject_predictions.csv --threshold 0.42
 """
 
 import argparse
@@ -42,10 +41,10 @@ def parse_cli_args() -> argparse.Namespace:
     parser.add_argument("--csv", type=str, required=True, help="Path to subject_predictions_<strategy>.csv")
     parser.add_argument(
         "--threshold", type=float, default=0.5,
-        help="Decision threshold that produced this CSV's 'prediction' column (matches the "
-             "'Checkpoint Threshold' p09_clinical_inference.py printed for this strategy). "
-             "Used only to rank confidence as distance from the boundary; default 0.5 matches "
-             "p09_clinical_inference.py's own fallback when no checkpoint threshold is found."
+        help="Fallback decision threshold, only used to derive outcome/confidence when the CSV "
+             "predates analyze_subject_results() baking them in directly. Should match the "
+             "'Checkpoint Threshold' p09_clinical_inference.py printed for this strategy at the "
+             "time; ignored (with a notice) if the CSV already has outcome/confidence columns."
     )
     parser.add_argument(
         "--top-n", type=int, default=1,
@@ -59,21 +58,17 @@ def parse_cli_args() -> argparse.Namespace:
 
 
 def annotate(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
-    """Tags each row TP/TN/FP/FN and computes confidence as distance from the decision threshold."""
+    """Derives outcome (TP/TN/FP/FN) and confidence (distance from threshold), for CSVs that don't already have them."""
     df = df.copy()
     df["ground_truth"] = df["ground_truth"].astype(int)
     df["prediction"] = df["prediction"].astype(int)
     df["pooled_score"] = df["pooled_score"].astype(float)
 
     is_correct = df["ground_truth"] == df["prediction"]
-    outcomes = []
-    for gt, pred, correct in zip(df["ground_truth"], df["prediction"], is_correct):
-        if correct:
-            outcomes.append("TP" if gt == 1 else "TN")
-        else:
-            outcomes.append("FP" if pred == 1 else "FN")
-    df["outcome"] = outcomes
-    df["is_correct"] = is_correct
+    df["outcome"] = [
+        ("TP" if gt == 1 else "TN") if correct else ("FP" if pred == 1 else "FN")
+        for gt, pred, correct in zip(df["ground_truth"], df["prediction"], is_correct)
+    ]
     df["confidence"] = (df["pooled_score"] - threshold).abs()
     return df
 
@@ -133,7 +128,16 @@ def main():
             "Multi-class exports store pooled_score as a per-class list and aren't supported here."
         )
 
-    df = annotate(df, args.threshold)
+    if {"outcome", "confidence"}.issubset(df.columns):
+        print(f"Using outcome/confidence columns already baked into '{csv_path}' by p09_clinical_inference.py.")
+    else:
+        print(
+            f"'{csv_path}' predates baked-in outcome/confidence columns -- deriving them here from "
+            f"--threshold={args.threshold}. Make sure this matches the checkpoint threshold that "
+            f"actually produced the 'prediction' column, or the confidence ranking will be off."
+        )
+        df = annotate(df, args.threshold)
+
     report(df, args.top_n)
 
     if args.output_csv:

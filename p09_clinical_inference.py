@@ -286,6 +286,19 @@ def analyze_subject_results(
                 "pooled_score": export_scores,
                 "prediction": export_preds
             })
+
+            if num_classes == 2:
+                # Bake in outcome (TP/TN/FP/FN) and confidence (distance from the
+                # decision threshold that actually produced "prediction" above) so
+                # downstream analysis (e.g. p09d_subject_confidence_report.py)
+                # doesn't have to guess/re-supply eval_t and risk it not matching.
+                is_correct = ground_truths == export_preds
+                df_out["outcome"] = [
+                    ("TP" if gt == 1 else "TN") if correct else ("FP" if pred == 1 else "FN")
+                    for gt, pred, correct in zip(ground_truths, export_preds, is_correct)
+                ]
+                df_out["confidence"] = np.abs(scores_arr - eval_t)
+
             df_out.to_csv(csv_path, index=False)
             print(f"  └─ Exported Subject Predictions -> {csv_path}")
 
