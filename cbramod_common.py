@@ -862,6 +862,7 @@ def setup_common_cli_parser(parser: argparse.ArgumentParser) -> None:
     cbra_group.add_argument("--head-type", type=str, choices=["linear", "mlp"], default="mlp", help="Classification head architecture: 'linear' (1-layer) or 'mlp' (2-layer)")
     cbra_group.add_argument("--head-dim", type=int, default=128, help="Head dimension for 2 layer MLP")
     cbra_group.add_argument("--num-classes", type=int, default=2, help="Number of target classes")
+    cbra_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
 
     # Data and Filtering Controls
     data_group = parser.add_argument_group("Data and Filtering")
@@ -913,7 +914,6 @@ def setup_training_cli_parser(
     hp_group.add_argument("--head-lr", type=float, default=1e-4, help="Initial learning rate for classification head")
     hp_group.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate for Cosine Annealing scheduler")
     hp_group.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay regularizer")
-    hp_group.add_argument("--dropout", type=float, default=0.3, help="Dropout probability in head")
     hp_group.add_argument("--patience", type=int, default=10, help="Early stopping patience (epochs without Subject F1 improvement)")
     hp_group.add_argument(
         "--imbalance-strategy",
