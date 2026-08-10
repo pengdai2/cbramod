@@ -26,6 +26,17 @@ from cbramod_utils import seed_everything
 
 
 class SubjectEEGInspector:
+    # Single source of truth for tier names + their plot style. Both
+    # identify_priority_windows() (which produces these keys) and
+    # plot_subject_eeg_diagnostics() (which looks styles up by key) iterate
+    # this same mapping, so the two can't drift out of sync.
+    TIER_STYLES: Dict[str, Dict] = {
+        "Tier 1: Top Drivers": {"color": "#D62728", "marker": "*", "size": 130, "label": "Tier 1: Top Driver"},
+        "Tier 2: Borderline":  {"color": "#9467BD", "marker": "D", "size": 70,  "label": "Tier 2: Borderline"},
+        "Tier 3: Spikes":      {"color": "#FF7F0E", "marker": "^", "size": 90,  "label": "Tier 3: Temporal Spike"},
+        "Tier 4: Baselines":   {"color": "#2CA02C", "marker": "s", "size": 70,  "label": "Tier 4: Baseline Control"},
+    }
+
     def __init__(self, model: nn.Module, device: torch.device, threshold: float = 0.66):
         self.model = model.to(device).eval()
         self.device = device
@@ -68,18 +79,62 @@ class SubjectEEGInspector:
             "pooling_strategy": pooling_strategy
         }
 
+    @staticmethod
+    def _window_record(f_idx: int, probs: np.ndarray, raw_indices, stages: List[str], window_sec: float) -> Dict:
+        """Builds the single per-window record shape shared by all tiers."""
+        return {
+            "filtered_index": int(f_idx),
+            "raw_epoch_index": int(raw_indices[f_idx]),
+            "probability": float(probs[f_idx]),
+            "stage": stages[f_idx] if f_idx < len(stages) else "UNKNOWN",
+            "start_time_sec": float(raw_indices[f_idx] * window_sec)
+        }
+
+    def _select_tier(
+        self,
+        candidate_order: np.ndarray,
+        assigned_indices: set,
+        top_k_per_tier: int,
+        probs: np.ndarray,
+        raw_indices,
+        stages: List[str],
+        window_sec: float,
+        stop_predicate=None
+    ) -> List[Dict]:
+        """
+        Walks `candidate_order` (indices already sorted by tier priority),
+        skipping windows already claimed by an earlier tier, until either
+        `top_k_per_tier` windows are collected or `stop_predicate` says stop.
+        """
+        selected: List[Dict] = []
+        for f_idx in candidate_order:
+            if f_idx in assigned_indices:
+                continue
+            if stop_predicate is not None and stop_predicate(f_idx):
+                break
+            if len(selected) >= top_k_per_tier:
+                break
+            selected.append(self._window_record(f_idx, probs, raw_indices, stages, window_sec))
+            assigned_indices.add(f_idx)
+        return selected
+
     def identify_priority_windows(
         self,
         report: Dict,
         top_k_per_tier: int = 3,
         window_sec: float = 30.0
-    ) -> Dict[str, List[Dict]]:
+    ) -> Tuple[Dict[str, List[Dict]], np.ndarray]:
         """
         Identifies target windows across 4 sampling tiers:
           - Tier 1: Top Driver Anchors (Highest probability windows)
           - Tier 2: Borderline Windows (Probability closest to operating threshold)
           - Tier 3: Temporal Spikes (Local probability peaks/outliers vs. neighbors)
           - Tier 4: Clean Baselines (Lowest probability windows)
+
+        Returns a tuple of (tier_assignments, rank_order), where rank_order is
+        the full probability-descending index order used for Tier 1 — callers
+        that also need a probability ranking (e.g. the scree plot) should reuse
+        it instead of re-sorting `window_probs` themselves.
         """
         probs = report["window_probs"]
         stages = report["stages"]
@@ -87,97 +142,65 @@ class SubjectEEGInspector:
         n_windows = len(probs)
 
         if n_windows == 0:
-            return {}
+            return {}, np.array([], dtype=int)
 
-        tier_assignments: Dict[str, List[Dict]] = {
-            "Tier 1: Top Drivers": [],
-            "Tier 2: Borderline": [],
-            "Tier 3: Spikes": [],
-            "Tier 4: Baselines": []
-        }
-
-        # Track assigned filtered indices to avoid duplication across tiers
         assigned_indices = set()
+        rank_order = np.argsort(probs)[::-1]  # Highest to lowest probability
 
-        # --- Tier 1: Top Drivers (Highest Probs) ---
-        sorted_top_f_indices = np.argsort(probs)[::-1]
-        for f_idx in sorted_top_f_indices:
-            if len(tier_assignments["Tier 1: Top Drivers"]) >= top_k_per_tier:
-                break
-            tier_assignments["Tier 1: Top Drivers"].append({
-                "filtered_index": int(f_idx),
-                "raw_epoch_index": int(raw_indices[f_idx]),
-                "probability": float(probs[f_idx]),
-                "stage": stages[f_idx] if f_idx < len(stages) else "UNKNOWN",
-                "start_time_sec": float(raw_indices[f_idx] * window_sec)
-            })
-            assigned_indices.add(f_idx)
-
-        # --- Tier 2: Borderline Windows (Closest to Threshold) ---
         thresh_diffs = np.abs(probs - self.threshold)
-        sorted_border_f_indices = np.argsort(thresh_diffs)
-        for f_idx in sorted_border_f_indices:
-            if f_idx in assigned_indices:
-                continue
-            if len(tier_assignments["Tier 2: Borderline"]) >= top_k_per_tier:
-                break
-            tier_assignments["Tier 2: Borderline"].append({
-                "filtered_index": int(f_idx),
-                "raw_epoch_index": int(raw_indices[f_idx]),
-                "probability": float(probs[f_idx]),
-                "stage": stages[f_idx] if f_idx < len(stages) else "UNKNOWN",
-                "start_time_sec": float(raw_indices[f_idx] * window_sec)
-            })
-            assigned_indices.add(f_idx)
+        border_order = np.argsort(thresh_diffs)
 
-        # --- Tier 3: Temporal Spikes (Local Peak Prominence) ---
         spike_scores = np.zeros(n_windows)
         for i in range(1, n_windows - 1):
             neighbor_avg = (probs[i - 1] + probs[i + 1]) / 2.0
             spike_scores[i] = probs[i] - neighbor_avg
+        spike_order = np.argsort(spike_scores)[::-1]
 
-        sorted_spike_f_indices = np.argsort(spike_scores)[::-1]
-        for f_idx in sorted_spike_f_indices:
-            if f_idx in assigned_indices:
-                continue
-            if spike_scores[f_idx] <= 0:  # Must be a positive local spike
-                break
-            if len(tier_assignments["Tier 3: Spikes"]) >= top_k_per_tier:
-                break
-            tier_assignments["Tier 3: Spikes"].append({
-                "filtered_index": int(f_idx),
-                "raw_epoch_index": int(raw_indices[f_idx]),
-                "probability": float(probs[f_idx]),
-                "stage": stages[f_idx] if f_idx < len(stages) else "UNKNOWN",
-                "start_time_sec": float(raw_indices[f_idx] * window_sec)
-            })
-            assigned_indices.add(f_idx)
+        # Candidate order (+ optional stop predicate) per tier, positional against
+        # TIER_STYLES so tier names live in exactly one place (TIER_STYLES).
+        tier_candidates = [
+            (rank_order, None),                                             # Tier 1: Top Drivers
+            (border_order, None),                                           # Tier 2: Borderline
+            (spike_order, lambda f_idx: spike_scores[f_idx] <= 0),          # Tier 3: Spikes (must be a positive local spike)
+            (rank_order[::-1], None),                                       # Tier 4: Baselines (lowest to highest probability)
+        ]
 
-        # --- Tier 4: Clean Baselines (Lowest Probs) ---
-        sorted_low_f_indices = np.argsort(probs)
-        for f_idx in sorted_low_f_indices:
-            if f_idx in assigned_indices:
-                continue
-            if len(tier_assignments["Tier 4: Baselines"]) >= top_k_per_tier:
-                break
-            tier_assignments["Tier 4: Baselines"].append({
-                "filtered_index": int(f_idx),
-                "raw_epoch_index": int(raw_indices[f_idx]),
-                "probability": float(probs[f_idx]),
-                "stage": stages[f_idx] if f_idx < len(stages) else "UNKNOWN",
-                "start_time_sec": float(raw_indices[f_idx] * window_sec)
-            })
-            assigned_indices.add(f_idx)
+        tier_assignments = {
+            tier_name: self._select_tier(
+                candidate_order, assigned_indices, top_k_per_tier, probs, raw_indices, stages, window_sec,
+                stop_predicate=stop_predicate
+            )
+            for tier_name, (candidate_order, stop_predicate) in zip(self.TIER_STYLES.keys(), tier_candidates)
+        }
 
-        return tier_assignments
+        return tier_assignments, rank_order
 
     def plot_subject_eeg_diagnostics(
         self,
         report: Dict,
         priority_windows: Optional[Dict[str, List[Dict]]] = None,
+        rank_order: Optional[np.ndarray] = None,
         figsize: Tuple[int, int] = (16, 12),
         save_path: Optional[Path] = None
     ) -> plt.Figure:
+        """
+        Generates 4-Panel EEG Diagnostic Dashboard:
+        - Panel 1: Hypnogram / Epoch Stage Timeline
+        - Panel 2: Epoch Probability Sequence, with priority-tier scatter overlay
+        - Panel 3: Probability Density (KDE/Hist), with priority-tier scatter overlay
+        - Panel 4: Sorted Epoch Profile (Scree Plot), with priority-tier scatter overlay
+
+        Args:
+            report: Output of `SubjectEEGInspector.inspect_subject`.
+            priority_windows: Tier-name -> list-of-window-record dict, as
+                returned by `identify_priority_windows`. Tier names must be
+                keys of `TIER_STYLES`. If omitted, no tier markers are drawn.
+            rank_order: Probability-descending index order over
+                `report["window_probs"]`, as returned by
+                `identify_priority_windows`. Pass this through when available
+                to avoid re-sorting `window_probs` for the Panel 4 scree plot;
+                if omitted, it is computed here.
+        """
         window_probs = report["window_probs"]
         stages = report["stages"]
         score = report["pooled_score"]
@@ -196,14 +219,7 @@ class SubjectEEGInspector:
 
         n_epochs = len(window_probs)
         epoch_indices = np.arange(n_epochs)
-
-        # Style Configuration for Tiers
-        tier_style = {
-            "Tier 1: Top Drivers": {"color": "#D62728", "marker": "*", "size": 130, "label": "Tier 1: Top Driver"},
-            "Tier 2: Borderline":  {"color": "#9467BD", "marker": "D", "size": 70,  "label": "Tier 2: Borderline"},
-            "Tier 3: Spikes":      {"color": "#FF7F0E", "marker": "^", "size": 90,  "label": "Tier 3: Temporal Spike"},
-            "Tier 4: Baselines":   {"color": "#2CA02C", "marker": "s", "size": 70,  "label": "Tier 4: Baseline Control"}
-        }
+        tier_style = self.TIER_STYLES
 
         # -------------------------------------------------------------------------
         # Panel 1: Hypnogram (Epoch Sleep Stages)
@@ -282,7 +298,9 @@ class SubjectEEGInspector:
         # -------------------------------------------------------------------------
         # Panel 4: Sorted Epoch Profile (Scree Plot) with Tier Overlays
         # -------------------------------------------------------------------------
-        sort_perm = np.argsort(window_probs)[::-1]  # High to Low sorting
+        # Reuse the rank order identify_priority_windows already computed (when
+        # given) instead of re-sorting window_probs a second time.
+        sort_perm = rank_order if rank_order is not None else np.argsort(window_probs)[::-1]  # High to Low sorting
         sorted_probs = window_probs[sort_perm]
         ranks = np.arange(1, n_epochs + 1)
 
@@ -347,7 +365,7 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # 1. Instantiate Model Architecture
-    if args.test_features_pt:
+    if args.features_pt:
         print("Instantiating isolated Probe Head for cached feature inference.")
         if args.head_type == "linear":
             model = LinearProbeHead(
@@ -389,15 +407,15 @@ def main():
     inspector = SubjectEEGInspector(model=model, device=device, threshold=threshold)
 
     # 3. Load dataset
-    if args.test_features_pt:
-        dataset = CachedFeatureSubjectDataset(args.test_features_pt, subject_id=args.subject_id)
+    if args.features_pt:
+        dataset = CachedFeatureSubjectDataset(args.features_pt, filter_subject=args.subject_id)
         print(f"Loaded cached features for {len(dataset)} subjects.")
     else:
         dataset = PANSubjectEEGDataset(
-            manifest_csv=args.test_manifest,
+            manifest_csv=args.manifest,
             data_dir=args.data_dir,
             filter_stage=args.filter_stage,
-            subject_id=args.subject_id,
+            filter_subject=args.subject_id,
             memory_map=True
         )
         print(f"Loaded raw EEG recording dataset for {len(dataset)} subjects.")
@@ -420,11 +438,13 @@ def main():
         )
 
         # 1) Extract all 4 tiers of target windows
-        priority_windows = inspector.identify_priority_windows(report, top_k_per_tier=3)
+        priority_windows, rank_order = inspector.identify_priority_windows(report, top_k_per_tier=3)
 
         # 2) Save diagnostic plot with distinctive tier markers
         save_path = output_dir / f"{subj_id}_diagnostic.png"
-        inspector.plot_subject_eeg_diagnostics(report, priority_windows=priority_windows, save_path=save_path)
+        inspector.plot_subject_eeg_diagnostics(
+            report, priority_windows=priority_windows, rank_order=rank_order, save_path=save_path
+        )
 
         # 3) Save priority windows to JSON for downstream attribution pipeline
         json_path = output_dir / f"{subj_id}_priority_windows.json"
