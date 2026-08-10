@@ -132,6 +132,44 @@ def compute_multi_granularity_attributions(
     return signal_attr, patch_attr, channel_attr
 
 
+# -----------------------------------------------------------------------------
+# Channel concentration: is this a focal or a distributed attribution?
+# -----------------------------------------------------------------------------
+
+def _gini_coefficient(values: np.ndarray) -> float:
+    """
+    Gini coefficient of a nonnegative array: 0.0 means attribution is spread
+    perfectly evenly across channels, 1.0 means it is concentrated entirely
+    in a single channel. Used as a cheap, threshold-able stand-in for
+    "is there a clear winning channel, or several channels driving this
+    together?" without requiring a human to eyeball the bar chart.
+    """
+    x = np.sort(np.abs(np.asarray(values, dtype=np.float64)))
+    n = len(x)
+    total = x.sum()
+    if n == 0 or total == 0:
+        return 0.0
+    cum = np.cumsum(x)
+    return float((n + 1 - 2 * np.sum(cum) / cum[-1]) / n)
+
+
+def compute_channel_concentration(
+    channel_attr: np.ndarray,
+    top_k: int = 3
+) -> Tuple[float, np.ndarray, np.ndarray]:
+    """
+    Summarizes `channel_attr` [Channels] into:
+      - gini: concentration coefficient (see `_gini_coefficient`)
+      - top_k_idx: indices of the top_k channels by attribution magnitude,
+        descending
+      - top_k_scores: their corresponding attribution scores
+    """
+    top_k = min(top_k, len(channel_attr))
+    order = np.argsort(channel_attr)[::-1]
+    top_k_idx = order[:top_k]
+    return _gini_coefficient(channel_attr), top_k_idx, channel_attr[top_k_idx]
+
+
 def plot_attribution_dashboard(
     raw_eeg: np.ndarray,
     signal_attr: np.ndarray,
@@ -139,37 +177,65 @@ def plot_attribution_dashboard(
     channel_attr: np.ndarray,
     output_path: Path,
     target_channel_idx: Optional[int] = None,
-    sfreq: float = 200.0
+    sfreq: float = 200.0,
+    concentration_threshold: float = 0.5,
+    top_k_channels: int = 3,
+    gini: Optional[float] = None,
+    top_k_idx: Optional[np.ndarray] = None
 ):
     """
     Generates a visual diagnostic dashboard comparing raw EEG signals,
     signal-level saliency, and CBraMod patch grid importance.
+
+    Panel 1 adapts to whether attribution is focal or distributed: when the
+    channel-attribution Gini coefficient is at or above
+    `concentration_threshold`, a single dominant channel drives the
+    prediction and is plotted alone (as before). Below that threshold, no
+    single channel "wins" clearly, so the top `top_k_channels` channels are
+    overlaid together instead of picking one arbitrarily.
+
+    `gini`/`top_k_idx` can be passed in pre-computed (e.g. from `main()`, which
+    already needs them for logging/export) to avoid recomputing; if omitted
+    they're derived here from `channel_attr`.
     """
     time_axis = np.arange(raw_eeg.shape[1]) / sfreq
     num_channels, num_patches = patch_attr.shape
 
-    # Default to the most-attributed channel rather than an arbitrary fixed
-    # index, so Panel 1 always shows the channel that actually drove this
-    # window's prediction. Callers can still pin a specific channel via
-    # `target_channel_idx` (e.g. to compare the same channel across windows).
-    if target_channel_idx is None:
-        target_channel_idx = int(np.argmax(channel_attr))
+    if gini is None or top_k_idx is None:
+        gini, top_k_idx, _ = compute_channel_concentration(channel_attr, top_k=top_k_channels)
+    is_focal = gini >= concentration_threshold
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 9), gridspec_kw={'height_ratios': [1, 1, 1.2]})
 
     # --- Panel 1: Raw EEG Trace with Overlay Signal Attribution ---
-    eeg_signal = raw_eeg[target_channel_idx]
-    attr_signal = signal_attr[target_channel_idx]
+    if target_channel_idx is not None:
+        # Explicit user override always wins, regardless of concentration.
+        plot_channels = [target_channel_idx]
+    elif is_focal:
+        plot_channels = [int(top_k_idx[0])]
+    else:
+        plot_channels = [int(c) for c in top_k_idx]
 
-    axes[0].plot(time_axis, eeg_signal, color='black', alpha=0.6, label=f'Raw EEG (Ch {target_channel_idx})')
-    # Overlay positive attribution as red highlights
-    pos_attr = np.maximum(0, attr_signal)
-    if pos_attr.max() > 0:
-        pos_attr_norm = pos_attr / pos_attr.max() * np.abs(eeg_signal).max()
-        axes[0].fill_between(time_axis, 0, pos_attr_norm, color='red', alpha=0.4, label='Positive Attribution')
+    colors = plt.cm.tab10(np.linspace(0, 1, max(len(plot_channels), 2)))
+    for i, ch in enumerate(plot_channels):
+        eeg_signal = raw_eeg[ch]
+        attr_signal = signal_attr[ch]
+        color = colors[i]
+
+        axes[0].plot(time_axis, eeg_signal, color=color, alpha=0.7, label=f'Raw EEG (Ch {ch})')
+        pos_attr = np.maximum(0, attr_signal)
+        if pos_attr.max() > 0:
+            pos_attr_norm = pos_attr / pos_attr.max() * np.abs(eeg_signal).max()
+            axes[0].fill_between(time_axis, 0, pos_attr_norm, color=color, alpha=0.25)
 
     axes[0].set_ylabel('Amplitude (µV)')
-    axes[0].set_title(f'Signal-Level Attribution (Channel {target_channel_idx}, Highest Attribution)')
+    if target_channel_idx is not None:
+        title = f'Signal-Level Attribution (Channel {target_channel_idx}, User-Selected)'
+    elif is_focal:
+        title = f'Signal-Level Attribution (Channel {plot_channels[0]}, Highest Attribution, Gini={gini:.2f})'
+    else:
+        title = f'Signal-Level Attribution (Top {len(plot_channels)} Channels, No Clear Winner, Gini={gini:.2f})'
+    axes[0].set_title(title)
     axes[0].legend(loc='upper right')
     axes[0].grid(True, linestyle=':', alpha=0.6)
 
@@ -343,7 +409,18 @@ def parse_cli_args() -> argparse.Namespace:
     )
     attr_group.add_argument(
         "--target-channel-idx", type=int, default=None,
-        help="EEG channel to plot in Panel 1 of the dashboard. Default: the channel with the highest attribution magnitude."
+        help="EEG channel to plot in Panel 1 of the dashboard. Overrides automatic focal/distributed "
+             "channel selection below."
+    )
+    attr_group.add_argument(
+        "--concentration-threshold", type=float, default=0.5,
+        help="Gini coefficient (0-1) on channel-level attribution above which a window is treated as "
+             "'focal' (one dominant channel, plotted alone). Below this, no single channel clearly wins, "
+             "so --top-k-channels channels are overlaid together in Panel 1 instead."
+    )
+    attr_group.add_argument(
+        "--top-k-channels", type=int, default=3,
+        help="Number of channels to overlay in Panel 1 when attribution is distributed rather than focal."
     )
 
     args = parser.parse_args()
@@ -424,13 +501,31 @@ def main():
 
             stem = f"{subject_id}_w{raw_idx}_{tier_tag}"
 
+            gini, top_k_idx, top_k_scores = compute_channel_concentration(
+                channel_attr, top_k=args.top_k_channels
+            )
+            is_focal = gini >= args.concentration_threshold
+            verdict = "focal (clear winner)" if is_focal else "distributed (no clear winner)"
+            print(
+                f"  Channel concentration: Gini={gini:.3f} -> {verdict} "
+                f"[threshold={args.concentration_threshold}]"
+            )
+            print(
+                f"  Top {len(top_k_idx)} channels: "
+                + ", ".join(f"ch{int(c)}={s:.4g}" for c, s in zip(top_k_idx, top_k_scores))
+            )
+
             save_path = output_dir / f"{stem}_multi_granularity_attr.npz"
             np.savez_compressed(
                 save_path,
                 signal_attribution=signal_attr,  # [C, T]
                 patch_attribution=patch_attr,    # [C, num_patches]
                 channel_attribution=channel_attr,  # [C]
-                raw_eeg=window_sample.squeeze(0)
+                raw_eeg=window_sample.squeeze(0),
+                channel_gini=gini,
+                top_k_channel_indices=top_k_idx,
+                top_k_channel_scores=top_k_scores,
+                is_focal=is_focal
             )
             print(f"Attribution dataset exported to {save_path}")
 
@@ -442,7 +537,11 @@ def main():
                 channel_attr=channel_attr,
                 output_path=plot_path,
                 target_channel_idx=args.target_channel_idx,
-                sfreq=args.sfreq
+                sfreq=args.sfreq,
+                concentration_threshold=args.concentration_threshold,
+                top_k_channels=args.top_k_channels,
+                gini=gini,
+                top_k_idx=top_k_idx
             )
 
 
