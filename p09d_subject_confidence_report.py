@@ -20,15 +20,24 @@ threshold skewing the ranking). For older CSVs exported before that change
 --threshold, which you should then set to whatever "Checkpoint Threshold"
 p09_clinical_inference.py printed for that strategy at the time.
 
+--output-json writes the same misclassified/highest/lowest selections as
+structured JSON (schema documented on build_report_dict below) --
+p09c_clinical_subject_diagnostics.py can consume this file directly via
+--subjects-json to run detailed per-window diagnostics on exactly the
+subjects flagged here.
+
 Usage:
   python p09d_subject_confidence_report.py --csv subject_predictions_p85_score.csv
   python p09d_subject_confidence_report.py --csv subject_predictions_p85_score.csv --top-n 5 --output-csv annotated.csv
+  python p09d_subject_confidence_report.py --csv subject_predictions_p85_score.csv --output-json report.json
   # Older CSV missing outcome/confidence columns:
   python p09d_subject_confidence_report.py --csv old_subject_predictions.csv --threshold 0.42
 """
 
 import argparse
+import json
 from pathlib import Path
+from typing import Dict, List
 
 import pandas as pd
 
@@ -54,6 +63,11 @@ def parse_cli_args() -> argparse.Namespace:
         "--output-csv", type=str, default=None,
         help="Optional path to save the full table annotated with outcome/confidence columns."
     )
+    parser.add_argument(
+        "--output-json", type=str, default=None,
+        help="Optional path to save the misclassified/highest/lowest-confidence selections as structured JSON "
+             "(see build_report_dict). Consumable by p09c_clinical_subject_diagnostics.py's --subjects-json."
+    )
     return parser.parse_args()
 
 
@@ -73,42 +87,90 @@ def annotate(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
     return df
 
 
+def _row_dict(row: pd.Series) -> Dict:
+    return {
+        "subject_id": row["subject_id"],
+        "ground_truth": int(row["ground_truth"]),
+        "prediction": int(row["prediction"]),
+        "pooled_score": float(row["pooled_score"]),
+        "outcome": row["outcome"],
+        "confidence": float(row["confidence"])
+    }
+
+
+def build_report_dict(df: pd.DataFrame, top_n: int, source_csv: str) -> Dict:
+    """
+    Builds the single source of truth for both the console report and
+    --output-json, so the two can never drift out of sync. Schema:
+
+      {
+        "source_csv": str,
+        "top_n": int,
+        "misclassified": [{subject_id, ground_truth, prediction, pooled_score, outcome, confidence}, ...],
+        "highest_confidence": {"P": [...], "N": [...]},
+        "lowest_confidence": {"P": [...], "N": [...]}
+      }
+
+    "misclassified" is sorted by descending confidence (most confidently
+    wrong first). "highest_confidence"/"lowest_confidence" each hold up to
+    top_n subjects per class, sorted so the most extreme (highest, or lowest
+    respectively) confidence comes first.
+    """
+    misclassified = df[df["outcome"].isin(["FP", "FN"])].sort_values("confidence", ascending=False)
+
+    result = {
+        "source_csv": source_csv,
+        "top_n": top_n,
+        "misclassified": [_row_dict(r) for _, r in misclassified.iterrows()],
+        "highest_confidence": {},
+        "lowest_confidence": {}
+    }
+
+    for class_label, outcome_tag in [("P", "TP"), ("N", "TN")]:
+        correct = df[df["outcome"] == outcome_tag].sort_values("confidence", ascending=False)
+        result["highest_confidence"][class_label] = [_row_dict(r) for _, r in correct.head(top_n).iterrows()]
+        result["lowest_confidence"][class_label] = [
+            _row_dict(r) for _, r in correct.tail(top_n).sort_values("confidence").iterrows()
+        ]
+
+    return result
+
+
 def print_section(title: str) -> None:
     print("\n" + "=" * 88)
     print(title)
     print("=" * 88)
 
 
-def report(df: pd.DataFrame, top_n: int) -> None:
-    # 1. Misclassified subjects (FP/FN)
-    misclassified = df[df["outcome"].isin(["FP", "FN"])].sort_values("confidence", ascending=False)
+def print_report(report_dict: Dict) -> None:
+    misclassified = report_dict["misclassified"]
     print_section(f"1) MISCLASSIFIED SUBJECTS ({len(misclassified)} total)")
-    if misclassified.empty:
+    if not misclassified:
         print("  (none)")
     else:
-        for _, row in misclassified.iterrows():
+        for r in misclassified:
             print(
-                f"  [{row['outcome']}] {row['subject_id']}: pooled_score={row['pooled_score']:.4f}, "
-                f"ground_truth={row['ground_truth']}, prediction={row['prediction']}"
+                f"  [{r['outcome']}] {r['subject_id']}: pooled_score={r['pooled_score']:.4f}, "
+                f"ground_truth={r['ground_truth']}, prediction={r['prediction']}"
             )
 
-    # 2 & 3. Highest/lowest confidence correctly-classified subjects, per class
-    for class_label, outcome_tag in [("P", "TP"), ("N", "TN")]:
-        correct = df[df["outcome"] == outcome_tag].sort_values("confidence", ascending=False)
-
+    top_n = report_dict["top_n"]
+    for class_label in ("P", "N"):
         print_section(f"2) HIGHEST-CONFIDENCE CORRECT [{class_label}] SUBJECTS (top {top_n})")
-        if correct.empty:
+        highest = report_dict["highest_confidence"][class_label]
+        if not highest:
             print("  (none)")
         else:
-            for _, row in correct.head(top_n).iterrows():
-                print(f"  {row['subject_id']}: pooled_score={row['pooled_score']:.4f}, confidence={row['confidence']:.4f}")
+            for r in highest:
+                print(f"  {r['subject_id']}: pooled_score={r['pooled_score']:.4f}, confidence={r['confidence']:.4f}")
 
         print_section(f"3) LOWEST-CONFIDENCE CORRECT [{class_label}] SUBJECTS (top {top_n}, most borderline)")
-        if correct.empty:
+        lowest = report_dict["lowest_confidence"][class_label]
+        if not lowest:
             print("  (none)")
         else:
-            for _, row in correct.tail(top_n).sort_values("confidence").iterrows():
-                print(f"  {row['subject_id']}: pooled_score={row['pooled_score']:.4f}, confidence={row['confidence']:.4f}")
+            for r in lowest:
+                print(f"  {r['subject_id']}: pooled_score={r['pooled_score']:.4f}, confidence={r['confidence']:.4f}")
 
 
 def main():
@@ -138,12 +200,19 @@ def main():
         )
         df = annotate(df, args.threshold)
 
-    report(df, args.top_n)
+    report_dict = build_report_dict(df, args.top_n, source_csv=str(csv_path))
+    print_report(report_dict)
 
     if args.output_csv:
         out_path = Path(args.output_csv)
         df.to_csv(out_path, index=False)
         print(f"\nFull annotated table saved to: {out_path}")
+
+    if args.output_json:
+        json_path = Path(args.output_json)
+        with open(json_path, "w") as f:
+            json.dump(report_dict, f, indent=2)
+        print(f"Structured report saved to: {json_path}")
 
 
 if __name__ == "__main__":

@@ -356,8 +356,42 @@ class SubjectEEGInspector:
 # Main Execution Loop
 # -----------------------------------------------------------------------------
 
+def load_subject_ids_from_json(json_path: Path) -> List[str]:
+    """
+    Extracts the unique subject_ids referenced anywhere in a
+    p09d_subject_confidence_report.py --output-json report (misclassified +
+    highest/lowest-confidence P/N selections), so that report can be handed
+    straight to --subjects-json to run detailed per-window diagnostics on
+    exactly the subjects it flagged.
+    """
+    with open(json_path) as f:
+        payload = json.load(f)
+
+    subject_ids: List[str] = [row["subject_id"] for row in payload.get("misclassified", [])]
+    for bucket in ("highest_confidence", "lowest_confidence"):
+        for class_rows in payload.get(bucket, {}).values():
+            subject_ids.extend(row["subject_id"] for row in class_rows)
+
+    # Dedupe while preserving first-seen order (a subject can legitimately
+    # appear in both e.g. "highest_confidence" and a later --output-json call
+    # over a different strategy's CSV, if the two were concatenated by hand).
+    seen = set()
+    unique_ids = []
+    for sid in subject_ids:
+        if sid not in seen:
+            seen.add(sid)
+            unique_ids.append(sid)
+    return unique_ids
+
+
 def parse_cli_args()-> argparse.Namespace:
     parser = setup_inference_cli_parser(description="Multi-Class Patient-Level Clinical Inference")
+    parser.add_argument(
+        "--subjects-json", type=str, default=None,
+        help="Path to a p09d_subject_confidence_report.py --output-json report. Its "
+             "misclassified/highest_confidence/lowest_confidence subject_ids are unioned with "
+             "--subject-id (if also given) to select which subjects to run diagnostics on."
+    )
     args = parser.parse_args()
     return args
 
@@ -423,16 +457,24 @@ def main():
 
     inspector = SubjectEEGInspector(model=model, device=device, threshold=threshold)
 
+    # 2c. Resolve subject filter: union of --subject-id and --subjects-json's subject_ids
+    subject_filter = [s.strip() for s in args.subject_id.split(",")] if args.subject_id else []
+    if args.subjects_json:
+        json_subject_ids = load_subject_ids_from_json(Path(args.subjects_json))
+        print(f"Loaded {len(json_subject_ids)} subject_id(s) from --subjects-json: {args.subjects_json}")
+        subject_filter = subject_filter + [sid for sid in json_subject_ids if sid not in subject_filter]
+    subject_filter = subject_filter or None
+
     # 3. Load dataset
     if args.features_pt:
-        dataset = CachedFeatureSubjectDataset(args.features_pt, filter_subject=args.subject_id)
+        dataset = CachedFeatureSubjectDataset(args.features_pt, filter_subject=subject_filter)
         print(f"Loaded cached features for {len(dataset)} subjects.")
     else:
         dataset = PANSubjectEEGDataset(
             manifest_csv=args.manifest,
             data_dir=args.data_dir,
             filter_stage=args.filter_stage,
-            filter_subject=args.subject_id,
+            filter_subject=subject_filter,
             memory_map=True
         )
         print(f"Loaded raw EEG recording dataset for {len(dataset)} subjects.")
