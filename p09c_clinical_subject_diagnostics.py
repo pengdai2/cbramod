@@ -229,7 +229,11 @@ class SubjectEEGInspector:
         # -------------------------------------------------------------------------
         # Panel 1: Hypnogram (Epoch Sleep Stages)
         # -------------------------------------------------------------------------
-        if stages and len(stages) == n_epochs:
+        # `stages` may be a numpy array (CachedFeatureSubjectDataset) or a
+        # plain list (PANSubjectEEGDataset) -- `if stages` alone raises
+        # "truth value of an array is ambiguous" for the former once it has
+        # more than one element, so check length instead of truthiness.
+        if len(stages) > 0 and len(stages) == n_epochs:
             stage_map = {"W": 4, "REM": 3, "N1": 2, "N2": 1, "N3": 0, "UNKNOWN": -1}
             num_stages = [stage_map.get(str(s).upper(), -1) for s in stages]
             ax1.step(epoch_indices, num_stages, where='mid', color='midnightblue', linewidth=1.5)
