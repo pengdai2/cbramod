@@ -309,15 +309,37 @@ class CachedFeatureSubjectDataset(Dataset):
         filter_subject: Optional[List[str]] = None
     ):
         data = torch.load(pt_path, map_location="cpu", weights_only=True)
+
+        # "stages"/"indices" should always be present -- extract_and_cache()
+        # (p08b_finetune_probing.py) writes them unconditionally. Fail loudly
+        # with an actionable message rather than silently defaulting to
+        # None/range placeholders: a cache missing this metadata means the
+        # extraction run that produced it either predates stage tracking or
+        # went through a different/broken pipeline, and callers that rely on
+        # per-window stage (e.g. p09c's tier reports) would otherwise get
+        # quietly wrong results instead of a clear signal to re-extract.
+        missing_keys = [k for k in ("stages", "indices") if k not in data]
+        if missing_keys:
+            raise KeyError(
+                f"Cached feature file '{pt_path}' is missing key(s) {missing_keys}. "
+                "extract_and_cache() always writes these alongside feats/labels/subject_ids, "
+                "so this cache was likely produced by a stale extraction run (predating stage "
+                "tracking) or a different pipeline entirely. Re-run feature extraction to "
+                "regenerate this cache rather than proceeding without stage/index metadata."
+            )
+
         self.feats = data["feats"]
         self.labels = data["labels"]
-        self.stages = data["stages"]
-        self.indices = data["indices"]
+        # Wrapped in np.array (rather than left as the plain lists that
+        # extract_and_cache() saves) so the boolean-mask indexing in
+        # __getitem__ works.
+        self.stages = np.array(data["stages"], dtype=object)
+        self.indices = np.array(data["indices"])
         self.subject_ids = np.array(data["subject_ids"])
         self.unique_subjects = np.unique(self.subject_ids)
         self.filter_subject = parse_filter(filter_subject)
         if self.filter_subject:
-            self.unique_subjects = self.unique_subjects(np.isin(self.unique_subjects, list(self.filter_subject)))
+            self.unique_subjects = self.unique_subjects[np.isin(self.unique_subjects, list(self.filter_subject))]
 
     def __len__(self) -> int:
         return len(self.unique_subjects)

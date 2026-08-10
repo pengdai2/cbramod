@@ -352,11 +352,16 @@ class ProbeTrainer(CBraModTrainer):
 
         all_feats = torch.cat([train_data["feats"], val_data["feats"]], dim=0)
         all_labels = torch.cat([train_data["labels"], val_data["labels"]], dim=0)
-    
-        # Combine subject IDs safely
-        train_sids = train_data.get("subject_ids", [])
-        val_sids = val_data.get("subject_ids", [])
-        all_subject_ids = np.array(train_sids + val_sids)
+
+        # Combine subject IDs and per-window metadata (stages/indices). These
+        # must already exist in the source caches -- extract_and_cache()
+        # writes them unconditionally -- so index directly (not .get with a
+        # silent [] default): a missing key here means the source cache was
+        # built without stage/index tracking and should be re-extracted, not
+        # silently propagated as dropped metadata into every fold cache below.
+        all_subject_ids = np.array(train_data["subject_ids"] + val_data["subject_ids"])
+        all_stages = np.array(train_data["stages"] + val_data["stages"], dtype=object)
+        all_indices = np.array(train_data["indices"] + val_data["indices"])
 
         # Build unique subject-to-label mapping for StratifiedGroupKFold
         unique_sids = np.unique(all_subject_ids)
@@ -399,13 +404,17 @@ class ProbeTrainer(CBraModTrainer):
             torch.save({
                 "feats": all_feats[train_mask],
                 "labels": all_labels[train_mask],
-                "subject_ids": all_subject_ids[train_mask].tolist()
+                "subject_ids": all_subject_ids[train_mask].tolist(),
+                "stages": all_stages[train_mask].tolist(),
+                "indices": all_indices[train_mask].tolist()
             }, fold_train_cache)
 
             torch.save({
                 "feats": all_feats[val_mask],
                 "labels": all_labels[val_mask],
-                "subject_ids": all_subject_ids[val_mask].tolist()
+                "subject_ids": all_subject_ids[val_mask].tolist(),
+                "stages": all_stages[val_mask].tolist(),
+                "indices": all_indices[val_mask].tolist()
             }, fold_val_cache)
 
             # Update checkpoint filename per fold to prevent overwriting

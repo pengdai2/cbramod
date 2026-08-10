@@ -62,13 +62,13 @@ def generate_subject_predictions(
         print(f"Loaded cached features for {len(dataset)} subjects.")
 
         for i in tqdm(range(len(dataset)), desc="Processing Subjects (Cached)"):
-            subject_id, subj_feats, label = dataset[i]
+            subj_feats, label, subject_id, _, _ = dataset[i]
             probs = infer_subject_windows(model, subj_feats, args.batch_size, device)
             yield subject_id, label, probs
 
     else:
         dataset = PANSubjectEEGDataset(
-            manifest_csv=args.test_manifest,
+            manifest_csv=args.manifest,
             data_dir=args.data_dir,
             filter_stage=args.filter_stage,
             filter_subject=args.subject_id,
