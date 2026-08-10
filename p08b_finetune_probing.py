@@ -317,6 +317,8 @@ class ProbeTrainer(CBraModTrainer):
                         "model_state_dict": head.state_dict(),
                         "best_macro_f1": best_primary_f1,
                         "primary_pooling": self.config.primary_pooling,
+                        "top_percentile": self.config.top_percentile,
+                        "t_window": self.config.t_window,
                         "optimal_thresholds": best_thresholds,
                         "pooling_summary": pooling_results
                     },

@@ -954,16 +954,31 @@ def setup_inference_cli_parser(
     subject_group.add_argument("--subject-id", type=str, default=None, help="Optional comma-separated list of specific Subject IDs to analyze (e.g., GRINS0322,GRINS0038).")
 
     # Pooling Strategy
+    # Defaults are left as None (rather than a hardcoded value) so
+    # resolve_pooling_config() can tell "user didn't pass this flag" apart
+    # from "user explicitly chose the same value the checkpoint already
+    # has" -- the former falls back to whatever pooling config was saved in
+    # the checkpoint at training time, the latter always wins.
     pool_group = parser.add_argument_group("Pooling Strategy")
     pool_group.add_argument(
         "--pooling-strategy",
         type=str,
-        default="p85_score",
+        default=None,
         choices=["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio", "all"],
-        help="Pooling strategy choice (default: 'p85_score', or 'all' for full comparative report)"
+        help="Pooling strategy choice, or 'all' for full comparative report. "
+             "Default: the primary_pooling strategy saved in the checkpoint at training time "
+             "(falls back to 'p85_score' if the checkpoint has none)."
     )
-    pool_group.add_argument("--top-percentile", type=float, default=0.10, help="Top percentile ratio (default: 0.10)")
-    pool_group.add_argument("--t-window", type=float, default=0.60, help="Window threshold for burden ratio (default: 0.60)")
+    pool_group.add_argument(
+        "--top-percentile", type=float, default=None,
+        help="Top percentile ratio for top-K pooling methods. "
+             "Default: the value saved in the checkpoint at training time (falls back to 0.10)."
+    )
+    pool_group.add_argument(
+        "--t-window", type=float, default=None,
+        help="Window threshold for burden ratio pooling. "
+             "Default: the value saved in the checkpoint at training time (falls back to 0.60)."
+    )
 
     misc_group = parser.add_argument_group("Miscellaneous")
     misc_group.add_argument("--override-threshold", type=float, default=None, help="Override operating decision threshold")
@@ -976,10 +991,18 @@ def load_model_checkpoint(
     model: torch.nn.Module,
     checkpoint_path: Path,
     device: torch.device
-) -> Tuple[torch.nn.Module, dict, Union[int, str]]:
+) -> Tuple[torch.nn.Module, dict, Union[int, str], Dict[str, Union[str, float]]]:
     """
     Loads checkpoint weights into the model architecture.
     Handles both head-only (backbone frozen / LP-FT) state dicts and full model state dicts.
+
+    Also surfaces the pooling configuration ("primary_pooling", "top_percentile",
+    "t_window") saved alongside the weights at training time, so downstream
+    inference/analysis scripts can reproduce the exact pooling that produced
+    the checkpoint's calibrated thresholds by default -- see
+    `resolve_pooling_config`. Only keys actually present in the checkpoint are
+    included, so older checkpoints saved before this field existed degrade
+    gracefully to an empty dict.
     """
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint state dict not found: {checkpoint_path}")
@@ -996,12 +1019,17 @@ def load_model_checkpoint(
 
     optimal_thresholds = checkpoint.get("optimal_thresholds", {}) if isinstance(checkpoint, dict) else {}
     epoch = checkpoint.get("epoch", "N/A") if isinstance(checkpoint, dict) else "N/A"
+    ckpt_pooling_params = {
+        key: checkpoint[key]
+        for key in ("primary_pooling", "top_percentile", "t_window")
+        if isinstance(checkpoint, dict) and key in checkpoint
+    }
 
     # Strategy 1: Attempt direct full-model state dict load (Full Fine-Tuning)
     try:
         model.load_state_dict(state_dict, strict=True)
         print(f"Successfully loaded full model checkpoint (strict=True) from epoch {epoch}.")
-        return model, optimal_thresholds, epoch
+        return model, optimal_thresholds, epoch, ckpt_pooling_params
     except Exception:
         pass
 
@@ -1015,7 +1043,7 @@ def load_model_checkpoint(
         try:
             model.head.load_state_dict(head_state_dict, strict=True)
             print(f"Successfully loaded head-only state dict into model.head from epoch {epoch}.")
-            return model, optimal_thresholds, epoch
+            return model, optimal_thresholds, epoch, ckpt_pooling_params
         except Exception:
             pass
 
@@ -1027,7 +1055,7 @@ def load_model_checkpoint(
     if unexpected_keys:
         print(f"  [Info] Unexpected keys: {len(unexpected_keys)}")
 
-    return model, optimal_thresholds, epoch
+    return model, optimal_thresholds, epoch, ckpt_pooling_params
 
 
 def get_operating_threshold(
@@ -1044,6 +1072,37 @@ def get_operating_threshold(
     else:
         operating_threshold = 0.5
     return operating_threshold
+
+
+def resolve_pooling_config(
+    pooling_strategy: Optional[str],
+    top_percentile: Optional[float],
+    t_window: Optional[float],
+    ckpt_pooling_params: Dict[str, Union[str, float]]
+) -> Tuple[str, float, float]:
+    """
+    Resolves the effective (pooling_strategy, top_percentile, t_window),
+    layering in priority order: explicit CLI flags (non-None) > the pooling
+    config saved in the checkpoint at training time > hardcoded fallback
+    defaults. Mirrors `get_operating_threshold`'s "checkpoint value unless
+    explicitly overridden" pattern, applied to the pooling config that
+    produced the checkpoint's own calibrated thresholds -- so inference and
+    analysis scripts reproduce training-time pooling by default while still
+    letting a caller deliberately try a different strategy via the CLI.
+    """
+    resolved_strategy = (
+        pooling_strategy if pooling_strategy is not None
+        else ckpt_pooling_params.get("primary_pooling", "p85_score")
+    )
+    resolved_top_percentile = (
+        top_percentile if top_percentile is not None
+        else ckpt_pooling_params.get("top_percentile", 0.10)
+    )
+    resolved_t_window = (
+        t_window if t_window is not None
+        else ckpt_pooling_params.get("t_window", 0.60)
+    )
+    return resolved_strategy, resolved_top_percentile, resolved_t_window
 
 
 def find_optimal_threshold(

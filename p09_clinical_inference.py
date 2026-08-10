@@ -23,6 +23,7 @@ from cbramod_common import (
     find_optimal_threshold,
     get_operating_threshold,
     load_model_checkpoint,
+    resolve_pooling_config,
     setup_inference_cli_parser
 )
 
@@ -119,15 +120,27 @@ def evaluate_clinical_cohort(
         )
 
     # 2. Load Model Checkpoint (Head-Only or Full-Model)
-    model, ckpt_thresholds, epoch = load_model_checkpoint(model, Path(args.checkpoint), device)
+    model, ckpt_thresholds, epoch, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
     model.to(device)
     model.eval()
 
+    # 2b. Resolve Pooling Config: CLI override > checkpoint's training-time config > hardcoded default
+    pooling_strategy, top_percentile, t_window = resolve_pooling_config(
+        pooling_strategy=args.pooling_strategy,
+        top_percentile=args.top_percentile,
+        t_window=args.t_window,
+        ckpt_pooling_params=ckpt_pooling_params
+    )
+    print(
+        f"Pooling config: strategy={pooling_strategy}, top_percentile={top_percentile}, t_window={t_window} "
+        f"(source: {'CLI override' if args.pooling_strategy is not None else 'checkpoint/default'})"
+    )
+
     # 3. Determine Active Strategies
-    if args.pooling_strategy == "all":
+    if pooling_strategy == "all":
         active_strategies = ["p85_score", "top_10_mean", "trimmed_top_10", "burden_ratio"]
     else:
-        active_strategies = [args.pooling_strategy]
+        active_strategies = [pooling_strategy]
 
     subject_results = {strat: [] for strat in active_strategies}
     ground_truths = []
@@ -146,11 +159,11 @@ def evaluate_clinical_cohort(
                 # Extract positive class probability array [N] for binary score aggregation
                 pos_probs = window_probs[:, 1]
                 score = compute_pooled_scores(
-                    pos_probs, method=strat, top_percentile=args.top_percentile, t_window=args.t_window
+                    pos_probs, method=strat, top_percentile=top_percentile, t_window=t_window
                 )
             else:
                 score = compute_pooled_scores(
-                    window_probs, method=strat, top_percentile=args.top_percentile, t_window=args.t_window
+                    window_probs, method=strat, top_percentile=top_percentile, t_window=t_window
                 )
 
             subject_results[strat].append(score)

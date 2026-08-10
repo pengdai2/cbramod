@@ -20,6 +20,7 @@ from cbramod_common import (
     compute_pooled_scores,
     get_operating_threshold,
     load_model_checkpoint,
+    resolve_pooling_config,
     setup_inference_cli_parser
 )
 from cbramod_utils import seed_everything
@@ -51,6 +52,8 @@ class SubjectEEGInspector:
         stages: List[str],
         indices: List[int],
         pooling_strategy: str = "p85_score",
+        top_percentile: float = 0.10,
+        t_window: float = 0.60,
         batch_size: int = 64
     ) -> Dict:
         num_windows = x_tensor.shape[0]
@@ -63,7 +66,9 @@ class SubjectEEGInspector:
             window_probs.append(probs)
 
         probs_arr = np.concatenate(window_probs) if window_probs else np.array([])
-        pooled_score = compute_pooled_scores(probs_arr, method=pooling_strategy)
+        pooled_score = compute_pooled_scores(
+            probs_arr, method=pooling_strategy, top_percentile=top_percentile, t_window=t_window
+        )
         prediction = int(pooled_score >= self.threshold)
 
         return {
@@ -394,12 +399,24 @@ def main():
         )
 
     # 2. Load Model Checkpoint
-    model, ckpt_thresholds, epoch = load_model_checkpoint(model, Path(args.checkpoint), device)
+    model, ckpt_thresholds, epoch, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
     model.to(device)
     model.eval()
 
-    threshold = get_operating_threshold(
+    # 2b. Resolve Pooling Config: CLI override > checkpoint's training-time config > hardcoded default
+    pooling_strategy, top_percentile, t_window = resolve_pooling_config(
         pooling_strategy=args.pooling_strategy,
+        top_percentile=args.top_percentile,
+        t_window=args.t_window,
+        ckpt_pooling_params=ckpt_pooling_params
+    )
+    print(
+        f"Pooling config: strategy={pooling_strategy}, top_percentile={top_percentile}, t_window={t_window} "
+        f"(source: {'CLI override' if args.pooling_strategy is not None else 'checkpoint/default'})"
+    )
+
+    threshold = get_operating_threshold(
+        pooling_strategy=pooling_strategy,
         override_threshold=args.override_threshold,
         ckpt_thresholds=ckpt_thresholds
     )
@@ -433,7 +450,9 @@ def main():
             ground_truth=y_tensor.item(),
             stages=stages,
             indices=indices,
-            pooling_strategy=args.pooling_strategy,
+            pooling_strategy=pooling_strategy,
+            top_percentile=top_percentile,
+            t_window=t_window,
             batch_size=args.batch_size
         )
 

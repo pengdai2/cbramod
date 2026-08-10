@@ -405,6 +405,8 @@ class EndToEndTrainer(CBraModTrainer):
                         "optimizer_state_dict": optimizer.state_dict(),
                         "best_macro_f1": best_primary_f1,
                         "primary_pooling": self.config.primary_pooling,
+                        "top_percentile": self.config.top_percentile,
+                        "t_window": self.config.t_window,
                         "optimal_thresholds": {k: v["optimal_threshold"] for k, v in pooling_results.items()},
                     },
                     best_model_path,
