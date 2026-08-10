@@ -62,7 +62,8 @@ def generate_subject_predictions(
         print(f"Loaded cached features for {len(dataset)} subjects.")
 
         for i in tqdm(range(len(dataset)), desc="Processing Subjects (Cached)"):
-            subj_feats, label, subject_id, _, _ = dataset[i]
+            subj_feats, label_tensor, subject_id, _, _ = dataset[i]
+            label = int(label_tensor.item())
             probs = infer_subject_windows(model, subj_feats, args.batch_size, device)
             yield subject_id, label, probs
 

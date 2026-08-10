@@ -489,11 +489,7 @@ def main():
         report = inspector.inspect_subject(
             x_tensor=x_tensor,
             subject_id=subj_id,
-            # PANSubjectEEGDataset yields y_tensor as a torch.Tensor, but
-            # CachedFeatureSubjectDataset already unwraps it to a plain int
-            # (see its __getitem__) -- normalize both here instead of
-            # assuming .item() exists.
-            ground_truth=int(y_tensor.item()) if torch.is_tensor(y_tensor) else int(y_tensor),
+            ground_truth=y_tensor.item(),
             stages=stages,
             indices=indices,
             pooling_strategy=pooling_strategy,

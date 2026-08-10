@@ -344,16 +344,20 @@ class CachedFeatureSubjectDataset(Dataset):
     def __len__(self) -> int:
         return len(self.unique_subjects)
 
-    def __getitem__(self, idx: int) -> Tuple[str, torch.Tensor, int]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, str, np.ndarray, np.ndarray]:
         subject_id = self.unique_subjects[idx]
         mask = (self.subject_ids == subject_id)
         subj_feats = self.feats[mask]
         subj_stages = self.stages[mask]
         subj_indices = self.indices[mask]
-        
-        # All windows for a given subject share the same patient-level ground truth
-        subj_label = int(self.labels[mask][0].item())
-        
+
+        # All windows for a given subject share the same patient-level ground
+        # truth. Kept as a tensor (not .item()'d to a plain int) for
+        # consistency with PANSubjectEEGDataset.__getitem__'s y_tensor --
+        # callers that treat both datasets generically can rely on this slot
+        # always being a torch.Tensor regardless of which dataset produced it.
+        subj_label = self.labels[mask][0]
+
         return subj_feats, subj_label, subject_id, subj_stages, subj_indices
 
 
