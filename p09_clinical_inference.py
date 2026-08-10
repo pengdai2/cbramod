@@ -58,7 +58,7 @@ def generate_subject_predictions(
     for both cached features (.pt) and raw EEG manifest datasets.
     """
     if args.features_pt:
-        dataset = CachedFeatureSubjectDataset(args.features_pt, subject_id=args.subject_id)
+        dataset = CachedFeatureSubjectDataset(args.features_pt, filter_subject=args.subject_id)
         print(f"Loaded cached features for {len(dataset)} subjects.")
 
         for i in tqdm(range(len(dataset)), desc="Processing Subjects (Cached)"):
@@ -71,7 +71,7 @@ def generate_subject_predictions(
             manifest_csv=args.test_manifest,
             data_dir=args.data_dir,
             filter_stage=args.filter_stage,
-            subject_id=args.subject_id,
+            filter_subject=args.subject_id,
             memory_map=True
         )
         print(f"Loaded raw EEG recording dataset for {len(dataset)} subjects.")
