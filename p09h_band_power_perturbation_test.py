@@ -88,7 +88,8 @@ def compute_relative_band_power(signal_1d: np.ndarray, sfreq: float, low: float,
 
 
 def perturb_window_band_power(
-    window_CT: np.ndarray, sfreq: float, low: float, high: float, scale_factor: float, order: int = 4
+    window_CT: np.ndarray, sfreq: float, low: float, high: float, scale_factor: float, order: int = 4,
+    preserve_total_energy: bool = True
 ) -> np.ndarray:
     """
     Rescales the [low, high] Hz component of every channel by `scale_factor`, leaving everything
@@ -96,6 +97,19 @@ def perturb_window_band_power(
     means the model's own channel-mean pooling step scales its band power by exactly the same
     factor (mean is linear), so this targets a predictable, well-defined quantity rather than an
     arbitrary single-channel edit.
+
+    `preserve_total_energy` (default True) renormalizes each perturbed channel back to its
+    ORIGINAL std after the band rescale. Without this, scaling a band that already dominates a
+    channel's total power (e.g. delta, often 80%+ of relative power) also substantially changes
+    the channel's OVERALL amplitude -- since the model's input is Z-scored to std~=1 per channel
+    per window (see p02_slice_eeg_dataset.py), that overall-amplitude shift pushes the perturbed
+    signal outside the range every training window was normalized to, confounding "does the model
+    care about this band's share of the spectrum" with "does the model react to an unrealistically
+    high/low-energy window." For a minor band like sigma (~5% of power) this confound is small
+    (~3% amplitude shift at scale=1.5); for a dominant band like delta it can be large (~44% at the
+    same scale factor) -- big enough to plausibly explain a result on its own. Renormalizing here
+    isolates the intended effect (spectral shape) from this confound (overall energy). At
+    scale_factor=1.0 this is an exact no-op (renormalization factor is exactly 1.0) either way.
     """
     perturbed = window_CT.copy()
     for c in range(window_CT.shape[0]):
@@ -104,7 +118,13 @@ def perturb_window_band_power(
             continue
         band_component = extract_band_component(sig, sfreq, low, high, order)
         residual = sig - band_component
-        perturbed[c] = residual + scale_factor * band_component
+        new_sig = residual + scale_factor * band_component
+        if preserve_total_energy:
+            orig_std = sig.std()
+            new_std = new_sig.std()
+            if new_std > 1e-8:
+                new_sig = new_sig * (orig_std / new_std)
+        perturbed[c] = new_sig
     return perturbed.astype(window_CT.dtype)
 
 
@@ -158,6 +178,14 @@ def parse_cli_args() -> argparse.Namespace:
              "(1.0 = unperturbed original). Used to fit a local slope per window."
     )
     group.add_argument("--filter-order", type=int, default=4, help="Butterworth filter order for band isolation.")
+    group.add_argument(
+        "--no-preserve-total-energy", dest="preserve_total_energy", action="store_false",
+        help="Disable renormalizing each perturbed channel back to its original std after the band "
+             "rescale. Default (preserve_total_energy=True) isolates the intended spectral-shape "
+             "effect from the confound of also shifting the channel's overall Z-scored amplitude -- "
+             "see perturb_window_band_power()'s docstring. Only disable this to reproduce/compare "
+             "against the earlier unconfounded-amplitude results."
+    )
     group.add_argument(
         "--max-windows-per-subject", type=int, default=40,
         help="Randomly subsample to at most this many windows per subject (each window needs one "
@@ -252,7 +280,10 @@ def main():
         for f_idx in window_order:
             window = raw_np[f_idx]  # [C, T]
             perturbed_batch = np.stack([
-                perturb_window_band_power(window, args.sfreq, low, high, s, order=args.filter_order)
+                perturb_window_band_power(
+                    window, args.sfreq, low, high, s, order=args.filter_order,
+                    preserve_total_energy=args.preserve_total_energy
+                )
                 for s in scale_factors
             ])
             with torch.no_grad():

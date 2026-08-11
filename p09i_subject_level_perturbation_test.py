@@ -82,9 +82,18 @@ def extract_band_component(signal_1d: np.ndarray, sfreq: float, low: float, high
 
 
 def perturb_window_band_power(
-    window_CT: np.ndarray, sfreq: float, low: float, high: float, scale_factor: float, order: int = 4
+    window_CT: np.ndarray, sfreq: float, low: float, high: float, scale_factor: float, order: int = 4,
+    preserve_total_energy: bool = True
 ) -> np.ndarray:
-    """Same as p09h's version: rescales the [low, high] Hz component of every channel uniformly."""
+    """
+    Same as p09h's version: rescales the [low, high] Hz component of every channel uniformly.
+
+    `preserve_total_energy` (default True) renormalizes each perturbed channel back to its ORIGINAL
+    std after the band rescale, controlling for the confound where scaling a band that dominates a
+    channel's total power (e.g. delta) also substantially shifts the channel's overall Z-scored
+    amplitude -- see p09h_band_power_perturbation_test.py's docstring for the full rationale. At
+    scale_factor=1.0 this is an exact no-op.
+    """
     perturbed = window_CT.copy()
     for c in range(window_CT.shape[0]):
         sig = window_CT[c]
@@ -92,7 +101,13 @@ def perturb_window_band_power(
             continue
         band_component = extract_band_component(sig, sfreq, low, high, order)
         residual = sig - band_component
-        perturbed[c] = residual + scale_factor * band_component
+        new_sig = residual + scale_factor * band_component
+        if preserve_total_energy:
+            orig_std = sig.std()
+            new_std = new_sig.std()
+            if new_std > 1e-8:
+                new_sig = new_sig * (orig_std / new_std)
+        perturbed[c] = new_sig
     return perturbed.astype(window_CT.dtype)
 
 
@@ -122,6 +137,11 @@ def parse_cli_args() -> argparse.Namespace:
              "of a subject simultaneously (1.0 = unperturbed original)."
     )
     group.add_argument("--filter-order", type=int, default=4, help="Butterworth filter order for band isolation.")
+    group.add_argument(
+        "--no-preserve-total-energy", dest="preserve_total_energy", action="store_false",
+        help="Disable renormalizing each perturbed channel back to its original std after the band "
+             "rescale (see perturb_window_band_power()'s docstring). Default: preserve_total_energy=True."
+    )
     group.add_argument(
         "--max-windows-per-subject", type=int, default=None,
         help="Optional cap on windows perturbed per subject, for speed on very long recordings. Default: "
@@ -232,7 +252,10 @@ def main():
         mean_window_prob_per_scale = np.zeros(len(scale_factors))
         for i, s in enumerate(scale_factors):
             perturbed_batch = np.stack([
-                perturb_window_band_power(w, args.sfreq, low, high, s, order=args.filter_order)
+                perturb_window_band_power(
+                    w, args.sfreq, low, high, s, order=args.filter_order,
+                    preserve_total_energy=args.preserve_total_energy
+                )
                 for w in work_windows
             ])
             with torch.no_grad():
