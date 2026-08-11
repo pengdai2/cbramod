@@ -61,7 +61,7 @@ from cbramod_common import (
     resolve_pooling_config,
     setup_inference_cli_parser
 )
-from cbramod_common import seed_everything
+from cbramod_utils import seed_everything
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector, load_subject_ids_from_json
 
 
@@ -107,12 +107,32 @@ def reconstruct_real_uv_channel_mean(
 ) -> np.ndarray:
     """
     Inverts p02's per-channel Z-score normalization (exact, same epsilon) then averages across
-    channels in real uV -- a physically meaningful "overall signal amplitude" proxy, unlike averaging
-    the Z-scored signal (which the model does, but which discards each channel's real amplitude scale
-    before averaging).
+    ACTIVE channels only (norm_std_uv > 0 -- p02 leaves this at exactly 0.0 for zero-padded/inactive
+    channels, since they're never normalized at all) in real uV -- a physically meaningful "overall
+    signal amplitude" proxy, unlike averaging the Z-scored signal the model itself pools (which
+    discards each channel's real amplitude scale before averaging) or averaging across all 64
+    channels including zero-padding.
+
+    Averaging over all 64 (as p09f/p09h/p09i do for the Z-scored signal) is harmless for RELATIVE
+    power -- a subject with only 20 of 64 channels recorded gets a uniformly diluted signal
+    (~20/64 the amplitude), but that's a single scalar factor on the whole window that cancels
+    exactly in a ratio. It is NOT harmless for ABSOLUTE power (this script's whole point): that same
+    dilution factor differs subject-to-subject depending on how many channels they had recorded,
+    confounding any cross-subject absolute-power comparison with an artifact of channel count rather
+    than real signal. It also explains YASA's "Wrong data amplitude... trimmed STD = 0.000" spam --
+    a signal diluted by zero-padding can fall below YASA's amplitude sanity floor even when the real,
+    active-channel signal is a perfectly normal EEG amplitude.
     """
-    real_uv_CT = normalized_CT * (norm_std_uv[:, None] + 1e-8) + norm_mean_uv[:, None]
-    return real_uv_CT.mean(axis=0)
+    active_mask = norm_std_uv > 0
+    if not np.any(active_mask):
+        # Shouldn't happen for a valid window (p02 rejects all-zero windows outright), but don't
+        # silently divide by zero -- fall back to the diluted all-channel mean rather than crash.
+        real_uv_CT = normalized_CT * (norm_std_uv[:, None] + 1e-8) + norm_mean_uv[:, None]
+        return real_uv_CT.mean(axis=0)
+    real_uv_CT_active = (
+        normalized_CT[active_mask] * (norm_std_uv[active_mask, None] + 1e-8) + norm_mean_uv[active_mask, None]
+    )
+    return real_uv_CT_active.mean(axis=0)
 
 
 def compute_band_powers(signal_1d: np.ndarray, sfreq: float, prefix: str) -> Dict[str, float]:
