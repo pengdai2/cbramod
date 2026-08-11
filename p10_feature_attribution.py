@@ -467,6 +467,36 @@ def plot_morphology_hotspots(
     print(f"Morphology hotspot plot saved to: {output_path}")
 
 
+def _annotate_yasa_events(ax: plt.Axes, sp_df: Optional[pd.DataFrame], sw_df: Optional[pd.DataFrame]) -> bool:
+    """
+    Shades every YASA-detected spindle/slow-wave span on `ax`, regardless of
+    whether it overlaps a high-attribution hotspot -- a detected event the
+    model *didn't* attend to is still informative context (e.g. "there was
+    a spindle right here and the model's attribution ignored it entirely").
+    Returns whether anything was actually drawn, so the caller only adds a
+    legend when there's something to label.
+    """
+    drew_anything = False
+
+    if sp_df is not None and len(sp_df):
+        for i, (_, row) in enumerate(sp_df.iterrows()):
+            ax.axvspan(
+                row["Start"], row["End"], color='gold', alpha=0.25,
+                label='YASA Spindle' if i == 0 else None
+            )
+        drew_anything = True
+
+    if sw_df is not None and len(sw_df):
+        for i, (_, row) in enumerate(sw_df.iterrows()):
+            ax.axvspan(
+                row["Start"], row["End"], color='steelblue', alpha=0.2,
+                label='YASA Slow Wave' if i == 0 else None
+            )
+        drew_anything = True
+
+    return drew_anything
+
+
 def plot_attribution_dashboard(
     raw_eeg: np.ndarray,
     signal_attr: np.ndarray,
@@ -482,7 +512,8 @@ def plot_attribution_dashboard(
     temporal_concentration_threshold: float = 0.5,
     top_k_patches: int = 3,
     temporal_gini: Optional[float] = None,
-    top_k_patch_idx: Optional[np.ndarray] = None
+    top_k_patch_idx: Optional[np.ndarray] = None,
+    show_yasa_events: bool = True
 ):
     """
     Generates a visual diagnostic dashboard comparing raw EEG signals,
@@ -493,7 +524,12 @@ def plot_attribution_dashboard(
     given), or the top `top_k_channels` channels stacked in separate rows
     (not overlaid on one axis) when it's distributed, so multi-channel cases
     stay readable instead of piling multiple colored fills on top of each
-    other.
+    other. When `show_yasa_events` and YASA is installed, every row also
+    shades that channel's YASA-detected spindle/slow-wave spans across the
+    *entire* window -- independent of `characterize_morphology_hotspots`'s
+    hotspot matching, so a detected event shows up here even on windows/tiers
+    where morphology characterization wasn't run, or where it didn't line up
+    with a high-attribution sample.
 
     Panel 2's patch heatmap is annotated with the temporal-concentration
     verdict (sustained vs. spike-localized) and marks the top attributed
@@ -541,15 +577,22 @@ def plot_attribution_dashboard(
         eeg_signal = raw_eeg[ch]
         attr_signal = signal_attr[ch]
 
-        ax.plot(time_axis, eeg_signal, color='black', alpha=0.75, linewidth=0.9)
+        ax.plot(time_axis, eeg_signal, color='black', alpha=0.75, linewidth=0.9, label='Raw EEG', zorder=3)
         pos_attr = np.maximum(0, attr_signal)
         if pos_attr.max() > 0:
             pos_attr_norm = pos_attr / pos_attr.max() * np.abs(eeg_signal).max()
-            ax.fill_between(time_axis, 0, pos_attr_norm, color='crimson', alpha=0.3)
+            ax.fill_between(time_axis, 0, pos_attr_norm, color='crimson', alpha=0.3, label='Attribution', zorder=2)
+
+        drew_events = False
+        if show_yasa_events and HAS_YASA:
+            sp_df, sw_df = detect_yasa_events(eeg_signal, sfreq)
+            drew_events = _annotate_yasa_events(ax, sp_df, sw_df)
 
         rank_note = " (Highest)" if i == 0 and num_channel_rows > 1 else ""
         ax.set_ylabel(f'Ch {ch}{rank_note}\n(µV)', fontsize=9)
         ax.grid(True, linestyle=':', alpha=0.4)
+        if drew_events:
+            ax.legend(loc='upper right', fontsize=7, ncol=2)
         if i < num_channel_rows - 1:
             ax.set_xticklabels([])
 
@@ -780,9 +823,11 @@ def parse_cli_args() -> argparse.Namespace:
     )
     attr_group.add_argument(
         "--no-yasa-detectors", dest="use_yasa_detectors", action="store_false", default=True,
-        help="Disable checking morphology hotspots against YASA's validated spindle/slow-wave detectors "
-             "(yasa.spindles_detect/sw_detect), falling back to the dominant-frequency/duration/amplitude "
-             "heuristic for every hotspot instead. Has no effect if YASA isn't installed."
+        help="Disable all use of YASA's validated spindle/slow-wave detectors (yasa.spindles_detect/"
+             "sw_detect): stops shading detected event spans on every dashboard's Panel 1 (shown "
+             "regardless of tier, whether or not they overlap a hotspot), and stops checking morphology "
+             "hotspots against them (falling back to the dominant-frequency/duration/amplitude heuristic "
+             "for every hotspot instead). Has no effect if YASA isn't installed."
     )
 
     args = parser.parse_args()
@@ -808,12 +853,19 @@ def main():
     patch_size_samples = int(round(args.sfreq))
     window_sec = float(args.num_patches)
     morphology_tier_filter = _resolve_tier_filter(args.morphology_tiers)
-    use_yasa = args.use_yasa_detectors and args.top_k_hotspots > 0
-    if args.top_k_hotspots > 0 and args.use_yasa_detectors and not HAS_YASA:
+    # Two independent uses of YASA: showing every detected spindle/slow-wave
+    # span on the dashboard (every window, regardless of tier or whether it
+    # lines up with a hotspot) vs. using detections to tag morphology
+    # hotspots (only for --morphology-tiers windows, only if --top-k-hotspots
+    # > 0). Decoupled so disabling hotspot characterization doesn't also
+    # hide the dashboard annotations, and vice versa.
+    show_yasa_events = args.use_yasa_detectors
+    use_yasa_for_hotspots = args.use_yasa_detectors and args.top_k_hotspots > 0
+    if args.use_yasa_detectors and not HAS_YASA:
         print(
-            "  [Warning] --no-yasa-detectors was not set but YASA is not installed; morphology hotspots "
-            "will use the dominant-frequency/duration/amplitude heuristic for every hotspot instead of "
-            "YASA's validated spindle/slow-wave detectors."
+            "  [Warning] --no-yasa-detectors was not set but YASA is not installed; dashboards won't show "
+            "YASA event spans, and morphology hotspots will use the dominant-frequency/duration/amplitude "
+            "heuristic instead of YASA's validated spindle/slow-wave detectors."
         )
 
     print("Instantiating full CBraModE2EClassifier for raw waveform attribution.")
@@ -934,7 +986,8 @@ def main():
                 temporal_concentration_threshold=args.temporal_concentration_threshold,
                 top_k_patches=args.top_k_patches,
                 temporal_gini=temporal_gini,
-                top_k_patch_idx=top_k_patch_idx
+                top_k_patch_idx=top_k_patch_idx,
+                show_yasa_events=show_yasa_events
             )
 
             # Morphology hotspot characterization -- only for tiers matching
@@ -952,7 +1005,7 @@ def main():
                     channel_idx=int(top_k_idx[0]),
                     top_k=args.top_k_hotspots,
                     snippet_sec=args.hotspot_snippet_sec,
-                    use_yasa=use_yasa
+                    use_yasa=use_yasa_for_hotspots
                 )
                 print(f"  Morphology hotspots (Ch {int(top_k_idx[0])}):")
                 for h in hotspots:
