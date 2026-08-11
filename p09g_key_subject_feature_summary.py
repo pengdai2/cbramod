@@ -116,6 +116,31 @@ def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+def joint_regression(y: np.ndarray, x1: np.ndarray, x2: np.ndarray) -> Dict[str, float]:
+    """
+    OLS of y ~ x1 + x2 (with intercept). Used here to disentangle two candidate explanations for the
+    bonus finding: a subject with low within-subject probability variance (x1=std_probability)
+    mechanically produces a weak correlation for ANY feature (Spearman correlation needs variance in
+    both variables) AND plausibly has higher confidence (a uniformly high or uniformly low probability
+    lands its p85 percentile far from the threshold) -- so std_probability alone could produce the
+    observed r-vs-confidence pattern with nothing specific to spectral content at all. If
+    beta(confidence) stays substantial once std_probability is in the model too, that's evidence of a
+    real, independent relationship; if it collapses toward 0, the univariate correlation was likely
+    just riding on the variance-restriction artifact.
+    """
+    mask = ~(np.isnan(y) | np.isnan(x1) | np.isnan(x2))
+    y, x1, x2 = y[mask], x1[mask], x2[mask]
+    if len(y) < 4:
+        return {"n": len(y), "beta_std_probability": float("nan"), "beta_confidence": float("nan"), "r2": float("nan")}
+    A = np.vstack([x1, x2, np.ones_like(y)]).T
+    coeffs, _, _, _ = np.linalg.lstsq(A, y, rcond=None)
+    pred = A @ coeffs
+    ss_res = np.sum((y - pred) ** 2)
+    ss_tot = np.sum((y - y.mean()) ** 2)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    return {"n": len(y), "beta_std_probability": float(coeffs[0]), "beta_confidence": float(coeffs[1]), "r2": float(r2)}
+
+
 def main():
     args = parse_cli_args()
 
@@ -142,6 +167,10 @@ def main():
             "n_windows": len(stage_group),
             "pooled_score_p85": pooled_score_p85,
             "confidence": confidence,
+            # Computed on the SAME stage-restricted window set the r_ columns use below, since a
+            # low-variance subject mechanically produces a weak correlation for every feature --
+            # this is the leading alternative explanation for the bonus finding, checked further down.
+            "std_probability": float(stage_group["probability"].std()) if len(stage_group) > 1 else float("nan"),
         }
         for col in feature_cols:
             if len(stage_group) >= args.min_windows and stage_group[col].std() > 0:
@@ -173,10 +202,35 @@ def main():
     print("\n" + "=" * 88)
     print("BONUS: does a subject's OWN correlation strength for a feature relate to their confidence?")
     print("=" * 88)
+    std_conf_valid = summary.dropna(subset=["std_probability", "confidence"])
+    r_std_conf = spearman_corr(std_conf_valid["std_probability"].values, std_conf_valid["confidence"].values)
+    print(
+        f"  Spearman(std_probability, confidence) = {r_std_conf:+.4f}  (n_subjects={len(std_conf_valid)})\n"
+        f"  -- the leading alternative explanation: low within-subject probability variance mechanically "
+        f"weakens correlation for EVERY feature (Spearman needs variance in both variables), and plausibly "
+        f"raises confidence on its own (a uniformly high/low probability lands its p85 far from threshold). "
+        f"If this alone is strong, treat the per-feature results below with real skepticism.\n"
+    )
     for col in r_cols:
         valid = summary.dropna(subset=[col, "confidence"])
         r = spearman_corr(valid[col].values, valid["confidence"].values)
-        print(f"  Spearman({col}, confidence) = {r:+.4f}  (n_subjects={len(valid)})")
+
+        joint_valid = summary.dropna(subset=[col, "std_probability", "confidence"])
+        joint = joint_regression(
+            joint_valid[col].values, joint_valid["std_probability"].values, joint_valid["confidence"].values
+        )
+        print(
+            f"  {col:20s}: Spearman(r, confidence) = {r:+.4f}  (n={len(valid)})   ||   "
+            f"joint OLS r ~ std_probability + confidence (n={joint['n']}, R^2={joint['r2']:.3f}): "
+            f"beta(std_probability)={joint['beta_std_probability']:+.4f}, "
+            f"beta(confidence)={joint['beta_confidence']:+.4f}"
+        )
+    print(
+        "\n  Read the joint beta(confidence) as the part of the univariate correlation that survives "
+        "once std_probability is controlled for -- if it's much smaller than the univariate Spearman "
+        "r above, the relationship was likely riding on the variance-restriction artifact, not a "
+        "feature-specific effect."
+    )
 
     out_path = Path(args.output_csv) if args.output_csv else Path(args.morphology_csv).with_name(
         f"per_subject_morphology_score{'_' + args.stage if args.stage else ''}.csv"
