@@ -467,6 +467,39 @@ def plot_morphology_hotspots(
     print(f"Morphology hotspot plot saved to: {output_path}")
 
 
+def scan_yasa_events_across_channels(
+    raw_eeg: np.ndarray,
+    sfreq: float,
+    channels: Optional[List[int]] = None
+) -> Dict[int, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]:
+    """
+    Runs `detect_yasa_events` for every channel in `channels` (default: all
+    channels in `raw_eeg`), not just whichever channels Panel 1 happens to
+    display. Panel 1 only ever shows the top-attributed channel(s); a
+    genuine spindle/slow-wave on some other channel would otherwise never
+    even be checked for, let alone shown. Returns {channel_idx: (spindle_df,
+    slow_wave_df)}.
+    """
+    if channels is None:
+        channels = list(range(raw_eeg.shape[0]))
+    return {ch: detect_yasa_events(raw_eeg[ch], sfreq) for ch in channels}
+
+
+def summarize_yasa_channel_scan(
+    events_by_channel: Dict[int, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]]
+) -> List[Dict]:
+    """Per-channel spindle/slow-wave counts from a full scan, one row per channel, sorted by channel index."""
+    summary = []
+    for ch in sorted(events_by_channel.keys()):
+        sp_df, sw_df = events_by_channel[ch]
+        summary.append({
+            "channel": ch,
+            "num_spindles": len(sp_df) if sp_df is not None else 0,
+            "num_slow_waves": len(sw_df) if sw_df is not None else 0
+        })
+    return summary
+
+
 def _annotate_yasa_events(ax: plt.Axes, sp_df: Optional[pd.DataFrame], sw_df: Optional[pd.DataFrame]) -> bool:
     """
     Shades every YASA-detected spindle/slow-wave span on `ax`, regardless of
@@ -513,7 +546,9 @@ def plot_attribution_dashboard(
     top_k_patches: int = 3,
     temporal_gini: Optional[float] = None,
     top_k_patch_idx: Optional[np.ndarray] = None,
-    show_yasa_events: bool = True
+    show_yasa_events: bool = True,
+    yasa_scan_all_channels: bool = True,
+    yasa_scan_json_path: Optional[Path] = None
 ):
     """
     Generates a visual diagnostic dashboard comparing raw EEG signals,
@@ -524,12 +559,25 @@ def plot_attribution_dashboard(
     given), or the top `top_k_channels` channels stacked in separate rows
     (not overlaid on one axis) when it's distributed, so multi-channel cases
     stay readable instead of piling multiple colored fills on top of each
-    other. When `show_yasa_events` and YASA is installed, every row also
-    shades that channel's YASA-detected spindle/slow-wave spans across the
-    *entire* window -- independent of `characterize_morphology_hotspots`'s
-    hotspot matching, so a detected event shows up here even on windows/tiers
-    where morphology characterization wasn't run, or where it didn't line up
-    with a high-attribution sample.
+    other. When `show_yasa_events` and YASA is installed, every displayed
+    row also shades that channel's YASA-detected spindle/slow-wave spans
+    across the *entire* window -- independent of
+    `characterize_morphology_hotspots`'s hotspot matching, so a detected
+    event shows up here even on windows/tiers where morphology
+    characterization wasn't run, or where it didn't line up with a
+    high-attribution sample.
+
+    Panel 1 only ever shows the top-attributed channel(s), though -- a real
+    spindle/slow-wave on some *other* channel wouldn't be checked for at all
+    if we only scanned displayed channels. So when `yasa_scan_all_channels`
+    (default True), every channel in `raw_eeg` is scanned, not just the
+    displayed ones: channels not shown as a full Panel 1 row still get a
+    marker on Panel 3's bar chart at their own channel index if they have a
+    detected event, and (if `yasa_scan_json_path` is given) the full
+    per-channel spindle/slow-wave counts are saved there. Set to False to
+    only scan displayed channels (previous behavior, cheaper -- scanning all
+    channels runs two detectors per channel, so cost scales with channel
+    count regardless of how many are actually plotted).
 
     Panel 2's patch heatmap is annotated with the temporal-concentration
     verdict (sustained vs. spike-localized) and marks the top attributed
@@ -560,6 +608,14 @@ def plot_attribution_dashboard(
     else:
         plot_channels = [int(c) for c in top_k_idx]
 
+    # Scan for YASA events once, up front -- across all channels by default
+    # (see docstring), not just `plot_channels`, so events elsewhere aren't
+    # silently never even checked for.
+    events_by_channel: Dict[int, Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]] = {}
+    if show_yasa_events and HAS_YASA:
+        scan_channels = list(range(num_channels)) if yasa_scan_all_channels else plot_channels
+        events_by_channel = scan_yasa_events_across_channels(raw_eeg, sfreq, channels=scan_channels)
+
     num_channel_rows = len(plot_channels)
     total_rows = num_channel_rows + 2  # + patch heatmap + channel bar chart
     height_ratios = [1.0] * num_channel_rows + [1.4, 1.2]
@@ -584,8 +640,8 @@ def plot_attribution_dashboard(
             ax.fill_between(time_axis, 0, pos_attr_norm, color='crimson', alpha=0.3, label='Attribution', zorder=2)
 
         drew_events = False
-        if show_yasa_events and HAS_YASA:
-            sp_df, sw_df = detect_yasa_events(eeg_signal, sfreq)
+        if ch in events_by_channel:
+            sp_df, sw_df = events_by_channel[ch]
             drew_events = _annotate_yasa_events(ax, sp_df, sw_df)
 
         rank_note = " (Highest)" if i == 0 and num_channel_rows > 1 else ""
@@ -629,6 +685,49 @@ def plot_attribution_dashboard(
     ax_bar.set_ylabel('Attribution L2 Norm')
     ax_bar.set_title('Global Channel Importance Profile')
     ax_bar.grid(axis='y', linestyle='--', alpha=0.7)
+
+    # Mark every channel with a detected YASA event here too, regardless of
+    # attribution rank -- this is the one place a spindle/slow-wave on a
+    # channel NOT shown as a full Panel 1 row still becomes visible, rather
+    # than only ever being checked for on the (up to top_k_channels)
+    # displayed channels.
+    if events_by_channel:
+        marker_headroom = max(channel_attr.max(), 1e-9) * 0.08
+        drew_bar_spindle, drew_bar_sw = False, False
+        for ch, (sp_df, sw_df) in events_by_channel.items():
+            n_sp = len(sp_df) if sp_df is not None else 0
+            n_sw = len(sw_df) if sw_df is not None else 0
+            marker_y = channel_attr[ch] + marker_headroom
+            if n_sp:
+                ax_bar.scatter(
+                    ch, marker_y, marker='*', s=70, color='gold', edgecolors='black', linewidths=0.5,
+                    zorder=5, label='YASA Spindle Detected' if not drew_bar_spindle else None
+                )
+                drew_bar_spindle = True
+                marker_y += marker_headroom
+            if n_sw:
+                ax_bar.scatter(
+                    ch, marker_y, marker='v', s=55, color='steelblue', edgecolors='black', linewidths=0.5,
+                    zorder=5, label='YASA Slow Wave Detected' if not drew_bar_sw else None
+                )
+                drew_bar_sw = True
+        if drew_bar_spindle or drew_bar_sw:
+            ax_bar.legend(loc='upper right', fontsize=8)
+
+        undisplayed_with_events = sorted(
+            ch for ch, (sp_df, sw_df) in events_by_channel.items()
+            if ch not in plot_channels and ((sp_df is not None and len(sp_df)) or (sw_df is not None and len(sw_df)))
+        )
+        if undisplayed_with_events:
+            print(
+                f"  [YASA] Detected event(s) on channel(s) not shown in Panel 1: {undisplayed_with_events} "
+                f"-- see Panel 3 markers" + (f" / {yasa_scan_json_path}" if yasa_scan_json_path else "")
+            )
+
+        if yasa_scan_json_path is not None:
+            with open(yasa_scan_json_path, "w") as f:
+                json.dump(summarize_yasa_channel_scan(events_by_channel), f, indent=2)
+            print(f"  Full per-channel YASA scan saved to: {yasa_scan_json_path}")
 
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -829,6 +928,15 @@ def parse_cli_args() -> argparse.Namespace:
              "hotspots against them (falling back to the dominant-frequency/duration/amplitude heuristic "
              "for every hotspot instead). Has no effect if YASA isn't installed."
     )
+    attr_group.add_argument(
+        "--no-yasa-scan-all-channels", dest="yasa_scan_all_channels", action="store_false", default=True,
+        help="Only run YASA detectors on the channel(s) Panel 1 actually displays, instead of every "
+             "channel. By default all channels are scanned so an event on a channel that wasn't among the "
+             "top-attributed ones still shows up as a marker on Panel 3 (and in the saved per-channel scan) "
+             "rather than never being checked for at all -- pass this flag to skip that (cheaper: scanning "
+             "runs two detectors per channel, so cost scales with total channel count, not just how many "
+             "are displayed)."
+    )
 
     args = parser.parse_args()
     if args.features_pt:
@@ -987,7 +1095,9 @@ def main():
                 top_k_patches=args.top_k_patches,
                 temporal_gini=temporal_gini,
                 top_k_patch_idx=top_k_patch_idx,
-                show_yasa_events=show_yasa_events
+                show_yasa_events=show_yasa_events,
+                yasa_scan_all_channels=args.yasa_scan_all_channels,
+                yasa_scan_json_path=output_dir / f"{stem}_yasa_channel_scan.json" if show_yasa_events else None
             )
 
             # Morphology hotspot characterization -- only for tiers matching
