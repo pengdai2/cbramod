@@ -572,6 +572,72 @@ def compute_pooled_scores(
         raise ValueError(f"Unsupported pooling method: {method}")
 
 
+def compute_leave_one_out_contributions(
+    window_probs: np.ndarray,
+    method: str = "p85_score",
+    top_percentile: float = 0.10,
+    t_window: float = 0.60
+) -> np.ndarray:
+    """
+    For each window i, computes contribution_i = full_pooled_score -
+    pooled_score_with_window_i_removed -- how much removing that single
+    window would change the subject-level pooled score under the ACTIVE
+    pooling formula. Positive means the window was pulling the pooled score
+    up (removing it lowers the score); negative means the opposite.
+
+    This answers an exact, retraining-free question -- "which windows does
+    the pooling formula itself say matter for this subject's score" --
+    which is logically prior to, and distinct from, "why did that window's
+    own classifier output score high" (the attribution/morphology
+    question). Binary (1D positive-class-probability) inputs only; 2D
+    multi-class arrays aren't supported here.
+
+    Cost is O(N^2) (pooling is recomputed from scratch per left-out window),
+    but N = windows per subject is small (tens to low hundreds), so this is
+    cheap in practice -- no need for Monte Carlo Shapley approximation.
+    """
+    window_probs = np.asarray(window_probs, dtype=np.float64)
+    n = len(window_probs)
+    if n <= 1:
+        return np.zeros(n)
+
+    full_score = compute_pooled_scores(window_probs, method=method, top_percentile=top_percentile, t_window=t_window)
+
+    contributions = np.zeros(n)
+    mask = np.ones(n, dtype=bool)
+    for i in range(n):
+        mask[i] = False
+        loo_score = compute_pooled_scores(window_probs[mask], method=method, top_percentile=top_percentile, t_window=t_window)
+        contributions[i] = full_score - loo_score
+        mask[i] = True
+
+    return contributions
+
+
+def rank_leave_one_out_contributions(
+    window_probs: np.ndarray,
+    method: str = "p85_score",
+    top_percentile: float = 0.10,
+    t_window: float = 0.60,
+    top_k: Optional[int] = None
+) -> List[Tuple[int, float]]:
+    """
+    Convenience wrapper around `compute_leave_one_out_contributions`:
+    returns (window_index, contribution) pairs sorted by |contribution|
+    descending, optionally truncated to the top_k largest-magnitude
+    contributors. `window_index` is positional within `window_probs` --
+    callers need their own raw-index array (e.g. a subject's
+    `report["indices"]` from p09c) to map back to actual .npy row numbers.
+    """
+    contributions = compute_leave_one_out_contributions(
+        window_probs, method=method, top_percentile=top_percentile, t_window=t_window
+    )
+    order = np.argsort(np.abs(contributions))[::-1]
+    if top_k is not None:
+        order = order[:top_k]
+    return [(int(i), float(contributions[i])) for i in order]
+
+
 # Standard sleep stage string normalization map
 STAGE_NORM_MAP = {
     "sleep stage w": "W", "stage w": "W", "wake": "W", "0": "W",
