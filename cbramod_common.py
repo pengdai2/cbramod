@@ -636,16 +636,6 @@ def rank_leave_one_out_contributions(
     return [(int(i), float(contributions[i])) for i in order]
 
 
-# Standard sleep stage string normalization map
-STAGE_NORM_MAP = {
-    "sleep stage w": "W", "stage w": "W", "wake": "W", "0": "W",
-    "sleep stage n1": "N1", "stage 1": "N1", "n1": "N1", "1": "N1",
-    "sleep stage n2": "N2", "stage 2": "N2", "n2": "N2", "2": "N2",
-    "sleep stage n3": "N3", "stage 3": "N3", "stage 4": "N3", "n3": "N3", "3": "N3", "4": "N3",
-    "sleep stage r": "REM", "stage rem": "REM", "rem": "REM", "5": "REM"
-}
-
-
 def setup_data_loader_and_criterion(
     dataset: Dataset,
     labels: np.ndarray,
