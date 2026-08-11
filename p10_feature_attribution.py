@@ -69,6 +69,12 @@ try:
 except ImportError:
     HAS_CAPTUM = False
 
+try:
+    import yasa
+    HAS_YASA = True
+except ImportError:
+    HAS_YASA = False
+
 from cbramod_common import CBraModE2EClassifier, load_model_checkpoint, setup_inference_cli_parser
 from cbramod_utils import seed_everything
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector
@@ -242,25 +248,112 @@ def _classify_morphology(dominant_freq_hz: float, duration_sec: float, peak_to_p
     return "unclassified"
 
 
+def detect_yasa_events(eeg_channel: np.ndarray, sfreq: float) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """
+    Runs YASA's validated spindle (`spindles_detect`) and slow-wave
+    (`sw_detect`) detectors once over a full channel's raw EEG, returning
+    their summary DataFrames (or None if unavailable/nothing detected).
+
+    Run once per window+channel and reused across all of that window's
+    hotspots via `_match_yasa_event` -- these detectors rely on
+    relative-power/envelope criteria that need more temporal context than a
+    single ~1s hotspot snippet provides, so they must see the full window,
+    not a truncated slice around one peak.
+    """
+    if not HAS_YASA:
+        return None, None
+
+    sp_df, sw_df = None, None
+    try:
+        sp = yasa.spindles_detect(eeg_channel, sf=sfreq, freq_sp=(11, 16), verbose=False)
+        sp_df = sp.summary() if sp is not None else None
+    except Exception as e:
+        print(f"  [YASA] Spindle detection failed, falling back to heuristic for this channel: {e}")
+
+    try:
+        sw = yasa.sw_detect(eeg_channel, sf=sfreq, verbose=False)
+        sw_df = sw.summary() if sw is not None else None
+    except Exception as e:
+        print(f"  [YASA] Slow-wave detection failed, falling back to heuristic for this channel: {e}")
+
+    return sp_df, sw_df
+
+
+def _match_yasa_event(
+    peak_time_sec: float,
+    sp_df: Optional[pd.DataFrame],
+    sw_df: Optional[pd.DataFrame]
+) -> Optional[Dict]:
+    """
+    Checks whether `peak_time_sec` falls inside any YASA-detected spindle or
+    slow-wave/K-complex event's [Start, End] interval. Returns a dict with
+    the validated tag, YASA's own duration/frequency/amplitude estimates
+    (computed from its literature-benchmarked algorithm, not our FFT-peak
+    heuristic), and the event's actual detected boundaries as
+    window_start_sec/window_end_sec (so the plotted snippet shows the real
+    detected event span rather than an arbitrary fixed half-span) -- or None
+    if no detected event covers this timepoint.
+    """
+    if sp_df is not None and len(sp_df):
+        hits = sp_df[(sp_df["Start"] <= peak_time_sec) & (peak_time_sec <= sp_df["End"])]
+        if len(hits):
+            row = hits.iloc[0]
+            return {
+                "morphology_tag": "sleep_spindle",
+                "tag_source": "yasa_spindles_detect",
+                "dominant_frequency_hz": float(row["Frequency"]),
+                "duration_sec": float(row["Duration"]),
+                "peak_to_peak_uv": float(row["Amplitude"]) if "Amplitude" in row else float("nan"),
+                "window_start_sec": float(row["Start"]),
+                "window_end_sec": float(row["End"]),
+            }
+
+    if sw_df is not None and len(sw_df):
+        hits = sw_df[(sw_df["Start"] <= peak_time_sec) & (peak_time_sec <= sw_df["End"])]
+        if len(hits):
+            row = hits.iloc[0]
+            return {
+                "morphology_tag": "k_complex_or_slow_wave",
+                "tag_source": "yasa_sw_detect",
+                "dominant_frequency_hz": float(row["Frequency"]),
+                "duration_sec": float(row["Duration"]),
+                "peak_to_peak_uv": float(row["PTP"]) if "PTP" in row else float("nan"),
+                "window_start_sec": float(row["Start"]),
+                "window_end_sec": float(row["End"]),
+            }
+
+    return None
+
+
 def characterize_morphology_hotspots(
     signal_attr: np.ndarray,
     raw_eeg: np.ndarray,
     sfreq: float,
     channel_idx: Optional[int] = None,
     top_k: int = 3,
-    snippet_sec: float = 1.0
+    snippet_sec: float = 1.0,
+    use_yasa: bool = True
 ) -> List[Dict]:
     """
     Finds the top_k highest (positive) attribution samples within
     `channel_idx` (defaults to the single most-attributed channel overall)
-    and extracts a `snippet_sec`-wide raw-EEG window centered on each,
-    tagging it with a coarse morphological guess (spindle, slow wave, sharp
-    transient, etc.) from dominant frequency + duration + amplitude.
+    and characterizes each one.
 
-    This is a starting point for "what does the model's top evidence
-    actually look like" -- pair with `plot_morphology_hotspots` and always
-    eyeball the returned snippet against the plotted trace rather than
-    trusting the tag alone.
+    Tagging priority: if `use_yasa` and YASA is installed, each hotspot is
+    first checked against YASA's validated spindle/slow-wave detections for
+    this channel (`detect_yasa_events` + `_match_yasa_event`) -- these use
+    literature-benchmarked criteria over the full window, not a short
+    snippet, and should be trusted over the fallback. Only when no detected
+    event covers the hotspot (e.g. it's a sharp transient/artifact outside
+    YASA's scope, or YASA isn't installed) do we fall back to the coarser
+    dominant-frequency/duration/amplitude heuristic on a `snippet_sec`-wide
+    window extracted around the peak. Each returned hotspot's "tag_source"
+    field says which path produced it.
+
+    This is still a triage aid, not ground truth -- pair with
+    `plot_morphology_hotspots` and eyeball the returned snippet against the
+    plotted trace rather than trusting any tag (YASA-sourced or heuristic)
+    outright.
 
     Hotspots are found by repeatedly taking the highest remaining positive
     attribution sample, then "claiming" (excluding from further selection)
@@ -273,6 +366,8 @@ def characterize_morphology_hotspots(
     attr_1d = signal_attr[channel_idx]
     eeg_1d = raw_eeg[channel_idx]
     half_span = max(1, int(round(snippet_sec * sfreq / 2)))
+
+    sp_df, sw_df = detect_yasa_events(eeg_1d, sfreq) if use_yasa else (None, None)
 
     pos_attr = np.maximum(attr_1d, 0)
     order = np.argsort(pos_attr)[::-1]
@@ -289,24 +384,36 @@ def characterize_morphology_hotspots(
         end = min(len(eeg_1d), idx + half_span)
         claimed[start:end] = True
 
-        snippet = eeg_1d[start:end]
-        dominant_freq = _dominant_frequency(snippet, sfreq)
-        duration_sec = (end - start) / sfreq
-        peak_to_peak_uv = float(snippet.max() - snippet.min()) if len(snippet) else 0.0
-        tag = _classify_morphology(dominant_freq, duration_sec, peak_to_peak_uv)
+        peak_time_sec = float(idx / sfreq)
+        yasa_match = _match_yasa_event(peak_time_sec, sp_df, sw_df) if use_yasa else None
 
-        hotspots.append({
+        if yasa_match is not None:
+            hotspot = dict(yasa_match)
+        else:
+            snippet = eeg_1d[start:end]
+            dominant_freq = _dominant_frequency(snippet, sfreq)
+            duration_sec = (end - start) / sfreq
+            peak_to_peak_uv = float(snippet.max() - snippet.min()) if len(snippet) else 0.0
+            hotspot = {
+                "morphology_tag": _classify_morphology(dominant_freq, duration_sec, peak_to_peak_uv),
+                "tag_source": "heuristic",
+                "dominant_frequency_hz": dominant_freq,
+                "duration_sec": duration_sec,
+                "peak_to_peak_uv": peak_to_peak_uv,
+            }
+
+        hotspot.update({
             "channel": channel_idx,
             "peak_sample_idx": int(idx),
-            "peak_time_sec": float(idx / sfreq),
+            "peak_time_sec": peak_time_sec,
             "attribution": float(attr_1d[idx]),
-            "window_start_sec": float(start / sfreq),
-            "window_end_sec": float(end / sfreq),
-            "dominant_frequency_hz": dominant_freq,
-            "duration_sec": duration_sec,
-            "peak_to_peak_uv": peak_to_peak_uv,
-            "morphology_tag": tag
         })
+        # A YASA match already carries the real detected event's
+        # window_start_sec/window_end_sec (see _match_yasa_event) -- only
+        # fall back to the fixed half-span snippet bounds when there isn't one.
+        hotspot.setdefault("window_start_sec", float(start / sfreq))
+        hotspot.setdefault("window_end_sec", float(end / sfreq))
+        hotspots.append(hotspot)
 
     return hotspots
 
@@ -328,22 +435,24 @@ def plot_morphology_hotspots(
     for i, hotspot in enumerate(hotspots):
         ax = axes[i, 0]
         ch = hotspot["channel"]
-        start_sample = int(round(hotspot["window_start_sec"] * sfreq))
-        end_sample = int(round(hotspot["window_end_sec"] * sfreq))
+        num_samples = raw_eeg.shape[1]
+        start_sample = max(0, int(round(hotspot["window_start_sec"] * sfreq)))
+        end_sample = min(num_samples, max(start_sample + 1, int(round(hotspot["window_end_sec"] * sfreq))))
 
         snippet_eeg = raw_eeg[ch, start_sample:end_sample]
         snippet_attr = np.maximum(signal_attr[ch, start_sample:end_sample], 0)
         snippet_time = np.arange(start_sample, end_sample) / sfreq
 
         ax.plot(snippet_time, snippet_eeg, color='black', linewidth=1.0)
-        if snippet_attr.max() > 0:
+        if snippet_attr.size and snippet_attr.max() > 0:
             attr_norm = snippet_attr / snippet_attr.max() * np.abs(snippet_eeg).max()
             ax.fill_between(snippet_time, 0, attr_norm, color='crimson', alpha=0.3)
         ax.axvline(hotspot["peak_time_sec"], color='crimson', linestyle='--', linewidth=1.0)
 
+        source_note = "YASA-detected" if hotspot["tag_source"].startswith("yasa") else "heuristic"
         ax.set_title(
             f"Hotspot {i + 1}: Ch {ch} @ {hotspot['peak_time_sec']:.2f}s -- "
-            f"{hotspot['morphology_tag']} "
+            f"{hotspot['morphology_tag']} [{source_note}] "
             f"(dom.freq={hotspot['dominant_frequency_hz']:.1f}Hz, "
             f"dur={hotspot['duration_sec']:.2f}s, p2p={hotspot['peak_to_peak_uv']:.1f}uV)",
             fontsize=10
@@ -665,7 +774,15 @@ def parse_cli_args() -> argparse.Namespace:
     )
     attr_group.add_argument(
         "--hotspot-snippet-sec", type=float, default=1.0,
-        help="Width (seconds) of the raw-EEG snippet extracted around each morphology hotspot peak."
+        help="Width (seconds) of the raw-EEG snippet extracted around each morphology hotspot peak, used "
+             "only as a fallback when YASA doesn't detect a validated event covering that peak (or "
+             "--no-yasa-detectors is set)."
+    )
+    attr_group.add_argument(
+        "--no-yasa-detectors", dest="use_yasa_detectors", action="store_false", default=True,
+        help="Disable checking morphology hotspots against YASA's validated spindle/slow-wave detectors "
+             "(yasa.spindles_detect/sw_detect), falling back to the dominant-frequency/duration/amplitude "
+             "heuristic for every hotspot instead. Has no effect if YASA isn't installed."
     )
 
     args = parser.parse_args()
@@ -691,6 +808,13 @@ def main():
     patch_size_samples = int(round(args.sfreq))
     window_sec = float(args.num_patches)
     morphology_tier_filter = _resolve_tier_filter(args.morphology_tiers)
+    use_yasa = args.use_yasa_detectors and args.top_k_hotspots > 0
+    if args.top_k_hotspots > 0 and args.use_yasa_detectors and not HAS_YASA:
+        print(
+            "  [Warning] --no-yasa-detectors was not set but YASA is not installed; morphology hotspots "
+            "will use the dominant-frequency/duration/amplitude heuristic for every hotspot instead of "
+            "YASA's validated spindle/slow-wave detectors."
+        )
 
     print("Instantiating full CBraModE2EClassifier for raw waveform attribution.")
     model = CBraModE2EClassifier(
@@ -827,12 +951,13 @@ def main():
                     sfreq=args.sfreq,
                     channel_idx=int(top_k_idx[0]),
                     top_k=args.top_k_hotspots,
-                    snippet_sec=args.hotspot_snippet_sec
+                    snippet_sec=args.hotspot_snippet_sec,
+                    use_yasa=use_yasa
                 )
                 print(f"  Morphology hotspots (Ch {int(top_k_idx[0])}):")
                 for h in hotspots:
                     print(
-                        f"    t={h['peak_time_sec']:.2f}s -> {h['morphology_tag']} "
+                        f"    t={h['peak_time_sec']:.2f}s -> {h['morphology_tag']} [{h['tag_source']}] "
                         f"(dom.freq={h['dominant_frequency_hz']:.1f}Hz, dur={h['duration_sec']:.2f}s, "
                         f"p2p={h['peak_to_peak_uv']:.1f}uV, attribution={h['attribution']:.4g})"
                     )
