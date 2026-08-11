@@ -1,13 +1,22 @@
 import argparse
 import os
+import re
 import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
+from typing import Optional
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from tqdm import tqdm
+
+
+def valid_regex(pattern_string: str) -> re.Pattern:
+    try:
+        return re.compile(pattern_string)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"Invalid regex: '{pattern_string}' ({e})")
 
 
 def get_block_device_path(target_mount_dir: Path) -> Path:
@@ -73,11 +82,17 @@ def sync_directory_from_s3(
     target_dir: Path,
     endpoint_url: str = None,
     concurrency: int = 16,
-    force: bool = False
+    force: bool = False,
+    filename_pattern: Optional[re.Pattern] = None
 ) -> Path:
     """
     Recursively lists all objects under s3_prefix and downloads them in parallel
     directly to local NVMe/SSD block storage.
+
+    `filename_pattern`, if given, restricts the download to objects whose basename (not full S3 key)
+    matches the regex -- e.g. `--filename_pattern '_meta\\.json$'` for a metadata-only re-download
+    after a p02 re-slice that only regenerated *_meta.json, skipping the much larger unchanged
+    *_windows.npy objects.
     """
     s3_client = boto3.client("s3", endpoint_url=endpoint_url)
     s3_prefix = s3_prefix.strip("/")
@@ -90,17 +105,26 @@ def sync_directory_from_s3(
 
     s3_objects = []
     total_bytes = 0
+    total_listed = 0
 
     for page in pages:
         for obj in page.get("Contents", []):
             # Skip directory markers
             if obj["Key"].endswith("/"):
                 continue
+            total_listed += 1
+            if filename_pattern is not None and not filename_pattern.search(Path(obj["Key"]).name):
+                continue
             s3_objects.append(obj)
             total_bytes += obj["Size"]
 
+    if filename_pattern is not None:
+        print(f"Filename pattern '{filename_pattern.pattern}' matched {len(s3_objects):,}/{total_listed:,} objects.")
+
     if not s3_objects:
-        raise FileNotFoundError(f"No objects found in s3://{bucket_name}/{s3_prefix}")
+        raise FileNotFoundError(f"No objects found in s3://{bucket_name}/{s3_prefix}" + (
+            f" matching pattern '{filename_pattern.pattern}'" if filename_pattern is not None else ""
+        ))
 
     print(f"Found {len(s3_objects):,} files totaling {total_bytes / (1024**3):.2f} GB.")
     print(f"Syncing to local storage ({target_dir}) using {concurrency} worker threads...\n")
@@ -145,9 +169,12 @@ def sync_directory_from_s3(
     if successful < len(s3_objects):
         raise RuntimeError(f"Download incomplete: {successful}/{len(s3_objects)} files downloaded successfully.")
 
-    # Write marker file
-    marker_file = target_dir / ".sync_complete"
-    marker_file.touch()
+    # Write the "fully synced" marker only for an UNFILTERED sync -- a filename_pattern run only
+    # touches a subset of objects (e.g. metadata-only), so writing this marker here would falsely
+    # tell a later unfiltered run that the full dataset is already present and it can skip downloading.
+    if filename_pattern is None:
+        marker_file = target_dir / ".sync_complete"
+        marker_file.touch()
 
     print(f"\n[SUCCESS] Synced {successful}/{len(s3_objects)} files to local storage.")
     return target_dir
@@ -159,7 +186,8 @@ def setup_local_block_storage(
     mount_point: Path,
     endpoint_url: str = None,
     concurrency: int = 16,
-    force_reprovision: bool = False
+    force_reprovision: bool = False,
+    filename_pattern: Optional[re.Pattern] = None
 ) -> Path:
     """End-to-end orchestration: Prepares block storage and streams S3 files in parallel."""
     mount_point = Path(mount_point).resolve()
@@ -168,8 +196,11 @@ def setup_local_block_storage(
     dataset_target_path = mount_point / "dataset"
     dataset_target_path.mkdir(parents=True, exist_ok=True)
 
+    # The ".sync_complete" skip-shortcut only applies to a full, unfiltered sync -- a filename_pattern
+    # run (e.g. metadata-only) represents a different, smaller scope than what that marker means, so it
+    # always runs regardless of whether a prior full sync completed.
     marker_file = dataset_target_path / ".sync_complete"
-    if marker_file.exists() and not force_reprovision:
+    if filename_pattern is None and marker_file.exists() and not force_reprovision:
         print(f"Dataset already fully synced to {dataset_target_path}. Skipping download.")
         print("Use --force to re-verify or force download.")
         return dataset_target_path
@@ -181,7 +212,8 @@ def setup_local_block_storage(
         target_dir=dataset_target_path,
         endpoint_url=endpoint_url,
         concurrency=concurrency,
-        force=force_reprovision
+        force=force_reprovision,
+        filename_pattern=filename_pattern
     )
 
     print(f"\n=== Local Storage Provisioning Complete ===")
@@ -197,6 +229,14 @@ if __name__ == "__main__":
     parser.add_argument("--endpoint_url", type=str, default=None, help="Custom S3 API endpoint URL (optional)")
     parser.add_argument("--concurrency", type=int, default=16, help="Max parallel download threads [Default: 16]")
     parser.add_argument("--force", action="store_true", help="Force re-verification/download of all files")
+    parser.add_argument(
+        "--filename_pattern", type=valid_regex, default=None,
+        help="Optional regex matched against each object's basename (not full S3 key) to restrict "
+             "which files get downloaded -- e.g. '_meta\\.json$' for a metadata-only re-download "
+             "after a p02 re-slice that only regenerated metadata, skipping the much larger unchanged "
+             ".npy tensors. Bypasses the .sync_complete skip-shortcut (that marker means the FULL "
+             "dataset synced, which a filtered run never claims) and does not write it either."
+    )
 
     args = parser.parse_args()
 
@@ -206,5 +246,6 @@ if __name__ == "__main__":
         mount_point=Path(args.mount_point),
         endpoint_url=args.endpoint_url,
         concurrency=args.concurrency,
-        force_reprovision=args.force
+        force_reprovision=args.force,
+        filename_pattern=args.filename_pattern
     )

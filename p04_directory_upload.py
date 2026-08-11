@@ -1,13 +1,22 @@
 import argparse
 import hashlib
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
+from typing import Optional
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from tqdm import tqdm
+
+
+def valid_regex(pattern_string: str) -> re.Pattern:
+    try:
+        return re.compile(pattern_string)
+    except re.error as e:
+        raise argparse.ArgumentTypeError(f"Invalid regex: '{pattern_string}' ({e})")
 
 
 def calculate_sha256(file_path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -151,16 +160,26 @@ def sync_directory_to_s3(
     s3_prefix: str,
     endpoint_url: str = None,
     part_size_mb: int = 32,
-    concurrency: int = 16
+    concurrency: int = 16,
+    filename_pattern: Optional[re.Pattern] = None
 ):
     """
     Recursively scans local folder and uploads all files in parallel.
     Preserves directory structure relative to data_dir root.
+
+    `filename_pattern`, if given, restricts the upload to files whose NAME (not full path) matches
+    the regex -- e.g. for a metadata-only re-upload after a p02 re-slice that only regenerated
+    *_meta.json (not the much larger *_windows.npy), pass `--filename-pattern '_meta\\.json$'` to
+    skip re-uploading every unchanged .npy.
     """
     data_dir = Path(data_dir).resolve()
     print(f"Scanning directory '{data_dir}' for files...")
-    
+
     all_files = [f for f in data_dir.rglob("*") if f.is_file()]
+    total_found = len(all_files)
+    if filename_pattern is not None:
+        all_files = [f for f in all_files if filename_pattern.search(f.name)]
+        print(f"Filename pattern '{filename_pattern.pattern}' matched {len(all_files):,}/{total_found:,} files.")
     total_bytes = sum(f.stat().st_size for f in all_files)
 
     print(f"Found {len(all_files):,} files totaling {total_bytes / (1024**3):.2f} GB.")
@@ -207,6 +226,12 @@ if __name__ == "__main__":
     parser.add_argument("--endpoint_url", type=str, default=None, help="Custom S3 endpoint (e.g. https://storage.googleapis.com)")
     parser.add_argument("--part_size_mb", type=int, default=32, help="Multipart chunk threshold in MB [Default: 32MB]")
     parser.add_argument("--concurrency", type=int, default=16, help="Max parallel file upload threads [Default: 16]")
+    parser.add_argument(
+        "--filename_pattern", type=valid_regex, default=None,
+        help="Optional regex matched against each file's NAME (not full path) to restrict which files "
+             "get uploaded -- e.g. '_meta\\.json$' for a metadata-only re-upload after a p02 re-slice "
+             "that only regenerated metadata, skipping the much larger unchanged .npy tensors."
+    )
 
     args = parser.parse_args()
 
@@ -216,5 +241,6 @@ if __name__ == "__main__":
         s3_prefix=args.s3_prefix,
         endpoint_url=args.endpoint_url,
         part_size_mb=args.part_size_mb,
-        concurrency=args.concurrency
+        concurrency=args.concurrency,
+        filename_pattern=args.filename_pattern
     )
