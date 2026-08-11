@@ -25,12 +25,13 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
+from cbramod_common import extract_epoch_stages, predict_epoch_stages_yasa
 import mne
 import yasa
 import numpy as np
 from scipy.signal import hilbert
 from tqdm import tqdm
-from cbramod_utils import extract_epoch_stages, predict_epoch_stages_yasa, find_eeg_files, load_raw_eeg, valid_regex
+from cbramod_utils import find_eeg_files, load_raw_eeg, valid_regex
 
 
 # Standard CBraMod 64-channel 10-20 spatial layout topology
@@ -262,7 +263,19 @@ def prepare_clean_raw_eeg(
 
     logger.debug(f"{tag}Discovered {len(recorded_eeg_chs)} valid scalp EEG channels.")
 
-    raw_eeg = raw_orig.copy().pick(recorded_eeg_chs)
+    # Locate A1/A2 (linked-earlobe reference electrodes) BEFORE picking down to the CBraMod scalp
+    # layout. A1/A2 aren't part of CBRMOD_STANDARD_64, so discover_cbramod_channels() never finds
+    # them -- picking only recorded_eeg_chs here (as this used to do unconditionally) would silently
+    # drop A1/A2 before apply_eeg_referencing() ever runs, making its "prefer linked-earlobe if
+    # present" check permanently unreachable and forcing every subject onto Common Average Reference
+    # regardless of whether A1/A2 actually exist in the recording.
+    ch_clean_orig = [clean_ch_name(ch) for ch in raw_orig.ch_names]
+    earlobe_chs = [raw_orig.ch_names[ch_clean_orig.index(name)] for name in ("A1", "A2") if name in ch_clean_orig]
+    if earlobe_chs:
+        logger.debug(f"{tag}Found linked-earlobe reference channel(s): {earlobe_chs}.")
+
+    pick_chs = recorded_eeg_chs + [ch for ch in earlobe_chs if ch not in recorded_eeg_chs]
+    raw_eeg = raw_orig.copy().pick(pick_chs)
 
     logger.debug(f"{tag}Applying zero-phase FIR bandpass filter ({l_freq} Hz - {h_freq} Hz)...")
     raw_eeg.filter(
@@ -274,6 +287,12 @@ def prepare_clean_raw_eeg(
     )
 
     raw_ref = apply_eeg_referencing(raw_eeg, subject_id=subject_id)
+
+    # Drop A1/A2 now that referencing is done -- they were only needed as the reference and aren't
+    # part of the CBraMod 64-channel scalp layout the rest of the pipeline (bad-channel detection,
+    # interpolation, harmonization) operates on.
+    if earlobe_chs:
+        raw_ref = raw_ref.copy().pick(recorded_eeg_chs)
 
     raw_clean_eeg, bad_chs, subject_ok = detect_and_interpolate_bad_channels(
         raw_ref, 
