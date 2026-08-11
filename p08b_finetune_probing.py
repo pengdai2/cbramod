@@ -31,7 +31,7 @@ import sys
 import time
 
 import numpy as np
-from cbramod_utils import seed_everything, setup_logger
+from cbramod_utils import setup_logger
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
@@ -44,6 +44,7 @@ from cbramod_common import (
     LinearProbeHead,
     MLPProbeHead,
     PANSleepEEGDataset,
+    seed_everything,
     setup_data_loader_and_criterion,
     setup_training_cli_parser
 )

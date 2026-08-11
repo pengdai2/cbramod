@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 import pandas as pd
 
-from cbramod_common import evaluate_subject_quality
+from cbramod_utils import evaluate_subject_quality
 
 
 def parse_label_map(label_map_arg: str) -> Dict[str, int]:

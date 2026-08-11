@@ -10,7 +10,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 
-from cbramod_common import evaluate_subject_quality
+from cbramod_utils import evaluate_subject_quality
 
 
 def evaluate_subject_gatekeeping(

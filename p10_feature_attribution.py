@@ -76,7 +76,7 @@ except ImportError:
     HAS_YASA = False
 
 from cbramod_common import CBraModE2EClassifier, load_model_checkpoint, setup_inference_cli_parser
-from cbramod_utils import seed_everything
+from cbramod_common import seed_everything
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector
 
 

@@ -25,13 +25,12 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
-from cbramod_common import extract_epoch_stages, predict_epoch_stages_yasa
 import mne
 import yasa
 import numpy as np
 from scipy.signal import hilbert
 from tqdm import tqdm
-from cbramod_utils import find_eeg_files, load_raw_eeg, valid_regex
+from cbramod_utils import extract_epoch_stages, predict_epoch_stages_yasa, find_eeg_files, load_raw_eeg, valid_regex
 
 
 # Standard CBraMod 64-channel 10-20 spatial layout topology

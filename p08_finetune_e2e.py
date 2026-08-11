@@ -24,10 +24,11 @@ from cbramod_common import (
     CBraModE2EClassifier,
     CBraModTrainer,
     PANSleepEEGDataset,
+    seed_everything,
     setup_data_loader_and_criterion,
     setup_training_cli_parser
 )
-from cbramod_utils import seed_everything, setup_logger
+from cbramod_utils import setup_logger
 
 
 # =====================================================================

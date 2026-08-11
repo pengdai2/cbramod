@@ -5,9 +5,9 @@ import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple, Union
-from cbramod_common import extract_epoch_stages
+from cbramod_utils import extract_epoch_stages
 from cbramod_utils import find_eeg_files, load_raw_eeg, valid_regex
-from cbramod_common import predict_epoch_stages_yasa
+from cbramod_utils import predict_epoch_stages_yasa
 from tqdm import tqdm
 
 

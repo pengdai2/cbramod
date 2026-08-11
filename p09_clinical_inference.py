@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
-from cbramod_utils import seed_everything
+from cbramod_common import seed_everything
 import torch
 from sklearn.metrics import (
     accuracy_score,

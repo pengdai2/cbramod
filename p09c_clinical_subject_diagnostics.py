@@ -23,7 +23,7 @@ from cbramod_common import (
     resolve_pooling_config,
     setup_inference_cli_parser
 )
-from cbramod_utils import seed_everything
+from cbramod_common import seed_everything
 
 
 class SubjectEEGInspector:
