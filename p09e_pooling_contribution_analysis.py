@@ -46,7 +46,7 @@ Usage:
 import argparse
 import json
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -69,6 +69,82 @@ from cbramod_utils import seed_everything
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector, load_subject_ids_from_json
 
 
+# -----------------------------------------------------------------------------
+# Temporal clustering null-model test
+# -----------------------------------------------------------------------------
+#
+# Contributor windows can look "clustered in time" purely because of the
+# stage-filtering already applied upstream (e.g. --filter-stage N2,N3 means
+# only NREM windows exist at all, and NREM occurs in recurring bouts across
+# a night -- so ANY subset of the valid window pool, including a random one,
+# will show some apparent clustering just from that architecture). The only
+# way to tell "genuinely more clustered than expected" apart from "just how
+# N2/N3 naturally distributes across this recording" is to compare against
+# a null model built from the SAME subject's own valid-window population.
+
+def compute_temporal_clustering_statistic(times_sec: np.ndarray) -> float:
+    """
+    Summarizes how temporally clustered a set of window timestamps is via
+    the median gap between consecutive timestamps (sorted ascending).
+    Smaller -> more clustered (most windows have a close neighbor in time);
+    larger -> more spread out.
+    """
+    times_sec = np.sort(np.asarray(times_sec, dtype=np.float64))
+    if len(times_sec) < 2:
+        return float("nan")
+    return float(np.median(np.diff(times_sec)))
+
+
+def run_temporal_clustering_null_test(
+    contributor_times_sec: np.ndarray,
+    population_times_sec: np.ndarray,
+    n_bootstrap: int = 1000,
+    seed: int = 42
+) -> Dict:
+    """
+    Tests whether `contributor_times_sec` are more temporally clustered than
+    expected by chance, given the full population of valid window
+    timestamps (e.g. every N2/N3 window for this subject) they were drawn
+    from. Draws `n_bootstrap` random same-size samples (without
+    replacement) from `population_times_sec`, computes the same clustering
+    statistic for each, and reports where the observed statistic falls in
+    that null distribution.
+
+    `empirical_p_value` is the fraction of random draws at least as
+    clustered as what was actually observed (i.e. P(null stat <= observed
+    stat)) -- small (e.g. < 0.05) means the real contributors are more
+    tightly clustered in time than a random same-size sample of this
+    subject's own valid windows would be, which is NOT explained away by
+    stage-filtering/sleep-cycle architecture alone (that's already baked
+    into the null model via `population_times_sec`).
+    """
+    rng = np.random.RandomState(seed)
+    observed_stat = compute_temporal_clustering_statistic(contributor_times_sec)
+
+    n = len(contributor_times_sec)
+    population_times_sec = np.asarray(population_times_sec, dtype=np.float64)
+    if n >= len(population_times_sec):
+        print(
+            "  [Warning] Contributor count >= population size -- the null model is degenerate "
+            "(every random draw is just the full population), so this test is uninformative here."
+        )
+
+    null_stats = np.empty(n_bootstrap)
+    for b in range(n_bootstrap):
+        sample = rng.choice(population_times_sec, size=n, replace=False)
+        null_stats[b] = compute_temporal_clustering_statistic(sample)
+
+    return {
+        "observed_median_gap_sec": observed_stat,
+        "null_median_gap_mean_sec": float(np.mean(null_stats)),
+        "null_median_gap_std_sec": float(np.std(null_stats)),
+        "empirical_p_value": float(np.mean(null_stats <= observed_stat)),
+        "n_bootstrap": n_bootstrap,
+        "population_size": int(len(population_times_sec)),
+        "sample_size": int(n)
+    }
+
+
 def parse_cli_args() -> argparse.Namespace:
     parser = setup_inference_cli_parser(description="Leave-One-Out Pooling Contribution Analysis")
     contrib_group = parser.add_argument_group("Pooling Contribution Analysis")
@@ -80,6 +156,11 @@ def parse_cli_args() -> argparse.Namespace:
         "--subjects-json", type=str, default=None,
         help="Path to a p09d_subject_confidence_report.py --output-json report. Its subject_ids are "
              "unioned with --subject-id (if also given) to select which subjects to analyze."
+    )
+    contrib_group.add_argument(
+        "--clustering-n-bootstrap", type=int, default=1000,
+        help="Number of random same-size draws from each subject's full valid-window population used "
+             "to build the null distribution for the temporal clustering test. Set to 0 to skip the test."
     )
     return parser.parse_args()
 
@@ -206,6 +287,23 @@ def main():
                 f"contribution={record['contribution']:+.4f}"
             )
 
+        clustering_test = None
+        if args.clustering_n_bootstrap > 0 and len(contributor_records) >= 2:
+            contributor_times_sec = np.array([r["start_time_sec"] for r in contributor_records])
+            population_times_sec = np.array(report["indices"], dtype=np.float64) * window_sec
+            clustering_test = run_temporal_clustering_null_test(
+                contributor_times_sec, population_times_sec,
+                n_bootstrap=args.clustering_n_bootstrap, seed=args.seed
+            )
+            print(
+                f"  Temporal clustering test: observed median gap={clustering_test['observed_median_gap_sec']:.1f}s "
+                f"vs. null mean={clustering_test['null_median_gap_mean_sec']:.1f}s "
+                f"(+/-{clustering_test['null_median_gap_std_sec']:.1f}s) "
+                f"-> p={clustering_test['empirical_p_value']:.4f} "
+                f"[population={clustering_test['population_size']} windows, "
+                f"n_bootstrap={clustering_test['n_bootstrap']}]"
+            )
+
         json_path = output_dir / f"{subj_id}_pooling_contributors.json"
         export_payload = {
             "subject_id": subj_id,
@@ -215,7 +313,8 @@ def main():
             "pooling_strategy": pooling_strategy,
             "top_percentile": top_percentile,
             "t_window": t_window,
-            "priority_tiers": {tier_name: contributor_records}
+            "priority_tiers": {tier_name: contributor_records},
+            "temporal_clustering_test": clustering_test
         }
         with open(json_path, "w") as f:
             json.dump(export_payload, f, indent=4)
