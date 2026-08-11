@@ -242,16 +242,36 @@ def main():
     feature_cols = [c for c in df.columns if c not in
                      ("subject_id", "ground_truth", "raw_epoch_index", "stage", "probability")]
 
+    report_correlations(df, feature_cols, "ALL STAGES COMBINED")
+
+    # Stage-stratified breakdown: a feature correlating with probability across a mix of stages
+    # (e.g. N2 + N3) could just be reflecting a coarse stage effect -- delta power is definitionally
+    # higher in N3, sigma/spindle power definitionally higher in N2, so "delta up / sigma down"
+    # correlating with probability is exactly what you'd see if the model merely scores one stage
+    # higher than the other, with no finer-grained relationship at all. Splitting by stage before
+    # correlating checks whether the relationship survives *within* a single stage, which is the
+    # more specific (and more interesting) claim.
+    stages_present = sorted(s for s in df["stage"].unique() if s and s != "UNKNOWN")
+    for stage in stages_present:
+        report_correlations(df[df["stage"] == stage], feature_cols, f"STAGE = {stage} ONLY")
+
+
+def report_correlations(df: pd.DataFrame, feature_cols: List[str], section_label: str) -> None:
+    """Prints both the pooled and within-subject correlation summary for one (sub)set of window rows."""
     print("\n" + "=" * 88)
-    print("POOLED CORRELATION (all windows, all subjects together -- conflates within/between-subject variance)")
+    print(f"POOLED CORRELATION -- {section_label} "
+          f"(all windows, all subjects together -- conflates within/between-subject variance)")
     print("=" * 88)
+    if len(df) == 0:
+        print("  (no rows in this subset)")
+        return
     for col in feature_cols:
         r = spearman_corr(df["probability"].values, df[col].values)
         print(f"  probability vs {col:20s}: Spearman r = {r:+.4f}  (n={len(df)})")
 
-    print("\n" + "=" * 88)
-    print("WITHIN-SUBJECT CORRELATION (summarized across subjects -- the direct test)")
-    print("=" * 88)
+    print("\n" + "-" * 88)
+    print(f"WITHIN-SUBJECT CORRELATION -- {section_label} (summarized across subjects -- the direct test)")
+    print("-" * 88)
     for col in feature_cols:
         per_subject_r = []
         for _, group in df.groupby("subject_id"):
