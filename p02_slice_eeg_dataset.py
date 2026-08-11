@@ -304,22 +304,35 @@ def harmonize_channels_to_cbramod(data_uV: np.ndarray, orig_ch_names: List[str])
 
 
 def process_and_normalize_slice(
-    slice_64: np.ndarray, 
-    min_std: float = 0.5, 
+    slice_64: np.ndarray,
+    min_std: float = 0.5,
     max_std: float = 150.0,
     window_id: str = "",
     subject_id: str = ""
-) -> Tuple[np.ndarray, bool, str]:
+) -> Tuple[np.ndarray, bool, str, np.ndarray, np.ndarray]:
     """
-    Evaluates window active channels for residual flatlines or extreme artifacts with 
+    Evaluates window active channels for residual flatlines or extreme artifacts with
     detailed debug logging, then applies per-window Z-score normalization strictly on active channels.
+
+    Also returns the per-channel mean/std (uV) actually used for that
+    normalization (`norm_mean_uv`/`norm_std_uv`, length == slice_64.shape[0],
+    0.0 for zero-padded/inactive channels and for rejected windows, which
+    are never normalized at all). Callers should persist these into the
+    slice's metadata so the exact original uV signal can be reconstructed
+    later without needing to re-derive anything from the source recording:
+
+        original_uV = normalized * (norm_std_uv + 1e-8) + norm_mean_uv
+
+    (same 1e-8 epsilon as used below, required for an exact inverse).
     """
+    num_channels = slice_64.shape[0]
+    zero_stats = np.zeros(num_channels, dtype=np.float32)
     tag = f"[Subj: {subject_id}] " if subject_id else ""
     nonzero_mask = np.abs(slice_64).sum(axis=-1) > 1e-8
 
     if not np.any(nonzero_mask):
         logger.debug(f"{tag}[REJECT WINDOW {window_id}] Reason: EMPTY_CHANNEL_DATA (All channels zero-padded/empty).")
-        return np.zeros_like(slice_64, dtype=np.float32), False, "EMPTY_CHANNEL_DATA"
+        return np.zeros_like(slice_64, dtype=np.float32), False, "EMPTY_CHANNEL_DATA", zero_stats.copy(), zero_stats.copy()
 
     active_stds = slice_64[nonzero_mask].std(axis=-1)
 
@@ -330,7 +343,7 @@ def process_and_normalize_slice(
             f"{tag}[REJECT WINDOW {window_id}] Reason: FLATLINE_DETECTED "
             f"(Min active channel std: {min_found_std:.3f} uV < threshold {min_std:.2f} uV)."
         )
-        return np.zeros_like(slice_64, dtype=np.float32), False, "FLATLINE_DETECTED"
+        return np.zeros_like(slice_64, dtype=np.float32), False, "FLATLINE_DETECTED", zero_stats.copy(), zero_stats.copy()
 
     # 2. Check for extreme transient artifacts (e.g., electrode pop or motion)
     max_found_std = active_stds.max()
@@ -339,7 +352,7 @@ def process_and_normalize_slice(
             f"{tag}[REJECT WINDOW {window_id}] Reason: EXTREME_ARTIFACT "
             f"(Max active channel std: {max_found_std:.2f} uV > threshold {max_std:.2f} uV)."
         )
-        return np.zeros_like(slice_64, dtype=np.float32), False, "EXTREME_ARTIFACT"
+        return np.zeros_like(slice_64, dtype=np.float32), False, "EXTREME_ARTIFACT", zero_stats.copy(), zero_stats.copy()
 
     # 3. Apply Z-score normalization strictly across active channels
     normalized = slice_64.copy()
@@ -347,7 +360,13 @@ def process_and_normalize_slice(
     stds = normalized[nonzero_mask].std(axis=-1, keepdims=True)
 
     normalized[nonzero_mask] = (normalized[nonzero_mask] - means) / (stds + 1e-8)
-    return normalized, True, "OK"
+
+    norm_mean_uv = zero_stats.copy()
+    norm_std_uv = zero_stats.copy()
+    norm_mean_uv[nonzero_mask] = means.squeeze(-1)
+    norm_std_uv[nonzero_mask] = stds.squeeze(-1)
+
+    return normalized, True, "OK", norm_mean_uv, norm_std_uv
 
 
 def slice_strategy_a_macro(
@@ -380,6 +399,8 @@ def slice_strategy_a_macro(
             "quality_status": "REJECTED_BAD_CHANNELS_OR_CLUSTERS",
             "num_recorded_channels": len(recorded_chs),
             "bad_channels_detected": bad_chs,
+            "norm_mean_uv": [0.0] * 64,
+            "norm_std_uv": [0.0] * 64,
             "type": "macro_30s"
         } for idx in range(num_windows)]
         return np.stack(slices, axis=0), metadata, raw_stages
@@ -403,7 +424,7 @@ def slice_strategy_a_macro(
         
         # Screen window quality and apply Z-score normalization
         win_id_str = f"#{idx} ({start_sec:.1f}s-{end_sec:.1f}s)"
-        window_norm, is_valid, quality_status = process_and_normalize_slice(
+        window_norm, is_valid, quality_status, norm_mean_uv, norm_std_uv = process_and_normalize_slice(
             window_raw, window_id=win_id_str, subject_id=subject_id
         )
 
@@ -422,6 +443,11 @@ def slice_strategy_a_macro(
             "quality_status": quality_status,
             "num_recorded_channels": len(recorded_chs),
             "bad_channels_interpolated": bad_chs,
+            # Per-channel mean/std (uV) used for this window's Z-score normalization --
+            # 0.0 for zero-padded/inactive channels or rejected windows (never normalized).
+            # Reconstruct the original uV signal via: normalized*(norm_std_uv+1e-8) + norm_mean_uv
+            "norm_mean_uv": norm_mean_uv.tolist(),
+            "norm_std_uv": norm_std_uv.tolist(),
             "type": "macro_30s"
         })
 
@@ -542,14 +568,17 @@ def slice_strategy_b_micro(
         peak_t = meta.get("peak_sec", 0.0)
         win_id_str = f"event_{idx} (peak={peak_t:.1f}s)"
         
-        norm_crop, is_valid, quality_status = process_and_normalize_slice(
+        norm_crop, is_valid, quality_status, norm_mean_uv, norm_std_uv = process_and_normalize_slice(
             crop, window_id=win_id_str, subject_id=subject_id
         )
-        
+
         if is_valid:
             slices.append(norm_crop)
             meta["is_valid"] = True
             meta["quality_status"] = quality_status
+            # See process_and_normalize_slice's docstring for the exact inverse transform.
+            meta["norm_mean_uv"] = norm_mean_uv.tolist()
+            meta["norm_std_uv"] = norm_std_uv.tolist()
             metadata.append(meta)
             valid_stages.append("EVENT")
         else:
