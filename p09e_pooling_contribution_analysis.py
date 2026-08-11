@@ -60,6 +60,7 @@ from cbramod_common import (
     MLPProbeHead,
     PANSubjectEEGDataset,
     compute_leave_one_out_contributions,
+    get_operating_threshold,
     load_model_checkpoint,
     resolve_pooling_config,
     setup_inference_cli_parser
@@ -111,7 +112,7 @@ def main():
         )
 
     # 2. Load Model Checkpoint
-    model, _, _, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
+    model, ckpt_thresholds, _, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
     model.to(device)
     model.eval()
 
@@ -132,9 +133,17 @@ def main():
             "specific pooling formula to differentiate with respect to. Pick a single strategy."
         )
 
-    # SubjectEEGInspector's own threshold only affects report['prediction'] (context for the export), not
-    # the contribution computation itself, which depends only on pooling_strategy/top_percentile/t_window.
-    inspector = SubjectEEGInspector(model=model, device=device, threshold=0.5)
+    # SubjectEEGInspector's threshold only affects report['prediction'] (context for the export), not the
+    # contribution computation itself (which depends only on pooling_strategy/top_percentile/t_window) --
+    # but it still needs to be the REAL calibrated operating threshold, not an arbitrary placeholder, or
+    # the exported "prediction" field will disagree with p09/p09c/p09d's (same bug class as
+    # get_operating_threshold was written to prevent elsewhere in this pipeline).
+    threshold = get_operating_threshold(
+        pooling_strategy=pooling_strategy,
+        override_threshold=args.override_threshold,
+        ckpt_thresholds=ckpt_thresholds
+    )
+    inspector = SubjectEEGInspector(model=model, device=device, threshold=threshold)
 
     # 2c. Resolve subject filter: union of --subject-id and --subjects-json's subject_ids
     subject_filter = [s.strip() for s in args.subject_id.split(",")] if args.subject_id else []
