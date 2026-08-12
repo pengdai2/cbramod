@@ -59,9 +59,9 @@ from cbramod_common import (
     PANSubjectEEGDataset,
     load_model_checkpoint,
     resolve_pooling_config,
+    seed_everything,
     setup_inference_cli_parser
 )
-from cbramod_utils import seed_everything
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector, load_subject_ids_from_json
 
 
