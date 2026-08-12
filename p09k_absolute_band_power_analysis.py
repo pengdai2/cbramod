@@ -371,6 +371,18 @@ def main():
     report_pairwise(df, abspower_cols, "ALL WINDOWS, POOLED")
     report_pairwise_within_subject(df, abspower_cols)
 
+    print("\n" + "=" * 88)
+    print("3) PROBABILITY vs. YASA MORPHOLOGY EVENT COUNTS (spindles/slow-waves, on the real-uV signal)")
+    print("=" * 88)
+    print(
+        "Earlier YASA runs (on Z-scored, and separately on CAR-cancellation-degenerate real-uV) signal "
+        "were unreliable -- most windows triggered an outright amplitude-rejection error rather than "
+        "running the detector at all, so n_spindles/n_slow_waves were mostly meaningless zeros. Now that "
+        "the real-uV signal reflects genuine recorded amplitude (A1/A2 referencing + active-channel-only "
+        "averaging), these counts are worth correlating for the first time."
+    )
+    report_correlations(df, ["n_spindles", "n_slow_waves"], "probability vs YASA event counts")
+
 
 def report_correlations(df: pd.DataFrame, feature_cols: List[str], label: str) -> None:
     print(f"\n--- POOLED -- {label} ---")
