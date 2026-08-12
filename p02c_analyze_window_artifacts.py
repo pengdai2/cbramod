@@ -167,7 +167,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="Analyze noisy window occurrence, timeline distribution, and sleep stage correlation from metadata JSON."
     )
-    parser.add_argument("--meta_json", type=str, required=True, help="Path to single subject metadata JSON file")
+    parser.add_argument("--meta-json", type=str, required=True, help="Path to single subject metadata JSON file")
     args = parser.parse_args()
 
     json_path = Path(args.meta_json).resolve()

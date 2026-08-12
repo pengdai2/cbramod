@@ -64,8 +64,8 @@ def verify_pipeline_setup(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CBraMod Pipeline Verification")
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for the test")
-    parser.add_argument("--num_samples", type=int, default=128, help="Number of synthetic samples")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size for the test")
+    parser.add_argument("--num-samples", type=int, default=128, help="Number of synthetic samples")
     parser.add_argument("--device", type=str, default="cuda", help="Target computing device (cuda/cpu)")
 
     args = parser.parse_args()

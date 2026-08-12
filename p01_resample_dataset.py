@@ -141,10 +141,10 @@ def run_resampling_pipeline(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parallel EEG Resampling Pipeline for CBraMod")
-    parser.add_argument("--src_dir", type=str, required=True, help="Path to raw top-level cohort directory")
-    parser.add_argument("--dst_dir", type=str, required=True, help="Path to parallel destination directory")
-    parser.add_argument("--target_sfreq", type=float, default=200.0, help="Target sampling rate (Hz) [Default: 200.0]")
-    parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help=f"Number of CPU workers [Default: {os.cpu_count()}]")
+    parser.add_argument("--src-dir", type=str, required=True, help="Path to raw top-level cohort directory")
+    parser.add_argument("--dst-dir", type=str, required=True, help="Path to parallel destination directory")
+    parser.add_argument("--target-sfreq", type=float, default=200.0, help="Target sampling rate (Hz) [Default: 200.0]")
+    parser.add_argument("--num-workers", type=int, default=os.cpu_count(), help=f"Number of CPU workers [Default: {os.cpu_count()}]")
     parser.add_argument("--force", action="store_true", help="Force reprocessing existing files")
     
     args = parser.parse_args()

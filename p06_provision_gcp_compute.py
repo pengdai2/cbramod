@@ -51,9 +51,9 @@ fi
 echo "Provisioning local storage from object store..."
 python3 05_provision_local_storage.py \\
     --bucket {bucket_name} \\
-    --s3_prefix {s3_prefix} \\
-    --mount_point {mount_point} \\
-    --endpoint_url {endpoint_url} \\
+    --s3-prefix {s3_prefix} \\
+    --mount-point {mount_point} \\
+    --endpoint-url {endpoint_url} \\
     --concurrency 32
 """
     else:
@@ -204,19 +204,19 @@ def deploy_gcp_compute_instance(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GCP Compute Engine GPU Instance Provisioning Script")
-    parser.add_argument("--project_id", type=str, required=True, help="Google Cloud Project ID")
+    parser.add_argument("--project-id", type=str, required=True, help="Google Cloud Project ID")
     parser.add_argument("--zone", type=str, default="us-central1-a", help="GCP Zone (e.g. us-central1-a)")
-    parser.add_argument("--instance_name", type=str, default="cbramod-training-worker", help="VM Instance Name")
-    parser.add_argument("--machine_type", type=str, default="g2-standard-8", help="GCP Machine Type (e.g. g2-standard-8)")
-    parser.add_argument("--accelerator_type", type=str, default="nvidia-l4", help="GPU Type (e.g. nvidia-l4, nvidia-tesla-t4)")
-    parser.add_argument("--accelerator_count", type=int, default=1, help="Number of GPUs")
-    parser.add_argument("--boot_disk_size_gb", type=int, default=100, help="Size of primary OS boot disk [GB]")
-    parser.add_argument("--data_disk_size_gb", type=int, default=0, help="Optional secondary disk size [GB]. Set > 0 to attach.")
+    parser.add_argument("--instance-name", type=str, default="cbramod-training-worker", help="VM Instance Name")
+    parser.add_argument("--machine-type", type=str, default="g2-standard-8", help="GCP Machine Type (e.g. g2-standard-8)")
+    parser.add_argument("--accelerator-type", type=str, default="nvidia-l4", help="GPU Type (e.g. nvidia-l4, nvidia-tesla-t4)")
+    parser.add_argument("--accelerator-count", type=int, default=1, help="Number of GPUs")
+    parser.add_argument("--boot-disk-size-gb", type=int, default=100, help="Size of primary OS boot disk [GB]")
+    parser.add_argument("--data-disk-size-gb", type=int, default=0, help="Optional secondary disk size [GB]. Set > 0 to attach.")
     parser.add_argument("--bucket", type=str, default=None, help="Optional target GCS/S3 Bucket")
-    parser.add_argument("--s3_prefix", type=str, default=None, help="Optional dataset folder prefix")
-    parser.add_argument("--mount_point", type=str, default="/mnt/nvme/cbra_data", help="Local block storage mount point")
-    parser.add_argument("--repo_url", type=str, default="", help="Git repository URL to clone")
-    parser.add_argument("--service_account_email", type=str, default=None, help="Optional Service Account email to attach to the VM instance (e.g. sa-worker@project.iam.gserviceaccount.com)"
+    parser.add_argument("--s3-prefix", type=str, default=None, help="Optional dataset folder prefix")
+    parser.add_argument("--mount-point", type=str, default="/mnt/nvme/cbra_data", help="Local block storage mount point")
+    parser.add_argument("--repo-url", type=str, default="", help="Git repository URL to clone")
+    parser.add_argument("--service-account-email", type=str, default=None, help="Optional Service Account email to attach to the VM instance (e.g. sa-worker@project.iam.gserviceaccount.com)"
 )
     args = parser.parse_args()
 

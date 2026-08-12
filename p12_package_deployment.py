@@ -101,10 +101,10 @@ def create_deployment_package(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Package CBraMod Weights & Pipeline into Deployment Archive")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to best model checkpoint .pt file")
-    parser.add_argument("--output_archive", type=str, default="./deploy/cbramod_deployment.tar.gz", help="Output .tar.gz archive path")
-    parser.add_argument("--num_channels", type=int, default=64, help="Number of EEG channels")
-    parser.add_argument("--num_classes", type=int, default=2, help="Number of prediction classes")
-    parser.add_argument("--sample_rate", type=int, default=200, help="EEG Sampling frequency (Hz)")
+    parser.add_argument("--output-archive", type=str, default="./deploy/cbramod_deployment.tar.gz", help="Output .tar.gz archive path")
+    parser.add_argument("--num-channels", type=int, default=64, help="Number of EEG channels")
+    parser.add_argument("--num-classes", type=int, default=2, help="Number of prediction classes")
+    parser.add_argument("--sample-rate", type=int, default=200, help="EEG Sampling frequency (Hz)")
 
     args = parser.parse_args()
 

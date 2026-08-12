@@ -812,12 +812,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="EEG Slicing Pipeline with Debug Logging for Interpolation & Window Quality Screening"
     )
-    parser.add_argument("--src_dir", type=str, required=True, help="Input directory containing resampled files")
-    parser.add_argument("--dst_dir", type=str, required=True, help="Output destination directory")
+    parser.add_argument("--src-dir", type=str, required=True, help="Input directory containing resampled files")
+    parser.add_argument("--dst-dir", type=str, required=True, help="Output destination directory")
     parser.add_argument("--pattern", type=valid_regex, default=None, help="Optional regex pattern to match subject id")
     parser.add_argument("--strategy", type=str, choices=["macro", "micro"], default="macro", help="Slicing strategy")
-    parser.add_argument("--window_sec", type=float, default=30.0, help="Window duration in seconds")
-    parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="CPU worker count")
+    parser.add_argument("--window-sec", type=float, default=30.0, help="Window duration in seconds")
+    parser.add_argument("--num-workers", type=int, default=os.cpu_count(), help="CPU worker count")
     parser.add_argument("--force", action="store_true", help="Force reprocessing")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose DEBUG logging")
 

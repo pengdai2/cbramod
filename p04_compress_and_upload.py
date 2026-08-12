@@ -211,14 +211,14 @@ def upload_to_object_store_resumable_parallel(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dataset Compression and Resumable Parallel S3 Upload")
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to preprocessed dataset folder to upload")
-    parser.add_argument("--archive_out", type=str, required=True, help="Path for temporary or local compressed archive (.tar.gz)")
+    parser.add_argument("--data-dir", type=str, required=True, help="Path to preprocessed dataset folder to upload")
+    parser.add_argument("--archive-out", type=str, required=True, help="Path for temporary or local compressed archive (.tar.gz)")
     parser.add_argument("--bucket", type=str, required=True, help="Target Cloud Object Store S3 bucket name")
-    parser.add_argument("--s3_key", type=str, required=True, help="Remote S3 Key path")
-    parser.add_argument("--endpoint_url", type=str, default=None, help="Custom S3 endpoint URL")
-    parser.add_argument("--part_size_mb", type=int, default=32, help="Chunk size in MB for resumable upload [Default: 32MB]")
+    parser.add_argument("--s3-key", type=str, required=True, help="Remote S3 Key path")
+    parser.add_argument("--endpoint-url", type=str, default=None, help="Custom S3 endpoint URL")
+    parser.add_argument("--part-size-mb", type=int, default=32, help="Chunk size in MB for resumable upload [Default: 32MB]")
     parser.add_argument("--concurrency", type=int, default=8, help="Max parallel upload threads [Default: 8]")
-    parser.add_argument("--skip_compression", action="store_true", help="If specified, uploads an existing archive file directly")
+    parser.add_argument("--skip-compression", action="store_true", help="If specified, uploads an existing archive file directly")
 
     args = parser.parse_args()
 

@@ -161,9 +161,9 @@ def setup_local_block_storage(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Provision Cloud Block Device from S3 Object Store")
     parser.add_argument("--bucket", type=str, required=True, help="Cloud Object Storage Bucket")
-    parser.add_argument("--s3_key", type=str, required=True, help="Remote S3 Key path for dataset archive")
-    parser.add_argument("--mount_point", type=str, default="/mnt/nvme/cbra_data", help="Local block storage path/mount point")
-    parser.add_argument("--endpoint_url", type=str, default=None, help="Custom S3 API endpoint URL (optional)")
+    parser.add_argument("--s3-key", type=str, required=True, help="Remote S3 Key path for dataset archive")
+    parser.add_argument("--mount-point", type=str, default="/mnt/nvme/cbra_data", help="Local block storage path/mount point")
+    parser.add_argument("--endpoint-url", type=str, default=None, help="Custom S3 API endpoint URL (optional)")
     parser.add_argument("--force", action="store_true", help="Force re-download and re-extraction")
 
     args = parser.parse_args()

@@ -132,8 +132,8 @@ def run_performance_analysis(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CBraMod Performance Analysis & Error Extraction")
-    parser.add_argument("--predictions_csv", type=str, required=True, help="Path to patient_level_test_predictions.csv")
-    parser.add_argument("--output_dir", type=str, default="./performance_analysis", help="Output directory")
+    parser.add_argument("--predictions-csv", type=str, required=True, help="Path to patient_level_test_predictions.csv")
+    parser.add_argument("--output-dir", type=str, default="./performance_analysis", help="Output directory")
 
     args = parser.parse_args()
 

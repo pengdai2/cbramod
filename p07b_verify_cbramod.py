@@ -168,8 +168,8 @@ def verify_cbramod_pipeline(subject_id: int = 0, epochs: int = 10, batch_size: i
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="CBraMod Verification on PhysioNet Data")
-    parser.add_argument("--subject_id", type=int, default=0, help="PhysioNet Subject ID to fetch")
-    parser.add_argument("--batch_size", type=int, default=16, help="Inference/Training Batch Size")
+    parser.add_argument("--subject-id", type=int, default=0, help="PhysioNet Subject ID to fetch")
+    parser.add_argument("--batch-size", type=int, default=16, help="Inference/Training Batch Size")
     parser.add_argument("--device", type=str, default="cuda", help="Target computing device (cuda/cpu)")
 
     args = parser.parse_args()

@@ -220,14 +220,14 @@ def sync_directory_to_s3(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parallel Resumable Uncompressed Directory Sync to S3/GCS")
-    parser.add_argument("--data_dir", type=str, required=True, help="Path to preprocessed dataset folder")
+    parser.add_argument("--data-dir", type=str, required=True, help="Path to preprocessed dataset folder")
     parser.add_argument("--bucket", type=str, required=True, help="Target Object Store S3 bucket name")
-    parser.add_argument("--s3_prefix", type=str, default="", help="Target directory prefix on S3 (e.g., 'datasets/sleep_cohort')")
-    parser.add_argument("--endpoint_url", type=str, default=None, help="Custom S3 endpoint (e.g. https://storage.googleapis.com)")
-    parser.add_argument("--part_size_mb", type=int, default=32, help="Multipart chunk threshold in MB [Default: 32MB]")
+    parser.add_argument("--s3-prefix", type=str, default="", help="Target directory prefix on S3 (e.g., 'datasets/sleep_cohort')")
+    parser.add_argument("--endpoint-url", type=str, default=None, help="Custom S3 endpoint (e.g. https://storage.googleapis.com)")
+    parser.add_argument("--part-size-mb", type=int, default=32, help="Multipart chunk threshold in MB [Default: 32MB]")
     parser.add_argument("--concurrency", type=int, default=16, help="Max parallel file upload threads [Default: 16]")
     parser.add_argument(
-        "--filename_pattern", type=valid_regex, default=None,
+        "--filename-pattern", type=valid_regex, default=None,
         help="Optional regex matched against each file's NAME (not full path) to restrict which files "
              "get uploaded -- e.g. '_meta\\.json$' for a metadata-only re-upload after a p02 re-slice "
              "that only regenerated metadata, skipping the much larger unchanged .npy tensors."

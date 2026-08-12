@@ -72,8 +72,8 @@ fi
 echo "Provisioning block storage dataset..."
 python3 05_provision_block_storage.py \
     --bucket {bucket_name} \
-    --s3_key {s3_key} \
-    --mount_point {mount_point}
+    --s3-key {s3_key} \
+    --mount-point {mount_point}
 
 echo "=== Compute Instance Bootstrap Complete! ==="
 """
@@ -155,14 +155,14 @@ def deploy_aws_ec2_instance(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Cloud Compute Instance Provisioning & Bootstrap Script")
     parser.add_argument("--provider", type=str, choices=["aws"], default="aws", help="Cloud Provider")
-    parser.add_argument("--instance_type", type=str, default="g5.2xlarge", help="GPU Instance Type (e.g., g5.2xlarge, p4d.24xlarge)")
-    parser.add_argument("--ami_id", type=str, default="ami-0c7217cdde317cfec", help="Deep Learning AMI ID (Ubuntu 22.04 CUDA)")
-    parser.add_argument("--key_name", type=str, required=True, help="SSH Key Pair Name")
-    parser.add_argument("--security_group", type=str, required=True, help="Security Group ID (allowing SSH)")
+    parser.add_argument("--instance-type", type=str, default="g5.2xlarge", help="GPU Instance Type (e.g., g5.2xlarge, p4d.24xlarge)")
+    parser.add_argument("--ami-id", type=str, default="ami-0c7217cdde317cfec", help="Deep Learning AMI ID (Ubuntu 22.04 CUDA)")
+    parser.add_argument("--key-name", type=str, required=True, help="SSH Key Pair Name")
+    parser.add_argument("--security-group", type=str, required=True, help="Security Group ID (allowing SSH)")
     parser.add_argument("--bucket", type=str, required=True, help="Cloud Object Store Bucket")
-    parser.add_argument("--s3_key", type=str, required=True, help="Dataset S3 archive key")
-    parser.add_argument("--mount_point", type=str, default="/mnt/nvme/cbra_data", help="Local NVMe mount point")
-    parser.add_argument("--repo_url", type=str, default="", help="Git repository URL to clone")
+    parser.add_argument("--s3-key", type=str, required=True, help="Dataset S3 archive key")
+    parser.add_argument("--mount-point", type=str, default="/mnt/nvme/cbra_data", help="Local NVMe mount point")
+    parser.add_argument("--repo-url", type=str, default="", help="Git repository URL to clone")
 
     args = parser.parse_args()
 

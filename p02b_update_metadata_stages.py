@@ -127,11 +127,11 @@ def run_metadata_update_pipeline(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Update existing dataset metadata JSON files with sleep stages")
-    parser.add_argument("--src_dir", type=str, required=True, help="Input directory containing raw EEG/PSG files")
-    parser.add_argument("--dst_dir", type=str, required=True, help="Directory containing existing _meta.json files")
+    parser.add_argument("--src-dir", type=str, required=True, help="Input directory containing raw EEG/PSG files")
+    parser.add_argument("--dst-dir", type=str, required=True, help="Directory containing existing _meta.json files")
     parser.add_argument("--pattern", type=valid_regex, default=None, help="Optional regex pattern to match subject ID")
-    parser.add_argument("--window_sec", type=float, default=30.0, help="Fallback window duration in seconds")
-    parser.add_argument("--num_workers", type=int, default=os.cpu_count(), help="CPU worker count")
+    parser.add_argument("--window-sec", type=float, default=30.0, help="Fallback window duration in seconds")
+    parser.add_argument("--num-workers", type=int, default=os.cpu_count(), help="CPU worker count")
     parser.add_argument("--force", action="store_true", help="Force overwrite existing stage fields in JSON")
 
     args = parser.parse_args()

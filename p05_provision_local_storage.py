@@ -90,7 +90,7 @@ def sync_directory_from_s3(
     directly to local NVMe/SSD block storage.
 
     `filename_pattern`, if given, restricts the download to objects whose basename (not full S3 key)
-    matches the regex -- e.g. `--filename_pattern '_meta\\.json$'` for a metadata-only re-download
+    matches the regex -- e.g. `--filename-pattern '_meta\\.json$'` for a metadata-only re-download
     after a p02 re-slice that only regenerated *_meta.json, skipping the much larger unchanged
     *_windows.npy objects.
     """
@@ -224,13 +224,13 @@ def setup_local_block_storage(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Provision Cloud Block Device by Syncing Uncompressed Directory from S3")
     parser.add_argument("--bucket", type=str, required=True, help="Cloud Object Storage Bucket")
-    parser.add_argument("--s3_prefix", type=str, required=True, help="Remote S3 prefix folder path")
-    parser.add_argument("--mount_point", type=str, default="/mnt/nvme/cbra_data", help="Local block storage path/mount point")
-    parser.add_argument("--endpoint_url", type=str, default=None, help="Custom S3 API endpoint URL (optional)")
+    parser.add_argument("--s3-prefix", type=str, required=True, help="Remote S3 prefix folder path")
+    parser.add_argument("--mount-point", type=str, default="/mnt/nvme/cbra_data", help="Local block storage path/mount point")
+    parser.add_argument("--endpoint-url", type=str, default=None, help="Custom S3 API endpoint URL (optional)")
     parser.add_argument("--concurrency", type=int, default=16, help="Max parallel download threads [Default: 16]")
     parser.add_argument("--force", action="store_true", help="Force re-verification/download of all files")
     parser.add_argument(
-        "--filename_pattern", type=valid_regex, default=None,
+        "--filename-pattern", type=valid_regex, default=None,
         help="Optional regex matched against each object's basename (not full S3 key) to restrict "
              "which files get downloaded -- e.g. '_meta\\.json$' for a metadata-only re-download "
              "after a p02 re-slice that only regenerated metadata, skipping the much larger unchanged "

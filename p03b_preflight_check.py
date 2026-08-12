@@ -7,7 +7,7 @@ missing files, corrupted arrays, NaN/Inf values, shape mismatches, true
 flatlined channels, and label anomalies before fine-tuning.
 
 Usage:
-    python preflight_check.py --manifest_dir ./manifests --data_dir ./data --expected_channels 64
+    python preflight_check.py --manifest-dir ./manifests --data-dir ./data --expected-channels 64
 """
 
 import argparse
@@ -333,36 +333,36 @@ def main():
         description="Preflight Data Sanity Check for Sleep EEG Fine-Tuning Pipeline."
     )
     parser.add_argument(
-        "--manifest_dir",
+        "--manifest-dir",
         type=str,
         required=True,
         help="Directory containing train_manifest.csv and val_manifest.csv"
     )
     parser.add_argument(
-        "--data_dir",
+        "--data-dir",
         type=str,
         default=None,
         help="Top-level root directory where relative tensor/meta paths reside"
     )
     parser.add_argument(
-        "--expected_channels",
+        "--expected-channels",
         type=int,
         default=64,
         help="Expected total tensor channel count (default: 64)"
     )
     parser.add_argument(
-        "--min_active_channels",
+        "--min-active-channels",
         type=int,
         default=1,
         help="Minimum non-zero active channels required per subject (default: 1)"
     )
     parser.add_argument(
-        "--disallow_zero_padding",
+        "--disallow-zero-padding",
         action="store_true",
         help="Raise error if any zero-padded channel is detected"
     )
     parser.add_argument(
-        "--sample_ratio",
+        "--sample-ratio",
         type=float,
         default=0.2,
         help="Fraction of files (0.0 - 1.0) to perform deep numerical array inspection on (default: 0.2)"
