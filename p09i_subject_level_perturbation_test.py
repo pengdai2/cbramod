@@ -322,11 +322,22 @@ def main():
     df.to_csv(csv_path, index=False)
     print(f"\nSaved {len(df)} (subject, perturb_fraction) rows to: {csv_path}")
 
+    report_fraction_sweep(df, perturb_fractions, band_label=args.band)
+
+
+def report_fraction_sweep(df: pd.DataFrame, perturb_fractions: List[float], band_label: str = "the band") -> None:
+    """
+    Reports the subject-level slope/R^2/propagation_ratio summary, optionally broken down by
+    perturb_fraction, plus (when more than one fraction is present) whether the subject-level result
+    trends with how much of the recording actually changed. Factored out of main() so a separate
+    aggregator script can call it on a combined DataFrame built from multiple already-completed runs
+    (e.g. run at 1.0 and 0.5 separately, at different times) without needing to re-run anything.
+    """
     print("\n" + "=" * 88)
-    print(f"SUBJECT-LEVEL RESULT: does perturbing {args.band} across a whole recording move the pooled score?")
+    print(f"SUBJECT-LEVEL RESULT: does perturbing {band_label} across a whole recording move the pooled score?")
     print("=" * 88)
     if len(perturb_fractions) > 1:
-        print(f"Broken down by --perturb-fraction ({perturb_fractions}):\n")
+        print(f"Broken down by perturb_fraction ({perturb_fractions}):\n")
         summary = df.groupby("perturb_fraction").agg(
             n_subjects=("subject_id", "count"),
             mean_slope=("subject_level_slope", "mean"),
