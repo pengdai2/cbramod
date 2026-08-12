@@ -832,8 +832,16 @@ class CBraModTrainer:
 
         return results  
 
-    def train(self, train_path: Path, val_path: Path) -> dict:
-        pass  # Placeholder for training loop implementation  
+    def train(self, *args, **kwargs) -> dict:
+        """
+        Placeholder -- concrete subclasses define their own train() signature, since their actual
+        data-loading needs genuinely differ (EndToEndTrainer takes fixed train/val manifest paths;
+        ProbeTrainer takes a single master cache path and resolves train/val subject subsets from it
+        internally). Deliberately not pinned to one concrete signature here: nothing calls train()
+        polymorphically through this base class today, and forcing a shared arg list would be
+        artificial rather than a real interface both subclasses actually implement.
+        """
+        raise NotImplementedError("Subclasses must implement train().")
 
 
 def setup_common_cli_parser(parser: argparse.ArgumentParser) -> None:
