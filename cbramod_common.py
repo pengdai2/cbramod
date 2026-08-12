@@ -1092,11 +1092,13 @@ def find_optimal_threshold(
 
 
 def is_checkpoint_improvement(
-    new_f1: float, new_auc: float, best_f1: float, best_auc: float, eps: float = 1e-6
+    new_f1: float, new_auc: float, best_f1: float, best_auc: float,
+    eps: float = 1e-6, min_large_gain: float = 0.02, max_small_dip: float = 0.01
 ) -> bool:
     """
     Checkpoint-selection criterion: strict Pareto improvement over BOTH subject-level macro F1 and
-    AUC -- neither metric may regress, and at least one must strictly improve.
+    AUC (neither metric may regress, at least one must strictly improve) -- OR a large gain in one
+    metric alongside only a small dip in the other.
 
     F1 here is computed at its own per-epoch optimal threshold (find_optimal_threshold() sweeps 99
     thresholds and reports the max), so it only tracks ONE point on the ROC curve -- on a small
@@ -1104,23 +1106,41 @@ def is_checkpoint_improvement(
     statistic: a single subject crossing the decision boundary can swing it, and the fresh 99-way
     threshold sweep every epoch is actively hunting for whatever spike exists in that epoch's noise.
     AUC integrates over the entire ranking rather than depending on exactly where one boundary lands,
-    so it's comparatively stable. An F1-only "> best" check (what this replaces) has two failure
-    modes: it never saves during a stretch where F1 sits at its own plateau while AUC keeps
-    genuinely improving (the original bug), AND it happily accepts an F1 uptick that came at a
-    meaningful AUC cost -- plausibly noise-chasing a threshold-sweep spike rather than a real
-    improvement. Requiring non-regression on the OTHER metric before crediting an improvement on
-    either one guards against both.
+    so it's comparatively stable. An F1-only "> best" check (what this originally replaced) has two
+    failure modes: it never saves during a stretch where F1 sits at its own plateau while AUC keeps
+    genuinely improving, AND it happily accepts an F1 uptick that came at a meaningful AUC cost --
+    plausibly noise-chasing a threshold-sweep spike rather than a real improvement. Requiring
+    non-regression on the OTHER metric before crediting an improvement on either one guards against
+    both (e.g. a real epoch: F1 +0.0005 / AUC -0.0119 is correctly rejected -- the "gain" is smaller
+    than one subject's worth of macro-F1 movement, the "dip" is an order of magnitude larger).
 
-    `eps` guards the "hasn't regressed" side against float noise -- without it, a metric that's
-    numerically 1e-9 below its prior best (semantically tied) would wrongly veto a real improvement
-    in the other one.
+    The pure strict-Pareto rule is arguably too conservative in the OTHER direction, though: it would
+    also reject a case where one metric jumps a lot and the other only dips a little -- a plausible
+    real improvement, not noise. The min_large_gain/max_small_dip clause recovers that case WITHOUT
+    reopening the noise-chasing problem above, because it requires the gain to clear an absolute
+    "clearly not noise" floor (default 0.02) AND the dip to stay under a "clearly minor" ceiling
+    (default 0.01) -- a pure gain/dip RATIO alone wouldn't do this safely, since e.g. a 0.001 gain
+    against a 0.0002 dip is a 5x ratio but both numbers are still noise-level; requiring the gain
+    itself to be large in absolute terms avoids that.
+
+    `eps` guards the strict-Pareto "hasn't regressed" side against float noise -- without it, a
+    metric that's numerically 1e-9 below its prior best (semantically tied) would wrongly veto a real
+    improvement in the other one.
     """
     f1_improved = new_f1 > best_f1
     f1_not_worse = new_f1 >= best_f1 - eps
     auc_improved = new_auc > best_auc
     auc_not_worse = new_auc >= best_auc - eps
 
-    return (f1_improved and auc_not_worse) or (auc_improved and f1_not_worse)
+    strict_pareto = (f1_improved and auc_not_worse) or (auc_improved and f1_not_worse)
+
+    # `eps` tolerance applied on both sides here too, same rationale as the strict-Pareto check above --
+    # without it, a gain/dip landing within float noise of the threshold could flicker based on
+    # floating-point representation alone rather than a real difference.
+    f1_large_gain_small_dip = (new_f1 - best_f1) >= min_large_gain - eps and (new_auc - best_auc) >= -max_small_dip - eps
+    auc_large_gain_small_dip = (new_auc - best_auc) >= min_large_gain - eps and (new_f1 - best_f1) >= -max_small_dip - eps
+
+    return strict_pareto or f1_large_gain_small_dip or auc_large_gain_small_dip
 
 
 def seed_everything(seed: int = 42) -> None:
