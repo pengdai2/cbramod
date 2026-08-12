@@ -1,12 +1,20 @@
 """
 Production CLI Pipeline for CBraMod Probe Training & Subject-Level Multi-Strategy Pooling Evaluation.
 
-Reads backbone embeddings from a single master cache -- built once, for the WHOLE cohort, by the
-standalone p08a_extract_features.py -- rather than extracting them itself. --train-manifest/
---val-manifest (p03's per-split CSVs) are only used to read each split's subject_id column;
-CachedFeatureSubjectDataset's subject filter then carves the corresponding window-level view out of
-THAT SAME master cache for training vs. validation, and per-fold for --enable-sgkf, with no separate
-extraction pass and no temporary per-fold cache files.
+Reads backbone embeddings from a single master cache -- built once, for the WHOLE cohort (train/val/
+test all together), by the standalone p08a_extract_features.py -- rather than extracting them itself.
+
+--train-manifest/--val-manifest (p03's per-split CSVs) are read for their subject_id column only, and
+mean something slightly different depending on mode:
+  - Fixed split (default): the two lists ARE the train/val subject split. CachedFeatureSubjectDataset's
+    subject filter carves each view directly out of the master cache.
+  - --enable-sgkf: their UNION defines which subjects are ELIGIBLE for cross-validation at all --
+    StratifiedGroupKFold then draws its own train/val partition per fold from that pool. This is what
+    keeps held-out test subjects (present in the master cache, since it covers everyone) out of every
+    fold's train AND val partition -- --train-manifest/--val-manifest are still required in this mode,
+    just for a different purpose than fixing a split.
+
+Either way, there's no separate extraction pass per split and no temporary per-fold cache files.
 
 Usage:
   # 1. First, build the master cache once (see p08a_extract_features.py):
@@ -22,9 +30,13 @@ Usage:
       --val-manifest /data/eeg_study/val_manifest.csv \
       --head-lr 0.0003 --epochs 40 --primary-pooling p85_score
 
-  # 3. Stratified Group K-Fold CV (subject-level splits drawn from the master cache directly --
-  #    --train-manifest/--val-manifest are ignored in this mode):
-  python p08b_finetune_probing.py --cache-dir /data/eeg_study/cache --enable-sgkf --sgkf-folds 5
+  # 3. Stratified Group K-Fold CV over the train+val subject pool (test subjects, present in the
+  #    master cache, are excluded from every fold -- see train_cross_validation()'s docstring):
+  python p08b_finetune_probing.py \
+      --cache-dir /data/eeg_study/cache \
+      --train-manifest /data/eeg_study/train_manifest.csv \
+      --val-manifest /data/eeg_study/val_manifest.csv \
+      --enable-sgkf --sgkf-folds 5
 """
 
 import argparse
@@ -326,7 +338,22 @@ class ProbeTrainer(CBraModTrainer):
         SAME master cache -- no concatenation of separate train/val caches, and no temporary per-fold
         cache files (train_fixed_split() carves each fold's train/val subject subset directly out of
         master_cache_path via CachedFeatureSubjectDataset's filter).
+
+        The master cache covers the WHOLE cohort (p03's master_manifest.csv includes train/val/test),
+        so the SGKF pool must be explicitly restricted to subjects in --train-manifest/--val-manifest
+        before splitting -- otherwise a held-out test subject could land in some fold's train OR val
+        partition, and the test set stops being genuinely held out. --train-manifest/--val-manifest
+        are repurposed here as "which subjects are eligible for CV at all" rather than a fixed split.
         """
+        if not self.config.train_manifest or not self.config.val_manifest:
+            raise ValueError(
+                "--enable-sgkf requires --train-manifest and --val-manifest -- not to fix a split, but "
+                "to determine which subjects are eligible for cross-validation at all (their union), "
+                "explicitly excluding whatever's held out as test in the master cache."
+            )
+        eligible_subject_ids = set(load_subject_ids_from_manifest(Path(self.config.train_manifest))) | \
+            set(load_subject_ids_from_manifest(Path(self.config.val_manifest)))
+
         self.logger.info(f"Loading master cache from {master_cache_path} to build SGKF splits...")
         master_data = torch.load(master_cache_path, map_location="cpu", weights_only=True)
         missing_keys = [k for k in ("subject_ids", "labels", "stages", "indices") if k not in master_data]
@@ -338,6 +365,18 @@ class ProbeTrainer(CBraModTrainer):
 
         all_subject_ids = np.array(master_data["subject_ids"])
         all_labels = master_data["labels"]
+
+        # Restrict to the eligible pool BEFORE computing unique_sids -- excluded subjects (e.g. test)
+        # must never enter sgkf.split() at all, not just get filtered out of the resulting folds.
+        cv_pool_mask = np.isin(all_subject_ids, list(eligible_subject_ids))
+        excluded_subjects = np.unique(all_subject_ids[~cv_pool_mask])
+        if len(excluded_subjects) > 0:
+            self.logger.info(
+                f"Excluding {len(excluded_subjects)} subject(s) present in the master cache but not in "
+                f"--train-manifest/--val-manifest (e.g. held-out test) from the SGKF pool."
+            )
+        all_subject_ids = all_subject_ids[cv_pool_mask]
+        all_labels = all_labels[cv_pool_mask]
 
         # Build unique subject-to-label mapping for StratifiedGroupKFold
         unique_sids = np.unique(all_subject_ids)
