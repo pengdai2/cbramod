@@ -56,9 +56,15 @@ try:
     # level regardless of the verbose=False passed to spindles_detect()/sw_detect() below -- that kwarg
     # only gates yasa's own INFO-ish prints. Most windows legitimately contain zero detected events
     # (spindles/slow-waves are transient, not present in every 30s window), so this is expected,
-    # benign output, not a data-quality signal -- raising the threshold to ERROR keeps anything that
-    # WOULD indicate a real problem (e.g. an amplitude-rejection error) visible while silencing this.
-    logging.getLogger("yasa").setLevel(logging.ERROR)
+    # benign output, not a data-quality signal.
+    #
+    # A per-logger logging.getLogger("yasa").setLevel(logging.ERROR) does NOT reliably silence this --
+    # yasa's own verbose=False handling appears to reset its logger's level back to WARNING internally
+    # on every spindles_detect()/sw_detect() call, undoing a one-time setLevel from here. logging.
+    # disable() instead sets a GLOBAL threshold checked independently of any individual logger's own
+    # level (Logger.manager.disable), so it can't be undone by yasa resetting its own logger per-call.
+    # ERROR (40) and CRITICAL stay visible; only WARNING (30) and below are suppressed.
+    logging.disable(logging.WARNING)
 except ImportError:
     HAS_YASA = False
 
