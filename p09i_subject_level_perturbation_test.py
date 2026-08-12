@@ -50,7 +50,6 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from scipy.signal import butter, sosfiltfilt
 from tqdm import tqdm
 
 from cbramod_common import (
@@ -60,6 +59,7 @@ from cbramod_common import (
     compute_pooled_scores,
     get_operating_threshold,
     load_model_checkpoint,
+    perturb_window_band_power,
     resolve_pooling_config,
     setup_inference_cli_parser
 )
@@ -73,44 +73,6 @@ BAND_DEFS = {
     "sigma": (11.0, 16.0),
     "beta": (16.0, 30.0),
 }
-
-
-def perturb_window_band_power(
-    window_CT: np.ndarray, sfreq: float, low: float, high: float, scale_factor: float, order: int = 4,
-    preserve_total_energy: bool = True
-) -> np.ndarray:
-    """
-    Same as p09h's version: rescales the [low, high] Hz component of every channel uniformly.
-
-    `preserve_total_energy` (default True) renormalizes each perturbed channel back to its ORIGINAL
-    std after the band rescale, controlling for the confound where scaling a band that dominates a
-    channel's total power (e.g. delta) also substantially shifts the channel's overall Z-scored
-    amplitude -- see p09h_band_power_perturbation_test.py's docstring for the full rationale. At
-    scale_factor=1.0 this is an exact no-op.
-
-    Vectorized across all channels via sosfiltfilt's `axis` parameter (one call over the whole [C, T]
-    array, not a Python loop calling it once per channel) -- this loop was the dominant cost of this
-    script's runtime in practice (num_windows x len(scale_factors) x 64 individual filter calls per
-    subject; the GPU forward pass, batched once per scale factor, is comparatively negligible), which
-    --max-windows-per-subject's own docstring didn't account for. Filtering an all-zero (zero-padded)
-    channel just produces zero output, so it's safe -- and exactly equivalent, validated against the
-    old per-channel loop on synthetic data -- to run every channel uniformly rather than skip-check
-    each one; the preserve_total_energy step's new_std > 1e-8 guard already leaves those channels at
-    exactly zero afterward too.
-    """
-    sos = butter(order, [low, high], btype="bandpass", fs=sfreq, output="sos")
-    band_component = sosfiltfilt(sos, window_CT, axis=-1)
-    residual = window_CT - band_component
-    new_sig = residual + scale_factor * band_component
-
-    if preserve_total_energy:
-        orig_std = window_CT.std(axis=-1, keepdims=True)
-        new_std = new_sig.std(axis=-1, keepdims=True)
-        safe_new_std = np.where(new_std > 1e-8, new_std, 1.0)
-        rescale = np.where(new_std > 1e-8, orig_std / safe_new_std, 1.0)
-        new_sig = new_sig * rescale
-
-    return new_sig.astype(window_CT.dtype)
 
 
 def fit_local_slope(scale_factors: np.ndarray, values: np.ndarray) -> Tuple[float, float]:

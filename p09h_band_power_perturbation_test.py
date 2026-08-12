@@ -48,13 +48,13 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 import torch
-from scipy.signal import butter, sosfiltfilt
 from tqdm import tqdm
 
 from cbramod_common import (
     CBraModE2EClassifier,
     PANSubjectEEGDataset,
     load_model_checkpoint,
+    perturb_window_band_power,
     setup_inference_cli_parser
 )
 from cbramod_common import seed_everything
@@ -79,54 +79,6 @@ def compute_relative_band_power(signal_1d: np.ndarray, sfreq: float, low: float,
         return 0.0
     band_mask = (freqs >= low) & (freqs <= high)
     return float(psd[band_mask].sum() / total_power)
-
-
-def perturb_window_band_power(
-    window_CT: np.ndarray, sfreq: float, low: float, high: float, scale_factor: float, order: int = 4,
-    preserve_total_energy: bool = True
-) -> np.ndarray:
-    """
-    Rescales the [low, high] Hz component of every channel by `scale_factor`, leaving everything
-    else (and zero-padded/inactive channels) untouched. Applying the SAME scale to every channel
-    means the model's own channel-mean pooling step scales its band power by exactly the same
-    factor (mean is linear), so this targets a predictable, well-defined quantity rather than an
-    arbitrary single-channel edit.
-
-    `preserve_total_energy` (default True) renormalizes each perturbed channel back to its
-    ORIGINAL std after the band rescale. Without this, scaling a band that already dominates a
-    channel's total power (e.g. delta, often 80%+ of relative power) also substantially changes
-    the channel's OVERALL amplitude -- since the model's input is Z-scored to std~=1 per channel
-    per window (see p02_slice_eeg_dataset.py), that overall-amplitude shift pushes the perturbed
-    signal outside the range every training window was normalized to, confounding "does the model
-    care about this band's share of the spectrum" with "does the model react to an unrealistically
-    high/low-energy window." For a minor band like sigma (~5% of power) this confound is small
-    (~3% amplitude shift at scale=1.5); for a dominant band like delta it can be large (~44% at the
-    same scale factor) -- big enough to plausibly explain a result on its own. Renormalizing here
-    isolates the intended effect (spectral shape) from this confound (overall energy). At
-    scale_factor=1.0 this is an exact no-op (renormalization factor is exactly 1.0) either way.
-
-    Vectorized across all channels via sosfiltfilt's `axis` parameter (one call over the whole [C, T]
-    array, not a Python loop calling it once per channel) -- this loop was the dominant cost of this
-    script's runtime in practice (num_windows x len(scale_factors) x 64 individual filter calls per
-    subject; the GPU forward pass, batched, is comparatively negligible). Filtering an all-zero
-    (zero-padded) channel just produces zero output, so it's safe -- and exactly equivalent, validated
-    against the old per-channel loop on synthetic data -- to run every channel uniformly rather than
-    skip-check each one; the preserve_total_energy step's new_std > 1e-8 guard already leaves those
-    channels at exactly zero afterward too.
-    """
-    sos = butter(order, [low, high], btype="bandpass", fs=sfreq, output="sos")
-    band_component = sosfiltfilt(sos, window_CT, axis=-1)
-    residual = window_CT - band_component
-    new_sig = residual + scale_factor * band_component
-
-    if preserve_total_energy:
-        orig_std = window_CT.std(axis=-1, keepdims=True)
-        new_std = new_sig.std(axis=-1, keepdims=True)
-        safe_new_std = np.where(new_std > 1e-8, new_std, 1.0)
-        rescale = np.where(new_std > 1e-8, orig_std / safe_new_std, 1.0)
-        new_sig = new_sig * rescale
-
-    return new_sig.astype(window_CT.dtype)
 
 
 def fit_local_slope(scale_factors: np.ndarray, probs: np.ndarray) -> Tuple[float, float]:
