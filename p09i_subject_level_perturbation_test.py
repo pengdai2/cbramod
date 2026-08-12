@@ -128,21 +128,20 @@ def parse_cli_args() -> argparse.Namespace:
              "original probability -- an approximation of 'the whole recording changed', not the real thing."
     )
     group.add_argument(
-        "--perturb-fraction", type=float, default=1.0,
-        help="Fraction (0-1] of a subject's sampled windows to actually perturb; the rest are left at "
-             "their ORIGINAL baseline signal (never touched, regardless of scale_factor) for every "
-             "point on the scale-factor sweep. Default 1.0 perturbs every window (the original design). "
-             "A smaller fraction (e.g. 0.5) is a sharper test of the specific concern p09e's leave-one-"
-             "out analysis raised: percentile pooling only cares about whichever window sits at the "
-             "rank, and most windows have near-zero contribution to it. Perturbing ALL windows sidesteps "
-             "that -- even a window that individually doesn't matter to the percentile still shifts, "
-             "which can move the whole distribution enough that something near the rank moves too, "
-             "without ever testing whether pooling ignores a change concentrated in the 'wrong' "
-             "(non-rank-adjacent) windows. Perturbing a random, fixed-across-the-sweep subset instead "
-             "directly tests that: if the percentile-determining window happens to land in the "
-             "UNPERTURBED remainder for a given subject, the pooled score should barely move despite a "
-             "real average shift across the perturbed subset -- exactly the failure mode p09e predicts, "
-             "and something --perturb-fraction=1.0 can't distinguish from faithful propagation."
+        "--perturb-fraction", type=str, default="1.0",
+        help="Comma-separated grid of fractions (each in (0, 1]) of a subject's sampled windows to "
+             "actually perturb; the rest are left at their ORIGINAL baseline signal (never touched, "
+             "regardless of scale_factor) for every point on the scale-factor sweep. Default '1.0' "
+             "perturbs every window (the original design) -- one row per (subject, fraction) pair is "
+             "written, and fractions below 1.0 are always a NESTED prefix of the same random per-subject "
+             "permutation (fraction=0.25's perturbed set is a subset of fraction=0.5's, etc.), so the "
+             "swept variable is cleanly 'how much of the recording changed' rather than also varying "
+             "which specific random subset was drawn each time. Smaller fractions test whether the "
+             "subject-level effect is fragile (only shows up when essentially everything changes) or "
+             "robust (survives incomplete coverage) -- see the module docstring's note on why a per-"
+             "window LOO-influence diagnostic was tried and dropped here (percentile pooling depends on "
+             "the whole sorted distribution, not a fixed set of 'important' windows, so which windows "
+             "specifically get perturbed can't be cleanly separated from how many do)."
     )
     group.add_argument(
         "--subjects-json", type=str, default=None,
@@ -174,6 +173,10 @@ def main():
     low, high = BAND_DEFS[args.band]
     scale_factors = np.array([float(s) for s in args.scale_factors.split(",")])
     lo_scale_idx, hi_scale_idx = int(np.argmin(scale_factors)), int(np.argmax(scale_factors))
+    perturb_fractions = sorted(float(f) for f in args.perturb_fraction.split(","))
+    for f in perturb_fractions:
+        if not (0.0 < f <= 1.0):
+            raise ValueError(f"--perturb-fraction values must be in (0, 1], got {f}.")
 
     print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
     model = CBraModE2EClassifier(
@@ -226,18 +229,8 @@ def main():
             approximated = True
         work_windows = raw_np[window_order]
 
-        # Which of work_windows actually get perturbed -- a FIXED subset held constant across the
-        # whole scale-factor sweep (not re-drawn per scale factor, or the fitted slope would be
-        # confounded by ALSO changing which windows are perturbed at each point). Windows outside this
-        # subset are left at their true, untouched baseline signal, but still participate in pooling --
-        # unlike --max-windows-per-subject, which drops excluded windows from pooling entirely, this
-        # keeps the full real window distribution intact and tests whether the percentile statistic
-        # responds to a change concentrated in only PART of it. See --perturb-fraction's help text.
-        n_perturb = max(1, int(round(args.perturb_fraction * len(work_windows))))
-        perturb_mask = np.zeros(len(work_windows), dtype=bool)
-        perturb_mask[rng.choice(len(work_windows), size=n_perturb, replace=False)] = True
-
-        # Baseline (unperturbed) probabilities and pooled score.
+        # Baseline (unperturbed) probabilities and pooled score -- computed ONCE per subject, reused
+        # across every fraction in the sweep (baseline doesn't depend on perturb_fraction at all).
         with torch.no_grad():
             baseline_logits = model(torch.from_numpy(work_windows).to(device))
             baseline_probs = torch.softmax(baseline_logits, dim=1)[:, 1].cpu().numpy()
@@ -246,68 +239,79 @@ def main():
         )
 
         # Leave-one-out contribution profile of the baseline windows -- pure math, no extra forward
-        # passes, reused directly from p09e's implementation.
+        # passes, reused directly from p09e's implementation. Reported as general per-subject context
+        # (how concentrated is this subject's OWN pooling sensitivity) -- NOT used to explain
+        # perturb_fraction's effect, since percentile pooling depends on the whole sorted distribution,
+        # not a fixed set of "important" windows identifiable from the baseline alone: perturbing even
+        # nominally "uninfluential" windows can reshuffle the post-perturbation rank order enough to
+        # move the percentile, so "did we hit the baseline-influential windows" doesn't cleanly explain
+        # what happens once other windows change too.
         loo_contributions = compute_leave_one_out_contributions(
             baseline_probs, method=pooling_strategy, top_percentile=top_percentile, t_window=t_window
         )
-        influential_mask = np.abs(loo_contributions) > 1e-6
-        n_influential = int(np.sum(influential_mask))
-        # Diagnostic for --perturb-fraction < 1.0: did the randomly-chosen perturbed subset happen to
-        # include the windows that actually matter to the pooling statistic, or miss them? Directly
-        # explains why a given subject's propagation_ratio comes out high or low under partial
-        # perturbation, rather than leaving it as an unexplained per-subject coincidence.
-        n_influential_perturbed = int(np.sum(influential_mask & perturb_mask))
+        n_influential = int(np.sum(np.abs(loo_contributions) > 1e-6))
 
-        # Perturb the selected subset (ALL sampled windows, if --perturb-fraction=1.0, the default)
-        # simultaneously, once per scale factor, and re-pool each time. Windows outside perturb_mask
-        # are passed through untouched -- exactly equivalent to scale_factor=1.0 (an exact no-op per
-        # perturb_window_band_power's own docstring), so this is just skipping needless recomputation.
-        pooled_per_scale = np.zeros(len(scale_factors))
-        mean_window_prob_per_scale = np.zeros(len(scale_factors))
-        for i, s in enumerate(scale_factors):
-            perturbed_batch = np.stack([
-                perturb_window_band_power(
-                    w, args.sfreq, low, high, s, order=args.filter_order,
-                    preserve_total_energy=args.preserve_total_energy
-                ) if perturb_mask[j] else w
-                for j, w in enumerate(work_windows)
-            ])
-            with torch.no_grad():
-                logits = model(torch.from_numpy(perturbed_batch).to(device))
-                probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
-            pooled_per_scale[i] = compute_pooled_scores(
-                probs, method=pooling_strategy, top_percentile=top_percentile, t_window=t_window
+        # ONE random permutation per subject, reused (as nested prefixes) across every fraction in the
+        # sweep -- so fraction=0.25's perturbed set is a subset of fraction=0.5's, etc. This isolates
+        # "how much of the recording changed" as the swept variable; independently re-randomizing the
+        # subset at each fraction would confound that with "which specific random subset got drawn."
+        permutation = rng.permutation(len(work_windows))
+
+        for frac in perturb_fractions:
+            n_perturb = max(1, int(round(frac * len(work_windows))))
+            perturb_mask = np.zeros(len(work_windows), dtype=bool)
+            perturb_mask[permutation[:n_perturb]] = True
+
+            # Perturb the selected subset simultaneously, once per scale factor, and re-pool each time.
+            # Windows outside perturb_mask are passed through untouched -- exactly equivalent to
+            # scale_factor=1.0 (an exact no-op per perturb_window_band_power's own docstring), so this
+            # is just skipping needless recomputation.
+            pooled_per_scale = np.zeros(len(scale_factors))
+            mean_window_prob_per_scale = np.zeros(len(scale_factors))
+            for i, s in enumerate(scale_factors):
+                perturbed_batch = np.stack([
+                    perturb_window_band_power(
+                        w, args.sfreq, low, high, s, order=args.filter_order,
+                        preserve_total_energy=args.preserve_total_energy
+                    ) if perturb_mask[j] else w
+                    for j, w in enumerate(work_windows)
+                ])
+                with torch.no_grad():
+                    logits = model(torch.from_numpy(perturbed_batch).to(device))
+                    probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()
+                pooled_per_scale[i] = compute_pooled_scores(
+                    probs, method=pooling_strategy, top_percentile=top_percentile, t_window=t_window
+                )
+                mean_window_prob_per_scale[i] = probs.mean()
+
+            subject_slope, subject_r2 = fit_local_slope(scale_factors, pooled_per_scale)
+
+            pooled_shift = pooled_per_scale[hi_scale_idx] - pooled_per_scale[lo_scale_idx]
+            mean_window_shift = mean_window_prob_per_scale[hi_scale_idx] - mean_window_prob_per_scale[lo_scale_idx]
+            propagation_ratio = float(pooled_shift / mean_window_shift) if abs(mean_window_shift) > 1e-9 else float("nan")
+
+            rows.append({
+                "subject_id": subj_id,
+                "ground_truth": int(y_tensor.item()),
+                "n_windows": len(work_windows),
+                "perturb_fraction": frac,
+                "n_windows_perturbed": int(n_perturb),
+                "windows_approximated": approximated,
+                "n_windows_with_nonzero_loo_contribution": n_influential,
+                "baseline_pooled_score": float(baseline_pooled),
+                "baseline_prediction": int(baseline_pooled >= threshold),
+                "subject_level_slope": subject_slope,
+                "subject_level_r2": subject_r2,
+                "mean_window_level_shift": float(mean_window_shift),
+                "pooled_score_shift": float(pooled_shift),
+                "propagation_ratio": propagation_ratio,
+            })
+
+            print(
+                f"  {subj_id} [frac={frac:.2f}]: baseline_pooled={baseline_pooled:.4f} | "
+                f"subject_slope={subject_slope:+.4f} (R^2={subject_r2:.3f}) | "
+                f"propagation_ratio={propagation_ratio:+.3f} | influential_windows={n_influential}/{len(work_windows)}"
             )
-            mean_window_prob_per_scale[i] = probs.mean()
-
-        subject_slope, subject_r2 = fit_local_slope(scale_factors, pooled_per_scale)
-
-        pooled_shift = pooled_per_scale[hi_scale_idx] - pooled_per_scale[lo_scale_idx]
-        mean_window_shift = mean_window_prob_per_scale[hi_scale_idx] - mean_window_prob_per_scale[lo_scale_idx]
-        propagation_ratio = float(pooled_shift / mean_window_shift) if abs(mean_window_shift) > 1e-9 else float("nan")
-
-        rows.append({
-            "subject_id": subj_id,
-            "ground_truth": int(y_tensor.item()),
-            "n_windows": len(work_windows),
-            "n_windows_perturbed": int(n_perturb),
-            "windows_approximated": approximated,
-            "n_windows_with_nonzero_loo_contribution": n_influential,
-            "n_influential_windows_perturbed": n_influential_perturbed,
-            "baseline_pooled_score": float(baseline_pooled),
-            "baseline_prediction": int(baseline_pooled >= threshold),
-            "subject_level_slope": subject_slope,
-            "subject_level_r2": subject_r2,
-            "mean_window_level_shift": float(mean_window_shift),
-            "pooled_score_shift": float(pooled_shift),
-            "propagation_ratio": propagation_ratio,
-        })
-
-        print(
-            f"  {subj_id}: baseline_pooled={baseline_pooled:.4f} | subject_slope={subject_slope:+.4f} "
-            f"(R^2={subject_r2:.3f}) | propagation_ratio={propagation_ratio:+.3f} | "
-            f"influential_windows={n_influential}/{len(work_windows)}"
-        )
 
     if not rows:
         print("No subjects processed -- nothing to report.")
@@ -316,53 +320,61 @@ def main():
     df = pd.DataFrame(rows)
     csv_path = output_dir / args.output_csv
     df.to_csv(csv_path, index=False)
-    print(f"\nSaved {len(df)} subjects' results to: {csv_path}")
+    print(f"\nSaved {len(df)} (subject, perturb_fraction) rows to: {csv_path}")
 
     print("\n" + "=" * 88)
     print(f"SUBJECT-LEVEL RESULT: does perturbing {args.band} across a whole recording move the pooled score?")
     print("=" * 88)
-    print(f"  mean subject-level slope   = {df['subject_level_slope'].mean():+.4f}")
-    print(f"  median subject-level slope = {df['subject_level_slope'].median():+.4f}")
-    print(f"  frac(slope<0) = {(df['subject_level_slope'] < 0).mean():.2f}   "
-          f"frac(slope>0) = {(df['subject_level_slope'] > 0).mean():.2f}")
-    print(f"  mean subject-level fit R^2 = {df['subject_level_r2'].mean():.3f}")
-    print(f"\n  mean propagation_ratio   = {df['propagation_ratio'].mean():+.4f}")
-    print(f"  median propagation_ratio = {df['propagation_ratio'].median():+.4f}")
+    if len(perturb_fractions) > 1:
+        print(f"Broken down by --perturb-fraction ({perturb_fractions}):\n")
+        summary = df.groupby("perturb_fraction").agg(
+            n_subjects=("subject_id", "count"),
+            mean_slope=("subject_level_slope", "mean"),
+            median_slope=("subject_level_slope", "median"),
+            frac_neg=("subject_level_slope", lambda s: (s < 0).mean()),
+            mean_r2=("subject_level_r2", "mean"),
+            mean_ratio=("propagation_ratio", "mean"),
+            median_ratio=("propagation_ratio", "median"),
+        )
+        print(summary.to_string(float_format=lambda x: f"{x:+.4f}" if abs(x) < 10 else f"{x:.1f}"))
+        print(
+            "\nIf the subject-level effect is robust (not an artifact of changing essentially the whole "
+            "recording), mean/median slope and frac_neg should stay reasonably stable as perturb_fraction "
+            "decreases, rather than collapsing toward zero/0.5."
+        )
+    else:
+        print(f"  mean subject-level slope   = {df['subject_level_slope'].mean():+.4f}")
+        print(f"  median subject-level slope = {df['subject_level_slope'].median():+.4f}")
+        print(f"  frac(slope<0) = {(df['subject_level_slope'] < 0).mean():.2f}   "
+              f"frac(slope>0) = {(df['subject_level_slope'] > 0).mean():.2f}")
+        print(f"  mean subject-level fit R^2 = {df['subject_level_r2'].mean():.3f}")
+        print(f"\n  mean propagation_ratio   = {df['propagation_ratio'].mean():+.4f}")
+        print(f"  median propagation_ratio = {df['propagation_ratio'].median():+.4f}")
     print(
-        "  A ratio near 1.0 means the pooled score moves about as much as a naive window average would --"
+        "\n  A ratio near 1.0 means the pooled score moves about as much as a naive window average would --"
         " pooling isn't losing much of the window-level effect. A ratio well below 1 (or negative) means"
         " most of the window-level signal is NOT reaching the subject-level decision, quantifying exactly"
         " the gap this script was built to test."
     )
 
-    if args.perturb_fraction < 1.0:
+    if len(perturb_fractions) > 1:
         print("\n" + "=" * 88)
-        print(f"PARTIAL-PERTURBATION DIAGNOSTIC (--perturb-fraction={args.perturb_fraction})")
+        print("CORRELATION: does the subject-level result trend with how much of the recording changed?")
         print("=" * 88)
         print(
-            "Does propagation_ratio depend on whether the randomly-perturbed subset happened to include "
-            "the windows that actually matter to pooling (nonzero LOO contribution), or missed them? "
-            "This is the direct test of p09e's concern that --perturb-fraction=1.0 can't distinguish "
-            "from faithful propagation."
+            "Pooled across every (subject, perturb_fraction) row -- NOT the per-window LOO-influence "
+            "framing tried earlier (dropped: percentile pooling depends on the whole sorted distribution, "
+            "not a fixed set of 'important' windows identifiable from the baseline alone, so 'did we hit "
+            "the influential windows' doesn't cleanly separate from 'how much changed overall'). This is "
+            "the clean version of that question: does MORE of the recording changing produce a stronger, "
+            "more negative slope / higher propagation_ratio, in a graded, monotonic way?"
         )
-        has_influential = df["n_windows_with_nonzero_loo_contribution"] > 0
-        frac_influential_perturbed = np.where(
-            has_influential,
-            df["n_influential_windows_perturbed"] / df["n_windows_with_nonzero_loo_contribution"].replace(0, np.nan),
-            np.nan
-        )
-        valid = has_influential & df["propagation_ratio"].notna()
-        r = spearman_corr(frac_influential_perturbed[valid], df.loc[valid, "propagation_ratio"].values)
-        print(
-            f"\n  Spearman(frac_influential_windows_perturbed, propagation_ratio) = {r:+.4f} "
-            f"(n_subjects={int(valid.sum())})"
-        )
-        print(
-            "  A positive correlation here would confirm: subjects where perturbation missed the "
-            "influential windows show a lower propagation_ratio, and subjects where it hit them show a "
-            "higher one -- i.e. the partial-perturbation result is explained by WHICH windows changed, "
-            "not just how many."
-        )
+        valid_slope = df["subject_level_slope"].notna()
+        r_slope = spearman_corr(df.loc[valid_slope, "perturb_fraction"].values, df.loc[valid_slope, "subject_level_slope"].values)
+        valid_ratio = df["propagation_ratio"].notna()
+        r_ratio = spearman_corr(df.loc[valid_ratio, "perturb_fraction"].values, df.loc[valid_ratio, "propagation_ratio"].values)
+        print(f"\n  Spearman(perturb_fraction, subject_level_slope)  = {r_slope:+.4f}  (n={int(valid_slope.sum())})")
+        print(f"  Spearman(perturb_fraction, propagation_ratio)    = {r_ratio:+.4f}  (n={int(valid_ratio.sum())})")
 
 
 if __name__ == "__main__":
