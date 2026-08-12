@@ -88,11 +88,12 @@ def apply_eeg_referencing(raw: mne.io.BaseRaw, subject_id: str = "") -> mne.io.B
         raw.set_eeg_reference(ref_channels=[a1_ch, a2_ch], projection=False, verbose=False)
         logger.debug(f"{tag}Referencing: Applied Linked-Earlobe (ref={a1_ch},{a2_ch}).")
     else:
-        try:
-            raw.set_eeg_reference(ref_channels="average", projection=False, verbose=False)
-            logger.debug(f"{tag}Referencing: Applied Common Average Reference (CAR).")
-        except Exception as e:
-            logger.warning(f"{tag}Referencing warning: {e}")
+        # No try/except swallow here on purpose: a referencing failure must fail loud (propagate to
+        # process_subject_slicing_worker's outer try/except, which marks the subject ERROR) rather
+        # than silently returning `raw` unreferenced with zero trace in the output metadata that
+        # referencing never actually happened.
+        raw.set_eeg_reference(ref_channels="average", projection=False, verbose=False)
+        logger.debug(f"{tag}Referencing: Applied Common Average Reference (CAR).")
     return raw
 
 
@@ -129,8 +130,14 @@ def validate_spatial_neighborhood(
         logger.debug(f"{tag}Spatial Neighborhood Check PASSED: All bad channels are spatially isolated.")
         return True
     except Exception as e:
-        logger.debug(f"{tag}Adjacency check skipped/failed ({e}); assuming spatially safe.")
-        return True
+        # Fail CLOSED, not open: if the adjacency check itself can't run, we have no way to verify
+        # this subject's bad channels aren't spatially clustered -- and the whole point of this check
+        # (per this file's own docstring) is to REJECT spatially-clustered bad channels rather than
+        # interpolate them. Silently assuming "safe" here would let exactly the subjects this check
+        # exists to catch slip through with no record that the check never actually ran.
+        logger.warning(f"{tag}[REJECT - ADJACENCY CHECK FAILED] Could not verify spatial isolation ({e}); "
+                        f"rejecting rather than assuming safe.")
+        return False
 
 
 def standardize_mne_channel_names(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
@@ -157,13 +164,22 @@ def detect_and_interpolate_bad_channels(
     max_bad_ratio: float = 0.15,
     max_bad_neighbors: int = 1,
     subject_id: str = ""
-) -> Tuple[mne.io.BaseRaw, List[str], bool]:
-    """Evaluates channel quality, spatial neighborhood adjacency, and interpolates bad channels safely."""
+) -> Tuple[mne.io.BaseRaw, List[str], List[str], bool]:
+    """
+    Evaluates channel quality, spatial neighborhood adjacency, and interpolates bad channels safely.
+
+    Returns (raw, interpolated_chs, bad_not_interpolated_chs, subject_ok) -- interpolated_chs is
+    exactly the channels that were successfully spatial-spline-reconstructed; bad_not_interpolated_chs
+    covers every OTHER flagged-bad channel (missing 3D coordinates, or detected but never attempted
+    because the subject was rejected outright for a high bad-ratio or spatially-clustered bad
+    channels). Callers must not treat bad_not_interpolated_chs as cleaned -- its data is whatever the
+    original flatline/noisy/uninterpolated signal was.
+    """
     tag = f"[Subj: {subject_id}] " if subject_id else ""
     n_recorded = len(recorded_ch_names)
     if n_recorded == 0:
         logger.error(f"{tag}No valid recorded EEG channels found.")
-        return raw, [], False
+        return raw, [], [], False
 
     # 1. Standardize channel casing to match MNE's standard 10-20 montage
     raw = standardize_mne_channel_names(raw)
@@ -196,30 +212,34 @@ def detect_and_interpolate_bad_channels(
             reason = "FLATLINE" if val < min_std_uV else "HIGH_VARIANCE/NOISE"
             logger.debug(f"{tag}  └─ Bad Channel '{raw.ch_names[i]}': std = {val:.2f} uV ({reason})")
 
-    # Reject if total bad channel ratio exceeds limit
+    # Reject if total bad channel ratio exceeds limit -- none of the bad channels were ever attempted,
+    # so they all land in bad_not_interpolated_chs, never in interpolated_chs.
     if bad_ratio > max_bad_ratio:
         logger.warning(
             f"{tag}[REJECT - HIGH BAD RATIO] Subject has {bad_count}/{n_recorded} bad channels "
             f"({bad_ratio:.1%}), exceeding limit of {max_bad_ratio:.1%}."
         )
-        return raw, bad_ch_names, False
+        return raw, [], bad_ch_names, False
 
-    # Reject if bad channels form spatial clusters
+    # Reject if bad channels form spatial clusters -- same rationale, nothing was interpolated.
     if bad_count > 1:
         is_spatially_isolated = validate_spatial_neighborhood(
             raw, bad_ch_names, max_bad_neighbors=max_bad_neighbors, subject_id=subject_id
         )
         if not is_spatially_isolated:
-            return raw, bad_ch_names, False
+            return raw, [], bad_ch_names, False
 
     # 3. Interpolate isolated bad channels with coordinate safety check
+    interpolated_chs: List[str] = []
+    bad_not_interpolated_chs: List[str] = []
     if bad_count > 0:
         # Keep only bad channels that have valid 3D spatial locations
         interpolatable_bads = [ch for ch in bad_ch_names if ch in valid_pos_chs]
-        
-        if len(interpolatable_bads) < bad_count:
-            skipped = set(bad_ch_names) - set(interpolatable_bads)
-            logger.warning(f"{tag}Skipping interpolation for bad channels missing 3D coordinates: {skipped}")
+        skipped_no_coords = [ch for ch in bad_ch_names if ch not in valid_pos_chs]
+
+        if skipped_no_coords:
+            logger.warning(f"{tag}Skipping interpolation for bad channels missing 3D coordinates: {skipped_no_coords}")
+        bad_not_interpolated_chs.extend(skipped_no_coords)
 
         if interpolatable_bads:
             clean_count = n_recorded - len(interpolatable_bads)
@@ -231,16 +251,17 @@ def detect_and_interpolate_bad_channels(
             try:
                 raw.interpolate_bads(reset_bads=True, mode='accurate', verbose=False)
                 logger.debug(f"{tag}Interpolation successfully applied.")
+                interpolated_chs = list(interpolatable_bads)
             except Exception as e:
                 logger.error(
                     f"{tag}[REJECT - INTERPOLATION FAILURE] Spherical spline interpolation failed: {e}. "
                     f"Marking subject as unrecoverable."
                 )
-                return raw, bad_ch_names, False
+                return raw, [], bad_ch_names, False
     else:
         logger.debug(f"{tag}No bad channels detected. All recorded channels are clean.")
 
-    return raw, bad_ch_names, True
+    return raw, interpolated_chs, bad_not_interpolated_chs, True
 
 
 def prepare_clean_raw_eeg(
@@ -250,8 +271,14 @@ def prepare_clean_raw_eeg(
     h_freq: float = 35.0,
     max_bad_ratio: float = 0.15,
     max_bad_neighbors: int = 1
-) -> Tuple[mne.io.BaseRaw, mne.io.BaseRaw, List[str], List[str], bool]:
-    """Top-level continuous data preparation pipeline."""
+) -> Tuple[mne.io.BaseRaw, mne.io.BaseRaw, List[str], List[str], List[str], bool]:
+    """
+    Top-level continuous data preparation pipeline.
+
+    Returns (raw_orig, raw_clean_eeg, recorded_eeg_chs, interpolated_chs, bad_not_interpolated_chs,
+    subject_ok) -- see detect_and_interpolate_bad_channels()'s docstring for what interpolated_chs vs
+    bad_not_interpolated_chs mean.
+    """
     tag = f"[Subj: {subject_id}] " if subject_id else ""
     logger.debug(f"{tag}Processing raw file: {file_path.name}")
     raw_orig = load_raw_eeg(file_path)
@@ -259,7 +286,7 @@ def prepare_clean_raw_eeg(
     recorded_eeg_chs = discover_cbramod_channels(raw_orig)
     if len(recorded_eeg_chs) == 0:
         logger.error(f"{tag}Zero matching CBraMod channels found in {file_path.name}")
-        return raw_orig, raw_orig, [], [], False
+        return raw_orig, raw_orig, [], [], [], False
 
     logger.debug(f"{tag}Discovered {len(recorded_eeg_chs)} valid scalp EEG channels.")
 
@@ -294,15 +321,15 @@ def prepare_clean_raw_eeg(
     if earlobe_chs:
         raw_ref = raw_ref.copy().pick(recorded_eeg_chs)
 
-    raw_clean_eeg, bad_chs, subject_ok = detect_and_interpolate_bad_channels(
-        raw_ref, 
-        recorded_ch_names=recorded_eeg_chs, 
+    raw_clean_eeg, interpolated_chs, bad_not_interpolated_chs, subject_ok = detect_and_interpolate_bad_channels(
+        raw_ref,
+        recorded_ch_names=recorded_eeg_chs,
         max_bad_ratio=max_bad_ratio,
         max_bad_neighbors=max_bad_neighbors,
         subject_id=subject_id
     )
 
-    return raw_orig, raw_clean_eeg, recorded_eeg_chs, bad_chs, subject_ok
+    return raw_orig, raw_clean_eeg, recorded_eeg_chs, interpolated_chs, bad_not_interpolated_chs, subject_ok
 
 
 def harmonize_channels_to_cbramod(data_uV: np.ndarray, orig_ch_names: List[str]) -> np.ndarray:
@@ -319,6 +346,22 @@ def harmonize_channels_to_cbramod(data_uV: np.ndarray, orig_ch_names: List[str])
             harmonized[t_idx, :] = data_uV[s_idx, :]
 
     return harmonized
+
+
+def compute_active_channel_mask(orig_ch_names: List[str]) -> List[bool]:
+    """
+    Boolean mask, aligned with CBRMOD_STANDARD_64 (and thus with `channel_names` in the output
+    meta.json and every axis-0 row of the harmonized 64-channel tensor), True where that position was
+    actually recorded for this subject and False where harmonize_channels_to_cbramod() zero-padded it.
+
+    Persisting this explicitly (rather than leaving downstream consumers to infer channel activity
+    from e.g. norm_std_uv > 0, which is only valid for is_valid=True windows and is a repurposed
+    byproduct of normalization rather than an intentional flag) is what several analysis scripts this
+    session ended up needing to reverse-engineer from scratch, once, each -- this makes that a
+    non-issue going forward.
+    """
+    clean_orig = set(clean_ch_name(ch) for ch in orig_ch_names)
+    return [clean_ch_name(ch) in clean_orig for ch in CBRMOD_STANDARD_64]
 
 
 def process_and_normalize_slice(
@@ -391,7 +434,8 @@ def slice_strategy_a_macro(
     raw_orig: mne.io.BaseRaw,
     raw_clean_eeg: mne.io.BaseRaw,
     recorded_chs: List[str],
-    bad_chs: List[str],
+    interpolated_chs: List[str],
+    bad_not_interpolated_chs: List[str],
     subject_ok: bool,
     window_sec: float = 30.0,
     subject_id: str = ""
@@ -416,7 +460,12 @@ def slice_strategy_a_macro(
             "is_valid": False,
             "quality_status": "REJECTED_BAD_CHANNELS_OR_CLUSTERS",
             "num_recorded_channels": len(recorded_chs),
-            "bad_channels_detected": bad_chs,
+            # Same key names as the valid-window path below (was "bad_channels_detected" here vs
+            # "bad_channels_interpolated" there -- any downstream reader keyed on one specific name,
+            # e.g. p02x_verify_reslice_diff.py, silently got an empty list for rejected subjects).
+            "bad_channels_interpolated": interpolated_chs,
+            "bad_channels_not_interpolated": bad_not_interpolated_chs,
+            "num_samples_clipped": 0,
             "norm_mean_uv": [0.0] * 64,
             "norm_std_uv": [0.0] * 64,
             "type": "macro_30s"
@@ -424,6 +473,11 @@ def slice_strategy_a_macro(
         return np.stack(slices, axis=0), metadata, raw_stages
 
     data_uV = raw_clean_eeg.get_data() * 1e6
+    # Track which samples the +-500uV clip actually alters, BEFORE clipping -- a clipped flat-top is a
+    # broadband transient (spectral leakage into every band, disproportionately the higher ones), so
+    # this is a cheap diagnostic to see how often it fires in practice before deciding whether the
+    # fixed clip bound needs to become something smarter (e.g. per-segment interpolation).
+    was_clipped = np.abs(data_uV) > 500.0
     data_clipped = np.clip(data_uV, -500.0, 500.0)
     data_harmonized = harmonize_channels_to_cbramod(data_clipped, raw_clean_eeg.ch_names)
 
@@ -439,7 +493,8 @@ def slice_strategy_a_macro(
         end_sec = end_sample / sfreq
 
         window_raw = data_harmonized[:, start_sample:end_sample]
-        
+        num_samples_clipped = int(was_clipped[:, start_sample:end_sample].sum())
+
         # Screen window quality and apply Z-score normalization
         win_id_str = f"#{idx} ({start_sec:.1f}s-{end_sec:.1f}s)"
         window_norm, is_valid, quality_status, norm_mean_uv, norm_std_uv = process_and_normalize_slice(
@@ -460,7 +515,9 @@ def slice_strategy_a_macro(
             "is_valid": is_valid,
             "quality_status": quality_status,
             "num_recorded_channels": len(recorded_chs),
-            "bad_channels_interpolated": bad_chs,
+            "bad_channels_interpolated": interpolated_chs,
+            "bad_channels_not_interpolated": bad_not_interpolated_chs,
+            "num_samples_clipped": num_samples_clipped,
             # Per-channel mean/std (uV) used for this window's Z-score normalization --
             # 0.0 for zero-padded/inactive channels or rejected windows (never normalized).
             # Reconstruct the original uV signal via: normalized*(norm_std_uv+1e-8) + norm_mean_uv
@@ -487,9 +544,10 @@ def slice_strategy_a_macro(
 def slice_strategy_b_micro(
     raw_clean_eeg: mne.io.BaseRaw,
     recorded_chs: List[str],
-    bad_chs: List[str],
+    interpolated_chs: List[str],
+    bad_not_interpolated_chs: List[str],
     subject_ok: bool,
-    crop_duration_sec: float = 3.0, 
+    crop_duration_sec: float = 3.0,
     spindle_band: Tuple[float, float] = (11.0, 16.0),
     threshold_std: float = 1.5,
     subject_id: str = ""
@@ -505,39 +563,44 @@ def slice_strategy_b_micro(
     half_crop = crop_samples // 2
 
     data_uV = raw_clean_eeg.get_data() * 1e6
+    was_clipped = np.abs(data_uV) > 500.0  # see slice_strategy_a_macro's identical comment
     data_clipped = np.clip(data_uV, -500.0, 500.0)
     data_harmonized = harmonize_channels_to_cbramod(data_clipped, raw_clean_eeg.ch_names)
 
     candidate_crops = []
     meta_candidates = []
 
-    if HAS_YASA:
-        try:
-            sp = yasa.spindles_detect(raw_clean_eeg, verbose=False)
-            if sp is not None:
-                summary = sp.summary()
-                for _, row in summary.iterrows():
-                    peak_sec = row["Peak"]
-                    peak_sample = int(round(peak_sec * sfreq))
+    # yasa is imported unconditionally at module level -- no soft-dependency flag to gate this on
+    # (an earlier refactor removed the try/except HAS_YASA guard but left this check behind, which
+    # referenced an undefined name and made this whole strategy crash immediately on every use).
+    try:
+        sp = yasa.spindles_detect(raw_clean_eeg, verbose=False)
+        if sp is not None:
+            summary = sp.summary()
+            for _, row in summary.iterrows():
+                peak_sec = row["Peak"]
+                peak_sample = int(round(peak_sec * sfreq))
 
-                    start_s = peak_sample - half_crop
-                    end_s = peak_sample + half_crop
+                start_s = peak_sample - half_crop
+                end_s = peak_sample + half_crop
 
-                    if start_s >= 0 and end_s <= data_harmonized.shape[1]:
-                        crop_data = data_harmonized[:, start_s:end_s]
-                        if crop_data.shape[1] == crop_samples:
-                            candidate_crops.append(crop_data)
-                            meta_candidates.append({
-                                "event_channel": row["Channel"],
-                                "peak_sec": peak_sec,
-                                "duration_sec": row["Duration"],
-                                "frequency": row["Frequency"],
-                                "num_recorded_channels": len(recorded_chs),
-                                "bad_channels_interpolated": bad_chs,
-                                "type": "event_crop_yasa"
-                            })
-        except Exception:
-            pass
+                if start_s >= 0 and end_s <= data_harmonized.shape[1]:
+                    crop_data = data_harmonized[:, start_s:end_s]
+                    if crop_data.shape[1] == crop_samples:
+                        candidate_crops.append(crop_data)
+                        meta_candidates.append({
+                            "event_channel": row["Channel"],
+                            "peak_sec": peak_sec,
+                            "duration_sec": row["Duration"],
+                            "frequency": row["Frequency"],
+                            "num_recorded_channels": len(recorded_chs),
+                            "bad_channels_interpolated": interpolated_chs,
+                            "bad_channels_not_interpolated": bad_not_interpolated_chs,
+                            "num_samples_clipped": int(was_clipped[:, start_s:end_s].sum()),
+                            "type": "event_crop_yasa"
+                        })
+    except Exception:
+        pass
 
     # Fallback: Hilbert envelope thresholding on spindle band
     if len(candidate_crops) == 0:
@@ -545,7 +608,7 @@ def slice_strategy_b_micro(
             l_freq=spindle_band[0], h_freq=spindle_band[1], verbose=False
         )
         spindle_data = raw_spindle.get_data()
-        
+
         envelope = np.abs(hilbert(spindle_data, axis=-1))
         mean_env = np.mean(envelope)
         std_env = np.std(envelope)
@@ -573,7 +636,9 @@ def slice_strategy_b_micro(
                     "peak_sec": peak / sfreq,
                     "duration_sec": crop_duration_sec,
                     "num_recorded_channels": len(recorded_chs),
-                    "bad_channels_interpolated": bad_chs,
+                    "bad_channels_interpolated": interpolated_chs,
+                    "bad_channels_not_interpolated": bad_not_interpolated_chs,
+                    "num_samples_clipped": int(was_clipped[:, start_s:end_s].sum()),
                     "type": "event_crop_bandpass"
                 })
 
@@ -585,13 +650,17 @@ def slice_strategy_b_micro(
     for idx, (crop, meta) in enumerate(zip(candidate_crops, meta_candidates)):
         peak_t = meta.get("peak_sec", 0.0)
         win_id_str = f"event_{idx} (peak={peak_t:.1f}s)"
-        
+
         norm_crop, is_valid, quality_status, norm_mean_uv, norm_std_uv = process_and_normalize_slice(
             crop, window_id=win_id_str, subject_id=subject_id
         )
 
         if is_valid:
             slices.append(norm_crop)
+            # window_idx must be the direct row index into the final .npy array (extract_valid_window_
+            # indices() does a required slice_info["window_idx"] lookup, no .get() fallback) -- this
+            # was never set at all for Strategy B, so any downstream loader would KeyError on it.
+            meta["window_idx"] = len(metadata)
             meta["is_valid"] = True
             meta["quality_status"] = quality_status
             # See process_and_normalize_slice's docstring for the exact inverse transform.
@@ -642,20 +711,29 @@ def process_subject_slicing_worker(
         return {"status": "SKIPPED", "subject": subject_id, "count": 0}
 
     try:
-        raw_orig, raw_clean_eeg, recorded_chs, bad_chs, subject_ok = prepare_clean_raw_eeg(
-            src_file, subject_id=subject_id
+        raw_orig, raw_clean_eeg, recorded_chs, interpolated_chs, bad_not_interpolated_chs, subject_ok = (
+            prepare_clean_raw_eeg(src_file, subject_id=subject_id)
         )
 
         if strategy.lower() == "macro":
             tensor, meta, stages = slice_strategy_a_macro(
-                raw_orig, raw_clean_eeg, recorded_chs, bad_chs, subject_ok, window_sec=window_sec, subject_id=subject_id
+                raw_orig, raw_clean_eeg, recorded_chs, interpolated_chs, bad_not_interpolated_chs,
+                subject_ok, window_sec=window_sec, subject_id=subject_id
             )
         elif strategy.lower() == "micro":
             tensor, meta, stages = slice_strategy_b_micro(
-                raw_clean_eeg, recorded_chs, bad_chs, subject_ok, crop_duration_sec=window_sec, subject_id=subject_id
+                raw_clean_eeg, recorded_chs, interpolated_chs, bad_not_interpolated_chs, subject_ok,
+                crop_duration_sec=window_sec, subject_id=subject_id
             )
         else:
             raise ValueError(f"Unknown strategy: {strategy}")
+
+        # Which of the 64 canonical positions were actually recorded for this subject (interpolated
+        # channels count as active -- they were fixed, not left zero-padded). Persisted once, subject-
+        # level, rather than leaving every downstream consumer to re-derive this from norm_std_uv > 0
+        # (only valid for is_valid=True windows, and a repurposed byproduct rather than an intentional
+        # flag -- this ambiguity already caused real confusion earlier in this project).
+        active_channel_mask = compute_active_channel_mask(recorded_chs)
 
         np.save(output_npy, tensor)
         with open(output_meta, "w") as f:
@@ -664,6 +742,7 @@ def process_subject_slicing_worker(
                 "strategy": strategy,
                 "num_channels": 64,
                 "channel_names": CBRMOD_STANDARD_64,
+                "active_channel_mask": active_channel_mask,
                 "sampling_freq": raw_clean_eeg.info["sfreq"],
                 "num_slices": len(meta),
                 "stages": stages,
