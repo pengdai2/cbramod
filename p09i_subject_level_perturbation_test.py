@@ -88,6 +88,15 @@ def fit_local_slope(scale_factors: np.ndarray, values: np.ndarray) -> Tuple[floa
     return float(slope), float(r2)
 
 
+def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
+        return float("nan")
+    ra = np.argsort(np.argsort(a)).astype(np.float64)
+    rb = np.argsort(np.argsort(b)).astype(np.float64)
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
 def parse_cli_args() -> argparse.Namespace:
     parser = setup_inference_cli_parser(description="Subject-Level (Pooled) Band Power Perturbation Test")
     group = parser.add_argument_group("Subject-Level Perturbation Test")
@@ -117,6 +126,23 @@ def parse_cli_args() -> argparse.Namespace:
              "set this (e.g. 100-200) if runtime matters more than perturbing literally every window. "
              "NOTE: capping means only a SUBSET of windows get perturbed while the rest keep their "
              "original probability -- an approximation of 'the whole recording changed', not the real thing."
+    )
+    group.add_argument(
+        "--perturb-fraction", type=float, default=1.0,
+        help="Fraction (0-1] of a subject's sampled windows to actually perturb; the rest are left at "
+             "their ORIGINAL baseline signal (never touched, regardless of scale_factor) for every "
+             "point on the scale-factor sweep. Default 1.0 perturbs every window (the original design). "
+             "A smaller fraction (e.g. 0.5) is a sharper test of the specific concern p09e's leave-one-"
+             "out analysis raised: percentile pooling only cares about whichever window sits at the "
+             "rank, and most windows have near-zero contribution to it. Perturbing ALL windows sidesteps "
+             "that -- even a window that individually doesn't matter to the percentile still shifts, "
+             "which can move the whole distribution enough that something near the rank moves too, "
+             "without ever testing whether pooling ignores a change concentrated in the 'wrong' "
+             "(non-rank-adjacent) windows. Perturbing a random, fixed-across-the-sweep subset instead "
+             "directly tests that: if the percentile-determining window happens to land in the "
+             "UNPERTURBED remainder for a given subject, the pooled score should barely move despite a "
+             "real average shift across the perturbed subset -- exactly the failure mode p09e predicts, "
+             "and something --perturb-fraction=1.0 can't distinguish from faithful propagation."
     )
     group.add_argument(
         "--subjects-json", type=str, default=None,
@@ -200,6 +226,17 @@ def main():
             approximated = True
         work_windows = raw_np[window_order]
 
+        # Which of work_windows actually get perturbed -- a FIXED subset held constant across the
+        # whole scale-factor sweep (not re-drawn per scale factor, or the fitted slope would be
+        # confounded by ALSO changing which windows are perturbed at each point). Windows outside this
+        # subset are left at their true, untouched baseline signal, but still participate in pooling --
+        # unlike --max-windows-per-subject, which drops excluded windows from pooling entirely, this
+        # keeps the full real window distribution intact and tests whether the percentile statistic
+        # responds to a change concentrated in only PART of it. See --perturb-fraction's help text.
+        n_perturb = max(1, int(round(args.perturb_fraction * len(work_windows))))
+        perturb_mask = np.zeros(len(work_windows), dtype=bool)
+        perturb_mask[rng.choice(len(work_windows), size=n_perturb, replace=False)] = True
+
         # Baseline (unperturbed) probabilities and pooled score.
         with torch.no_grad():
             baseline_logits = model(torch.from_numpy(work_windows).to(device))
@@ -213,9 +250,18 @@ def main():
         loo_contributions = compute_leave_one_out_contributions(
             baseline_probs, method=pooling_strategy, top_percentile=top_percentile, t_window=t_window
         )
-        n_influential = int(np.sum(np.abs(loo_contributions) > 1e-6))
+        influential_mask = np.abs(loo_contributions) > 1e-6
+        n_influential = int(np.sum(influential_mask))
+        # Diagnostic for --perturb-fraction < 1.0: did the randomly-chosen perturbed subset happen to
+        # include the windows that actually matter to the pooling statistic, or miss them? Directly
+        # explains why a given subject's propagation_ratio comes out high or low under partial
+        # perturbation, rather than leaving it as an unexplained per-subject coincidence.
+        n_influential_perturbed = int(np.sum(influential_mask & perturb_mask))
 
-        # Perturb ALL (sampled) windows simultaneously, once per scale factor, and re-pool each time.
+        # Perturb the selected subset (ALL sampled windows, if --perturb-fraction=1.0, the default)
+        # simultaneously, once per scale factor, and re-pool each time. Windows outside perturb_mask
+        # are passed through untouched -- exactly equivalent to scale_factor=1.0 (an exact no-op per
+        # perturb_window_band_power's own docstring), so this is just skipping needless recomputation.
         pooled_per_scale = np.zeros(len(scale_factors))
         mean_window_prob_per_scale = np.zeros(len(scale_factors))
         for i, s in enumerate(scale_factors):
@@ -223,8 +269,8 @@ def main():
                 perturb_window_band_power(
                     w, args.sfreq, low, high, s, order=args.filter_order,
                     preserve_total_energy=args.preserve_total_energy
-                )
-                for w in work_windows
+                ) if perturb_mask[j] else w
+                for j, w in enumerate(work_windows)
             ])
             with torch.no_grad():
                 logits = model(torch.from_numpy(perturbed_batch).to(device))
@@ -244,8 +290,10 @@ def main():
             "subject_id": subj_id,
             "ground_truth": int(y_tensor.item()),
             "n_windows": len(work_windows),
+            "n_windows_perturbed": int(n_perturb),
             "windows_approximated": approximated,
             "n_windows_with_nonzero_loo_contribution": n_influential,
+            "n_influential_windows_perturbed": n_influential_perturbed,
             "baseline_pooled_score": float(baseline_pooled),
             "baseline_prediction": int(baseline_pooled >= threshold),
             "subject_level_slope": subject_slope,
@@ -286,6 +334,35 @@ def main():
         " most of the window-level signal is NOT reaching the subject-level decision, quantifying exactly"
         " the gap this script was built to test."
     )
+
+    if args.perturb_fraction < 1.0:
+        print("\n" + "=" * 88)
+        print(f"PARTIAL-PERTURBATION DIAGNOSTIC (--perturb-fraction={args.perturb_fraction})")
+        print("=" * 88)
+        print(
+            "Does propagation_ratio depend on whether the randomly-perturbed subset happened to include "
+            "the windows that actually matter to pooling (nonzero LOO contribution), or missed them? "
+            "This is the direct test of p09e's concern that --perturb-fraction=1.0 can't distinguish "
+            "from faithful propagation."
+        )
+        has_influential = df["n_windows_with_nonzero_loo_contribution"] > 0
+        frac_influential_perturbed = np.where(
+            has_influential,
+            df["n_influential_windows_perturbed"] / df["n_windows_with_nonzero_loo_contribution"].replace(0, np.nan),
+            np.nan
+        )
+        valid = has_influential & df["propagation_ratio"].notna()
+        r = spearman_corr(frac_influential_perturbed[valid], df.loc[valid, "propagation_ratio"].values)
+        print(
+            f"\n  Spearman(frac_influential_windows_perturbed, propagation_ratio) = {r:+.4f} "
+            f"(n_subjects={int(valid.sum())})"
+        )
+        print(
+            "  A positive correlation here would confirm: subjects where perturbation missed the "
+            "influential windows show a lower propagation_ratio, and subjects where it hit them show a "
+            "higher one -- i.e. the partial-perturbation result is explained by WHICH windows changed, "
+            "not just how many."
+        )
 
 
 if __name__ == "__main__":
