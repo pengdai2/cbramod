@@ -309,7 +309,7 @@ class CachedFeatureSubjectDataset(Dataset):
         data = torch.load(pt_path, map_location="cpu", weights_only=True)
 
         # "stages"/"indices" should always be present -- extract_and_cache()
-        # (p08b_finetune_probing.py) writes them unconditionally. Fail loudly
+        # (p08a_extract_features.py) writes them unconditionally. Fail loudly
         # with an actionable message rather than silently defaulting to
         # None/range placeholders: a cache missing this metadata means the
         # extraction run that produced it either predates stage tracking or
@@ -357,6 +357,32 @@ class CachedFeatureSubjectDataset(Dataset):
         subj_label = self.labels[mask][0]
 
         return subj_feats, subj_label, subject_id, subj_stages, subj_indices
+
+
+def flatten_cached_feature_dataset(
+    dataset: "CachedFeatureSubjectDataset"
+) -> Tuple[torch.Tensor, torch.Tensor, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Flattens a (subject-grouped) CachedFeatureSubjectDataset back out to window-level arrays,
+    restricted to whatever subject filter the dataset was constructed with (dataset.unique_subjects).
+
+    CachedFeatureSubjectDataset's own __getitem__ groups all of one subject's windows together (one
+    item per subject, for patient-level inference) -- the wrong shape for a flat, shuffled window-
+    level training batch, or for a window-level forward pass that gets pooled by subject afterward
+    (p08b's validation loop). This is the bridge: reuse the class's file-loading and subject-filter-
+    parsing (a single pt_path + filter_subject covers train/val/test/any-CV-fold's subject subset,
+    all against the SAME master cache, no separate per-split extraction or temporary per-fold cache
+    files needed), then flatten back to (feats, labels, subject_ids, stages, indices) at the window
+    level for whatever flat batching the caller actually needs.
+    """
+    mask = np.isin(dataset.subject_ids, dataset.unique_subjects)
+    return (
+        dataset.feats[mask],
+        dataset.labels[mask],
+        dataset.subject_ids[mask],
+        dataset.stages[mask],
+        dataset.indices[mask],
+    )
 
 
 class SyntheticEEGDataset(torch.utils.data.Dataset):

@@ -1,49 +1,53 @@
 """
-Production CLI Pipeline for CBraMod with Manifest-based .npy Datasets.
-Supports Stage-Filtered Embedding Extraction, Window-Level Probe Training & 
-Subject-Level Multi-Strategy Pooling Evaluation.
+Production CLI Pipeline for CBraMod Probe Training & Subject-Level Multi-Strategy Pooling Evaluation.
+
+Reads backbone embeddings from a single master cache -- built once, for the WHOLE cohort, by the
+standalone p08a_extract_features.py -- rather than extracting them itself. --train-manifest/
+--val-manifest (p03's per-split CSVs) are only used to read each split's subject_id column;
+CachedFeatureSubjectDataset's subject filter then carves the corresponding window-level view out of
+THAT SAME master cache for training vs. validation, and per-fold for --enable-sgkf, with no separate
+extraction pass and no temporary per-fold cache files.
 
 Usage:
-  # 1. First run (Extracts embeddings filtered by stage & performs probe training):
-  python cbramod_manifest_pipeline.py \
+  # 1. First, build the master cache once (see p08a_extract_features.py):
+  python p08a_extract_features.py \
+      --master-manifest /data/eeg_study/master_manifest.csv \
+      --data-dir /data/eeg_study/npy_files --filter-stage N2,N3 \
+      --cache-dir /data/eeg_study/cache
+
+  # 2. Train against a fixed train/val split, drawn from that cache:
+  python p08b_finetune_probing.py \
+      --cache-dir /data/eeg_study/cache \
       --train-manifest /data/eeg_study/train_manifest.csv \
       --val-manifest /data/eeg_study/val_manifest.csv \
-      --data-dir /data/eeg_study/npy_files \
-      --filter-stage N2,N3 \
-      --num-workers 8
+      --head-lr 0.0003 --epochs 40 --primary-pooling p85_score
 
-  # 2. Subsequent runs (Uses cached embeddings, trains head with custom primary pooling):
-  python cbramod_manifest_pipeline.py --head-lr 0.0003 --epochs 40 --primary-pooling p85_score
-
-  # 3. Force re-extraction from .npy files:
-  python cbramod_manifest_pipeline.py \
-      --train-manifest /data/eeg_study/train_manifest.csv \
-      --val-manifest /data/eeg_study/val_manifest.csv \
-      --filter-stage N2,N3 \
-      --force-extract
+  # 3. Stratified Group K-Fold CV (subject-level splits drawn from the master cache directly --
+  #    --train-manifest/--val-manifest are ignored in this mode):
+  python p08b_finetune_probing.py --cache-dir /data/eeg_study/cache --enable-sgkf --sgkf-folds 5
 """
 
 import argparse
-import gc
 import logging
 from pathlib import Path
+from typing import List
 import sys
 import time
 
 import numpy as np
+import pandas as pd
 from cbramod_utils import setup_logger
 import torch
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import StratifiedGroupKFold
-from tqdm import tqdm
 
 from cbramod_common import (
-    CBraModFeatureExtractor,
+    CachedFeatureSubjectDataset,
     CBraModTrainer,
     LinearProbeHead,
     MLPProbeHead,
-    PANSleepEEGDataset,
+    flatten_cached_feature_dataset,
     is_checkpoint_improvement,
     seed_everything,
     setup_data_loader_and_criterion,
@@ -51,26 +55,39 @@ from cbramod_common import (
 )
 
 
+def load_subject_ids_from_manifest(manifest_csv: Path) -> List[str]:
+    """Reads just the subject_id column of a p03-generated split manifest (train/val/test_manifest.csv)."""
+    df = pd.read_csv(manifest_csv)
+    if "subject_id" not in df.columns:
+        raise ValueError(f"{manifest_csv} has no 'subject_id' column -- is this a p03 split manifest?")
+    return df["subject_id"].astype(str).tolist()
+
+
 # =====================================================================
 # 1. CONFIGURATION & CLI PARSER
 # =====================================================================
 
 def parse_cli_args() -> argparse.Namespace:
-    """Parses command-line arguments for the CBraMod manifest-based pipeline."""
+    """Parses command-line arguments for the CBraMod probe-training pipeline."""
     parser = setup_training_cli_parser(
-        description="CBraMod Manifest-Based Pipeline for Embedding Extraction & Probe Training"
+        description="CBraMod Probe Training & Subject-Level Multi-Strategy Pooling Evaluation "
+                     "(reads a master cache built by p08a_extract_features.py)"
     )
 
-    # Checkpoint & Cache Controls
+    # Cache Controls
     cache_group = parser.add_argument_group("Cache Controls")
-    cache_group.add_argument("--cache-dir", type=str, default=None, help="Directory for cached embeddings")
-    cache_group.add_argument("--train-cache-name", type=str, default="cached_train_embeddings.pt", help="Filename for cached training embeddings")
-    cache_group.add_argument("--val-cache-name", type=str, default="cached_val_embeddings.pt", help="Filename for cached validation embeddings")
-    cache_group.add_argument("--force-extract", action="store_true", help="Force re-extraction of backbone embeddings")
+    cache_group.add_argument("--cache-dir", type=str, required=True, help="Directory containing the master cache (see p08a_extract_features.py)")
+    cache_group.add_argument(
+        "--master-cache-name", type=str, default="cached_master_embeddings.pt",
+        help="Filename of the whole-cohort cached embeddings file written by p08a_extract_features.py. "
+             "--train-manifest/--val-manifest (and SGKF's own subject-level splits) filter THIS SAME "
+             "cache via CachedFeatureSubjectDataset's subject filter, rather than each needing their "
+             "own separately-extracted cache."
+    )
 
     # Run Options
     run_group = parser.add_argument_group("Run Options")
-    run_group.add_argument("--enable-sgkf", action="store_true", help="Enable stratified group k-fmax old cross-validation (overrides train/val split)")
+    run_group.add_argument("--enable-sgkf", action="store_true", help="Enable stratified group k-fold cross-validation (overrides train/val split)")
     run_group.add_argument("--sgkf-folds", type=int, default=5, help="Number of folds for stratified group k-fold CV (default: 5)")
 
     # Logging Controls
@@ -81,83 +98,9 @@ def parse_cli_args() -> argparse.Namespace:
     args.use_amp = not args.no_amp
     return args
 
-# =====================================================================
-# 2. EMBEDDING EXTRACTION ENGINE WITH STAGE FILTERING & SUBJECT ID TRACKING
-# =====================================================================
-
-class EmbeddingManager:
-    """Manages feature extraction from manifest .npy files with optional stage filtering."""
-    def __init__(self, config: argparse.Namespace, logger: logging.Logger):
-        self.config = config
-        self.logger = logger
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    def extract_and_cache(self, manifest_path: Path, output_cache_path: Path, split_name: str) -> None:
-        """Reads .npy files, applies stage filtering, extracts backbone embeddings, and caches feats + labels + subject_ids."""
-        filter_str = f" [Filter: {self.config.filter_stage}]" if self.config.filter_stage else ""
-        self.logger.info(f"[{split_name.upper()}] Initializing PANSleepEEGDataset from: {manifest_path}{filter_str}")
-        
-        dataset = PANSleepEEGDataset(
-            manifest_csv=manifest_path, 
-            data_dir=self.config.data_dir,
-            filter_stage=self.config.filter_stage
-        )
-        self.logger.info(f"[{split_name.upper()}] Successfully indexed {len(dataset):,} valid stage-filtered window references.")
-
-        loader = DataLoader(
-            dataset,
-            batch_size=self.config.batch_size,
-            shuffle=False,
-            num_workers=self.config.num_workers,
-            pin_memory=True,
-            prefetch_factor=2 if self.config.num_workers > 0 else None
-        )
-
-        self.logger.info(f"[{split_name.upper()}] Extracting backbone representations to: {output_cache_path}")
-        extractor = CBraModFeatureExtractor(
-            num_channels=self.config.num_channels,
-            sfreq=self.config.sfreq
-        ).to(self.device)
-        extractor.eval()
-
-        all_embeddings, all_labels, all_subject_ids, all_stages, all_indices = [], [], [], [], []
-        start_time = time.time()
-
-        with torch.no_grad():
-            for batch_x, batch_y, batch_subj, batch_stg, batch_idx in tqdm(loader, desc=f"Extracting {split_name}", unit="batch"):
-                batch_x = batch_x.to(self.device, non_blocking=True)
-                with torch.amp.autocast(device_type="cuda", enabled=(self.config.use_amp and self.device.type == "cuda")):
-                    pooled_feats = extractor(batch_x)
-
-                all_embeddings.append(pooled_feats.cpu().float())
-                all_labels.append(batch_y.cpu())
-                all_subject_ids.extend(batch_subj)
-                all_stages.extend(batch_stg)
-                all_indices.extend(batch_idx)
-
-        cached_feats = torch.cat(all_embeddings, dim=0)
-        cached_labels = torch.cat(all_labels, dim=0)
-
-        torch.save({
-            "feats": cached_feats, 
-            "labels": cached_labels,
-            "subject_ids": all_subject_ids,
-            "stages": all_stages,
-            "indices": all_indices
-        }, output_cache_path)
-
-        del extractor, dataset, loader, all_embeddings, all_labels, all_subject_ids
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        elapsed = time.time() - start_time
-        file_size_mb = output_cache_path.stat().st_size / (1024 * 1024)
-        self.logger.info(f"✓ [{split_name.upper()}] Extraction complete ({elapsed:.1f}s) | Windows: {len(cached_feats):,} | Cache Size: {file_size_mb:.2f} MB")
-
 
 # =====================================================================
-# 3. TRAINER ENGINE WITH WINDOW TRAINING & FAST SUBJECT POOLING VAL
+# 2. TRAINER ENGINE WITH WINDOW TRAINING & FAST SUBJECT POOLING VAL
 # =====================================================================
 
 class ProbeTrainer(CBraModTrainer):
@@ -165,25 +108,47 @@ class ProbeTrainer(CBraModTrainer):
     def __init__(self, config: argparse.Namespace, logger: logging.Logger):
         super().__init__(config, logger)
 
-    def train(self, train_path: Path, val_path: Path) -> dict:
+    def train(self, master_cache_path: Path) -> dict:
         """Main training loop that handles both fixed split and optional SGKF cross-validation."""
         if self.config.enable_sgkf:
-            return self.train_cross_validation(train_path, val_path)
+            return self.train_cross_validation(master_cache_path)
         else:
-            return self.train_fixed_split(train_path, val_path)
-    
-    def train_fixed_split(self, train_path: Path, val_path: Path) -> dict:
-        """Trains the probe head on a fixed train/val split and evaluates subject-level pooling metrics."""
-        self.logger.info("Loading cached feature tensors into RAM...")
-        train_data = torch.load(train_path, map_location="cpu", weights_only=True)
-        val_data = torch.load(val_path, map_location="cpu", weights_only=True)
+            train_subject_ids = load_subject_ids_from_manifest(Path(self.config.train_manifest))
+            val_subject_ids = load_subject_ids_from_manifest(Path(self.config.val_manifest))
+            return self.train_fixed_split(master_cache_path, train_subject_ids, val_subject_ids)
 
-        train_ds = TensorDataset(train_data["feats"], train_data["labels"])
-        val_ds = TensorDataset(val_data["feats"], val_data["labels"])
+    def train_fixed_split(
+        self, master_cache_path: Path, train_subject_ids: List[str], val_subject_ids: List[str]
+    ) -> dict:
+        """
+        Trains the probe head on a fixed train/val subject split and evaluates subject-level pooling
+        metrics. Both splits are carved out of the SAME master cache via CachedFeatureSubjectDataset's
+        subject filter -- no separate per-split extraction, and (called per-fold from
+        train_cross_validation) no temporary per-fold cache files either.
+        """
+        self.logger.info(f"Loading cached feature tensors into RAM from {master_cache_path}...")
+        train_view = CachedFeatureSubjectDataset(master_cache_path, filter_subject=train_subject_ids)
+        val_view = CachedFeatureSubjectDataset(master_cache_path, filter_subject=val_subject_ids)
+
+        # Same invariant the old CV-only sanity_check() checked, now enforced for EVERY fixed-split
+        # call (plain train/val included, not just CV folds) since nothing here is CV-specific.
+        leaked = set(train_view.unique_subjects) & set(val_view.unique_subjects)
+        assert not leaked, f"[CRITICAL LEAKAGE] {len(leaked)} subject(s) in both train and val: {leaked}"
+
+        train_feats, train_labels, _, _, _ = flatten_cached_feature_dataset(train_view)
+        val_feats, val_labels, val_subject_ids_flat, _, _ = flatten_cached_feature_dataset(val_view)
+
+        self.logger.info(
+            f"✓ [Leak Check Passed] Train: {len(train_view.unique_subjects)} subjs ({len(train_feats):,} windows) | "
+            f"Val: {len(val_view.unique_subjects)} subjs ({len(val_feats):,} windows)"
+        )
+
+        train_ds = TensorDataset(train_feats, train_labels)
+        val_ds = TensorDataset(val_feats, val_labels)
 
         train_loader, criterion = setup_data_loader_and_criterion(
             dataset=train_ds,
-            labels=train_data["labels"].numpy(),
+            labels=train_labels.numpy(),
             batch_size=self.config.batch_size,
             num_workers=self.config.num_workers,
             imbalance_strategy=self.config.imbalance_strategy,
@@ -192,7 +157,9 @@ class ProbeTrainer(CBraModTrainer):
         )
         val_loader = DataLoader(val_ds, batch_size=self.config.batch_size, shuffle=False, num_workers=self.config.num_workers, pin_memory=True)
 
-        val_subject_ids = val_data.get("subject_ids", [str(i) for i in range(len(val_ds))])
+        # val_subject_ids_flat comes straight from flatten_cached_feature_dataset() above -- always
+        # present (CachedFeatureSubjectDataset requires subject_ids to load at all), so no fallback needed.
+        val_subject_ids = val_subject_ids_flat
 
         if self.config.head_type == "linear":
             head = LinearProbeHead(
@@ -353,25 +320,24 @@ class ProbeTrainer(CBraModTrainer):
 
         return best_primary_metrics
 
-    def train_cross_validation(self, train_cache_path: Path, val_cache_path: Path) -> dict:
-        """Executes Stratified Group K-Fold Cross-Validation on subject-level splits."""
-        # Load and concatenate both train and val caches to form a unified pool for SGKF
-        self.logger.info("Loading cached embeddings into memory for SGKF splitting...")
-        train_data = torch.load(train_cache_path, map_location="cpu", weights_only=True)
-        val_data = torch.load(val_cache_path, map_location="cpu", weights_only=True)
+    def train_cross_validation(self, master_cache_path: Path) -> dict:
+        """
+        Executes Stratified Group K-Fold Cross-Validation on subject-level splits, all drawn from the
+        SAME master cache -- no concatenation of separate train/val caches, and no temporary per-fold
+        cache files (train_fixed_split() carves each fold's train/val subject subset directly out of
+        master_cache_path via CachedFeatureSubjectDataset's filter).
+        """
+        self.logger.info(f"Loading master cache from {master_cache_path} to build SGKF splits...")
+        master_data = torch.load(master_cache_path, map_location="cpu", weights_only=True)
+        missing_keys = [k for k in ("subject_ids", "labels", "stages", "indices") if k not in master_data]
+        if missing_keys:
+            raise KeyError(
+                f"Master cache '{master_cache_path}' is missing key(s) {missing_keys} -- re-run "
+                "p08a_extract_features.py to regenerate it."
+            )
 
-        all_feats = torch.cat([train_data["feats"], val_data["feats"]], dim=0)
-        all_labels = torch.cat([train_data["labels"], val_data["labels"]], dim=0)
-
-        # Combine subject IDs and per-window metadata (stages/indices). These
-        # must already exist in the source caches -- extract_and_cache()
-        # writes them unconditionally -- so index directly (not .get with a
-        # silent [] default): a missing key here means the source cache was
-        # built without stage/index tracking and should be re-extracted, not
-        # silently propagated as dropped metadata into every fold cache below.
-        all_subject_ids = np.array(train_data["subject_ids"] + val_data["subject_ids"])
-        all_stages = np.array(train_data["stages"] + val_data["stages"], dtype=object)
-        all_indices = np.array(train_data["indices"] + val_data["indices"])
+        all_subject_ids = np.array(master_data["subject_ids"])
+        all_labels = master_data["labels"]
 
         # Build unique subject-to-label mapping for StratifiedGroupKFold
         unique_sids = np.unique(all_subject_ids)
@@ -385,9 +351,9 @@ class ProbeTrainer(CBraModTrainer):
 
         # Execute k-Fold Stratified Group K-Fold
         sgkf = StratifiedGroupKFold(n_splits=self.config.sgkf_folds, shuffle=True, random_state=self.config.seed)
-    
+
         fold_results = []
-    
+
         self.logger.info(f"=" * 100)
         self.logger.info(f"STARTING {self.config.sgkf_folds}-FOLD STRATIFIED GROUP K-FOLD CROSS-VALIDATION ACROSS {len(unique_sids)} TOTAL SUBJECTS")
         self.logger.info(f"=" * 100)
@@ -398,39 +364,17 @@ class ProbeTrainer(CBraModTrainer):
         for fold, (train_subj_idx, val_subj_idx) in enumerate(
             sgkf.split(unique_sids, unique_labels, groups=unique_sids)):
             self.logger.info(f"\n--- Fold [{fold+1}/{self.config.sgkf_folds}] ---")
-            train_sids_fold = set(unique_sids[train_subj_idx])
-            val_sids_fold = set(unique_sids[val_subj_idx])
-
-            train_mask = np.isin(all_subject_ids, list(train_sids_fold))
-            val_mask = np.isin(all_subject_ids, list(val_sids_fold))
-
-            self.sanity_check(all_feats, all_subject_ids, fold, train_sids_fold, val_sids_fold, train_mask, val_mask)
-
-            # Save temporary fold-specific cache paths to leverage existing ProbeTrainer class directly
-            cache_dir = Path(self.config.cache_dir)
-            fold_train_cache = cache_dir / f"fold_{fold+1}_train.pt"
-            fold_val_cache = cache_dir / f"fold_{fold+1}_val.pt"
-
-            torch.save({
-                "feats": all_feats[train_mask],
-                "labels": all_labels[train_mask],
-                "subject_ids": all_subject_ids[train_mask].tolist(),
-                "stages": all_stages[train_mask].tolist(),
-                "indices": all_indices[train_mask].tolist()
-            }, fold_train_cache)
-
-            torch.save({
-                "feats": all_feats[val_mask],
-                "labels": all_labels[val_mask],
-                "subject_ids": all_subject_ids[val_mask].tolist(),
-                "stages": all_stages[val_mask].tolist(),
-                "indices": all_indices[val_mask].tolist()
-            }, fold_val_cache)
+            train_sids_fold = list(unique_sids[train_subj_idx])
+            val_sids_fold = list(unique_sids[val_subj_idx])
 
             # Update checkpoint filename per fold to prevent overwriting
             self.config.checkpoint_filename = checkpoint_path.with_stem(f"{checkpoint_path.stem}_fold_{fold+1}")
 
-            results = self.train_fixed_split(fold_train_cache, fold_val_cache)
+            # train_fixed_split() re-runs its own leakage assertion on top of this -- the SGKF split
+            # itself guarantees disjoint subject sets by construction, but checking again at the point
+            # where train/val views actually get built is what catches a REAL bug, not just a
+            # theoretical one.
+            results = self.train_fixed_split(master_cache_path, train_sids_fold, val_sids_fold)
             fold_results.append(results)
 
         # Aggregate OOF Summary Statistics
@@ -444,54 +388,14 @@ class ProbeTrainer(CBraModTrainer):
         self.logger.info(f"=" * 100)
         self.logger.info(f"{self.config.sgkf_folds}-FOLD CROSS-VALIDATION COMPLETE")
         for metric, value in stats.items():
-            self.logger.info(f"{metric}: {value["mean"]:.4f} +/- {value["std"]:.4f}")
+            self.logger.info(f"{metric}: {value['mean']:.4f} +/- {value['std']:.4f}")
         self.logger.info(f"=" * 100)
 
         return stats
 
-    def sanity_check(self, all_feats, all_subject_ids, fold, train_sids_fold, val_sids_fold, train_mask, val_mask):
-        # =====================================================================
-        # STRICT LEAKAGE & PARTITION DEBUG CHECKS
-        # =====================================================================
-        # 1. Check Subject ID set intersection
-        id_intersection = train_sids_fold.intersection(val_sids_fold)
-        assert len(id_intersection) == 0, (
-            f"[CRITICAL LEAKAGE] Fold {fold+1}: Found {len(id_intersection)} overlapping subject IDs in group split! "
-            f"Leaked IDs: {id_intersection}"
-        )
-
-        # 2. Check window mask mutual exclusivity (no window in both train and val)
-        mask_overlap = np.sum(train_mask & val_mask)
-        assert mask_overlap == 0, (
-            f"[CRITICAL LEAKAGE] Fold {fold+1}: {mask_overlap} window samples assigned to BOTH train and val splits!"
-        )
-
-        # 3. Check partition completeness (no windows silently dropped)
-        dropped_windows = np.sum(~(train_mask | val_mask))
-        assert dropped_windows == 0, (
-            f"[DATA LOSS] Fold {fold+1}: {dropped_windows} windows unmapped during string/type masking!"
-        )
-
-        # 4. Verify actual subject IDs extracted from filtered feature arrays
-        actual_train_subjs = set(all_subject_ids[train_mask])
-        actual_val_subjs = set(all_subject_ids[val_mask])
-        array_intersection = actual_train_subjs.intersection(actual_val_subjs)
-        assert len(array_intersection) == 0, (
-            f"[CRITICAL LEAKAGE] Fold {fold+1}: Found {len(array_intersection)} overlapping subjects in feature arrays! "
-            f"Overlapping: {array_intersection}"
-        )
-
-        self.logger.info(
-            f"✓ [Leak Checks Passed] Fold {fold+1} | "
-            f"Train: {len(actual_train_subjs)} subjs ({np.sum(train_mask):,} windows) | "
-            f"Val: {len(actual_val_subjs)} subjs ({np.sum(val_mask):,} windows) | "
-            f"Total Retained: {len(all_feats):,} windows"
-        )
-        # =====================================================================
-
 
 # =====================================================================
-# 4. PIPELINE ORCHESTRATOR
+# 3. PIPELINE ORCHESTRATOR
 # =====================================================================
 
 def main():
@@ -499,35 +403,22 @@ def main():
     seed_everything(args.seed)
 
     cache_dir = Path(args.cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
     checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     logger = setup_logger(cache_dir / args.log_filename)
 
-    train_cache_path = cache_dir / args.train_cache_name
-    val_cache_path = cache_dir / args.val_cache_name
-    cache_exists = train_cache_path.exists() and val_cache_path.exists()
-
-    if not cache_exists or args.force_extract:
-        logger.info("Cached embeddings not found or --force-extract specified. Initializing Feature Extraction Phase...")
-
-        if not args.train_manifest or not args.val_manifest:
-            logger.error("Missing manifest paths! Please provide --train-manifest and --val-manifest to extract features.")
-            sys.exit(1)
-
-        train_manifest_path = Path(args.train_manifest)
-        val_manifest_path = Path(args.val_manifest)
-
-        extractor_mgr = EmbeddingManager(args, logger)
-        extractor_mgr.extract_and_cache(train_manifest_path, train_cache_path, split_name="train")
-        extractor_mgr.extract_and_cache(val_manifest_path, val_cache_path, split_name="val")
-    else:
-        logger.info(f"Found existing cached feature files at '{cache_dir}'. Skipping .npy extraction phase.")
+    master_cache_path = cache_dir / args.master_cache_name
+    if not master_cache_path.exists():
+        logger.error(
+            f"Master cache not found at '{master_cache_path}'. Run p08a_extract_features.py first "
+            "to build it (once, for the whole cohort) -- this script only trains against an "
+            "already-extracted cache, it doesn't extract features itself."
+        )
+        sys.exit(1)
 
     trainer = ProbeTrainer(args, logger)
-    trainer.train(train_cache_path, val_cache_path)
+    trainer.train(master_cache_path)
 
 
 if __name__ == "__main__":
