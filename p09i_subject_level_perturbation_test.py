@@ -75,12 +75,6 @@ BAND_DEFS = {
 }
 
 
-def extract_band_component(signal_1d: np.ndarray, sfreq: float, low: float, high: float, order: int = 4) -> np.ndarray:
-    """Zero-phase Butterworth bandpass -- the part of the signal living in [low, high] Hz."""
-    sos = butter(order, [low, high], btype="bandpass", fs=sfreq, output="sos")
-    return sosfiltfilt(sos, signal_1d)
-
-
 def perturb_window_band_power(
     window_CT: np.ndarray, sfreq: float, low: float, high: float, scale_factor: float, order: int = 4,
     preserve_total_energy: bool = True
@@ -93,22 +87,30 @@ def perturb_window_band_power(
     channel's total power (e.g. delta) also substantially shifts the channel's overall Z-scored
     amplitude -- see p09h_band_power_perturbation_test.py's docstring for the full rationale. At
     scale_factor=1.0 this is an exact no-op.
+
+    Vectorized across all channels via sosfiltfilt's `axis` parameter (one call over the whole [C, T]
+    array, not a Python loop calling it once per channel) -- this loop was the dominant cost of this
+    script's runtime in practice (num_windows x len(scale_factors) x 64 individual filter calls per
+    subject; the GPU forward pass, batched once per scale factor, is comparatively negligible), which
+    --max-windows-per-subject's own docstring didn't account for. Filtering an all-zero (zero-padded)
+    channel just produces zero output, so it's safe -- and exactly equivalent, validated against the
+    old per-channel loop on synthetic data -- to run every channel uniformly rather than skip-check
+    each one; the preserve_total_energy step's new_std > 1e-8 guard already leaves those channels at
+    exactly zero afterward too.
     """
-    perturbed = window_CT.copy()
-    for c in range(window_CT.shape[0]):
-        sig = window_CT[c]
-        if np.abs(sig).sum() < 1e-8:
-            continue
-        band_component = extract_band_component(sig, sfreq, low, high, order)
-        residual = sig - band_component
-        new_sig = residual + scale_factor * band_component
-        if preserve_total_energy:
-            orig_std = sig.std()
-            new_std = new_sig.std()
-            if new_std > 1e-8:
-                new_sig = new_sig * (orig_std / new_std)
-        perturbed[c] = new_sig
-    return perturbed.astype(window_CT.dtype)
+    sos = butter(order, [low, high], btype="bandpass", fs=sfreq, output="sos")
+    band_component = sosfiltfilt(sos, window_CT, axis=-1)
+    residual = window_CT - band_component
+    new_sig = residual + scale_factor * band_component
+
+    if preserve_total_energy:
+        orig_std = window_CT.std(axis=-1, keepdims=True)
+        new_std = new_sig.std(axis=-1, keepdims=True)
+        safe_new_std = np.where(new_std > 1e-8, new_std, 1.0)
+        rescale = np.where(new_std > 1e-8, orig_std / safe_new_std, 1.0)
+        new_sig = new_sig * rescale
+
+    return new_sig.astype(window_CT.dtype)
 
 
 def fit_local_slope(scale_factors: np.ndarray, values: np.ndarray) -> Tuple[float, float]:
@@ -144,11 +146,15 @@ def parse_cli_args() -> argparse.Namespace:
     )
     group.add_argument(
         "--max-windows-per-subject", type=int, default=None,
-        help="Optional cap on windows perturbed per subject, for speed on very long recordings. Default: "
-             "use every valid window, since perturbing all of them together (not one at a time) only "
-             "costs one batched forward pass per scale factor regardless of window count. NOTE: capping "
-             "this means only a SUBSET of windows get perturbed while the rest keep their original "
-             "probability -- an approximation of 'the whole recording changed', not the real thing."
+        help="Optional cap on windows perturbed per subject, for speed on very long recordings. The "
+             "GPU forward pass batches all sampled windows together (one pass per scale factor "
+             "regardless of window count), but the CPU-side Butterworth filtering does NOT -- it's "
+             "vectorized across channels but still runs once per window per scale factor, so it scales "
+             "linearly with window count and is the dominant cost for a full night (num_windows x "
+             "len(scale_factors) filter calls per subject). Default: use every valid window (no cap); "
+             "set this (e.g. 100-200) if runtime matters more than perturbing literally every window. "
+             "NOTE: capping means only a SUBSET of windows get perturbed while the rest keep their "
+             "original probability -- an approximation of 'the whole recording changed', not the real thing."
     )
     group.add_argument(
         "--subjects-json", type=str, default=None,
