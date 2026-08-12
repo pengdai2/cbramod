@@ -12,9 +12,17 @@ identifies which windows drive the POOLED subject score), this script
 doesn't try to explain the model at all -- it just correlates two
 independently-measurable quantities for every valid window of every subject:
   1. The model's own window-level probability (requires the checkpoint).
-  2. Simple, established EEG features computed directly from the raw signal
-     (relative band power in the classic bands, and YASA spindle/slow-wave
-     counts) -- requires no model at all.
+  2. Relative band power in the classic bands, computed directly from the
+     raw signal -- requires no model at all.
+
+This script no longer reports YASA spindle/slow-wave event counts -- it
+operates on the Z-scored channel-mean signal (see below), which YASA's
+detectors are not calibrated for (real EEG amplitude, not Z-scored to
+std~=1), making those counts unreliable independent of anything else.
+p09k_absolute_band_power_analysis.py computes the same counts on the
+reconstructed real-uV signal instead (needs metadata from a p02 re-slice
+that persists per-channel norm_mean_uv/norm_std_uv) -- use that script's
+YASA-count correlations, not a stale run of this one.
 
 Feature computation operates on the CHANNEL-MEAN-POOLED signal (average
 across all channels within a window), matching exactly what
@@ -41,7 +49,6 @@ Usage:
 """
 
 import argparse
-import logging
 from pathlib import Path
 from typing import Dict, List
 
@@ -50,25 +57,6 @@ import pandas as pd
 import torch
 from scipy.signal import welch
 from tqdm import tqdm
-
-try:
-    import yasa
-    HAS_YASA = True
-    # yasa's "No spindles/SW were found..." messages are emitted via the logging module at WARNING
-    # level regardless of the verbose=False passed to spindles_detect()/sw_detect() below -- that kwarg
-    # only gates yasa's own INFO-ish prints. Most windows legitimately contain zero detected events
-    # (spindles/slow-waves are transient, not present in every 30s window), so this is expected,
-    # benign output, not a data-quality signal.
-    #
-    # A per-logger logging.getLogger("yasa").setLevel(logging.ERROR) does NOT reliably silence this --
-    # yasa's own verbose=False handling appears to reset its logger's level back to WARNING internally
-    # on every spindles_detect()/sw_detect() call, undoing a one-time setLevel from here. logging.
-    # disable() instead sets a GLOBAL threshold checked independently of any individual logger's own
-    # level (Logger.manager.disable), so it can't be undone by yasa resetting its own logger per-call.
-    # ERROR (40) and CRITICAL stay visible; only WARNING (30) and below are suppressed.
-    logging.disable(logging.WARNING)
-except ImportError:
-    HAS_YASA = False
 
 from cbramod_common import (
     CBraModE2EClassifier,
@@ -108,23 +96,6 @@ def compute_band_powers(signal_1d: np.ndarray, sfreq: float) -> Dict[str, float]
         mask = (freqs >= lo) & (freqs <= hi)
         powers[f"{band}_relpower"] = float(psd[mask].sum() / total_power) if total_power > 0 else 0.0
     return powers
-
-
-def compute_yasa_event_counts(signal_1d: np.ndarray, sfreq: float) -> Dict[str, float]:
-    """Spindle/slow-wave counts on a single channel-mean-pooled window via YASA (0 if unavailable/none detected)."""
-    n_spindles, n_slow_waves = 0, 0
-    if HAS_YASA:
-        try:
-            sp = yasa.spindles_detect(signal_1d, sf=sfreq, freq_sp=(11, 16), verbose=False)
-            n_spindles = len(sp.summary()) if sp is not None else 0
-        except Exception:
-            pass
-        try:
-            sw = yasa.sw_detect(signal_1d, sf=sfreq, verbose=False)
-            n_slow_waves = len(sw.summary()) if sw is not None else 0
-        except Exception:
-            pass
-    return {"n_spindles": float(n_spindles), "n_slow_waves": float(n_slow_waves)}
 
 
 def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
@@ -168,7 +139,7 @@ def main():
 
     if args.features_pt:
         raise ValueError(
-            "This script needs raw EEG (--manifest) to compute band power/YASA features from the signal "
+            "This script needs raw EEG (--manifest) to compute band power features from the signal "
             "itself; --features-pt (pre-extracted embeddings) has no raw waveform left to analyze."
         )
 
@@ -207,9 +178,6 @@ def main():
     )
     print(f"Loaded raw EEG recording dataset for {len(dataset)} subjects.")
 
-    if not HAS_YASA:
-        print("  [Warning] YASA not installed -- n_spindles/n_slow_waves will be 0 for every window.")
-
     all_rows: List[Dict] = []
     for idx in tqdm(range(len(dataset)), desc="Process Subjects"):
         x_tensor, y_tensor, subj_id, stages, indices = dataset[idx]
@@ -232,7 +200,6 @@ def main():
         for f_idx in window_order:
             channel_mean_signal = raw_np[f_idx].mean(axis=0)  # [T] -- matches the model's own channel pooling
             band_powers = compute_band_powers(channel_mean_signal, args.sfreq)
-            yasa_counts = compute_yasa_event_counts(channel_mean_signal, args.sfreq)
 
             all_rows.append({
                 "subject_id": subj_id,
@@ -241,7 +208,6 @@ def main():
                 "stage": report["stages"][f_idx] if f_idx < len(report["stages"]) else "UNKNOWN",
                 "probability": float(report["window_probs"][f_idx]),
                 **band_powers,
-                **yasa_counts,
             })
 
     if not all_rows:
