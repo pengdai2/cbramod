@@ -307,11 +307,11 @@ class ProbeTrainer(CBraModTrainer):
                 f"Subj AUC: {primary_auc:.4f}"
             )
 
-            # Model Selection & Checkpointing: Pareto criterion on Primary Subject-Level Macro F1 AND
-            # AUC (accepts a strict F1 improvement regardless of AUC, but ALSO accepts an AUC-only
-            # improvement as long as F1 hasn't regressed -- an F1-only check never saves during a
-            # stretch where F1 sits at its per-epoch optimal-threshold plateau while AUC keeps
-            # climbing. See is_checkpoint_improvement()'s docstring in cbramod_common.py.)
+            # Model Selection & Checkpointing: strict Pareto criterion on Primary Subject-Level Macro
+            # F1 AND AUC -- neither may regress, at least one must strictly improve. See
+            # is_checkpoint_improvement()'s docstring in cbramod_common.py for the full rationale
+            # (guards against both an F1-only check's plateau-while-AUC-climbs blind spot, and
+            # against crediting an F1 uptick that came at a real AUC cost).
             if is_checkpoint_improvement(primary_f1, primary_auc, best_primary_f1, best_primary_auc):
                 best_primary_f1 = primary_f1
                 best_primary_auc = primary_auc

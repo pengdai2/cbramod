@@ -1095,29 +1095,32 @@ def is_checkpoint_improvement(
     new_f1: float, new_auc: float, best_f1: float, best_auc: float, eps: float = 1e-6
 ) -> bool:
     """
-    Checkpoint-selection criterion: F1-primary, with AUC as a tie-breaker when F1 hasn't regressed.
+    Checkpoint-selection criterion: strict Pareto improvement over BOTH subject-level macro F1 and
+    AUC -- neither metric may regress, and at least one must strictly improve.
 
     F1 here is computed at its own per-epoch optimal threshold (find_optimal_threshold() sweeps 99
-    thresholds and reports the max), so it only tracks ONE point on the ROC curve. AUC integrates
-    improvement across the ENTIRE curve. A model can keep separating classes better in regions away
-    from the current max-F1 operating point -- AUC keeps rising while F1 plateaus exactly at its prior
-    best -- and an F1-only "> best" check (what this replaces) never saves during that stretch, even
-    though the model is genuinely improving.
+    thresholds and reports the max), so it only tracks ONE point on the ROC curve -- on a small
+    validation cohort (this pipeline's is typically ~35-40 subjects), that's a genuinely high-variance
+    statistic: a single subject crossing the decision boundary can swing it, and the fresh 99-way
+    threshold sweep every epoch is actively hunting for whatever spike exists in that epoch's noise.
+    AUC integrates over the entire ranking rather than depending on exactly where one boundary lands,
+    so it's comparatively stable. An F1-only "> best" check (what this replaces) has two failure
+    modes: it never saves during a stretch where F1 sits at its own plateau while AUC keeps
+    genuinely improving (the original bug), AND it happily accepts an F1 uptick that came at a
+    meaningful AUC cost -- plausibly noise-chasing a threshold-sweep spike rather than a real
+    improvement. Requiring non-regression on the OTHER metric before crediting an improvement on
+    either one guards against both.
 
-    A strict F1 improvement is ALWAYS accepted, regardless of what AUC does (F1 stays primary, exactly
-    matching the original selection behavior in that case). When F1 is only tied (not strictly worse,
-    within `eps`), an AUC improvement is also accepted -- this is the new case, fixing the plateau
-    scenario. An F1 improvement is never rejected just because AUC happened to drop; that would be a
-    strictly more restrictive selection than before, not what was asked for.
-
-    `eps` guards the "not strictly worse" side against float noise -- without it, a new_f1 that's
-    numerically 1e-9 below best_f1 (semantically tied) would wrongly reject a real AUC improvement.
+    `eps` guards the "hasn't regressed" side against float noise -- without it, a metric that's
+    numerically 1e-9 below its prior best (semantically tied) would wrongly veto a real improvement
+    in the other one.
     """
     f1_improved = new_f1 > best_f1
     f1_not_worse = new_f1 >= best_f1 - eps
     auc_improved = new_auc > best_auc
+    auc_not_worse = new_auc >= best_auc - eps
 
-    return f1_improved or (f1_not_worse and auc_improved)
+    return (f1_improved and auc_not_worse) or (auc_improved and f1_not_worse)
 
 
 def seed_everything(seed: int = 42) -> None:

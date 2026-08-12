@@ -395,13 +395,13 @@ class EndToEndTrainer(CBraModTrainer):
                 f"Subj AUC: {primary_auc:.4f}"
             )
 
-            # Pareto criterion (F1 AND AUC): accepts a strict F1 improvement regardless of AUC, but
-            # ALSO accepts an AUC-only improvement as long as F1 hasn't regressed -- an F1-only
-            # "primary_f1 > best_primary_f1" check never saves during a stretch where F1 sits exactly
-            # at its per-epoch optimal-threshold plateau while AUC keeps climbing (a real, common
-            # pattern: F1 tracks one point on the ROC curve, AUC integrates the whole curve), even
-            # though that epoch's model is genuinely better. See is_checkpoint_improvement()'s
-            # docstring in cbramod_common.py for the full rationale.
+            # Strict Pareto criterion on F1 AND AUC: neither may regress, at least one must strictly
+            # improve. A plain "primary_f1 > best_primary_f1" check has two failure modes -- it never
+            # saves during a stretch where F1 sits at its per-epoch optimal-threshold plateau while
+            # AUC keeps genuinely climbing, AND it happily accepts an F1 uptick that came at a real
+            # AUC cost (plausibly noise-chasing that epoch's 99-way threshold sweep on a small ~35-40
+            # subject validation cohort, rather than a real improvement). See
+            # is_checkpoint_improvement()'s docstring in cbramod_common.py for the full rationale.
             if is_checkpoint_improvement(primary_f1, primary_auc, best_primary_f1, best_primary_auc):
                 best_primary_f1 = primary_f1
                 best_primary_auc = primary_auc
