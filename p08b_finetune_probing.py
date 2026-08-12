@@ -44,6 +44,7 @@ from cbramod_common import (
     LinearProbeHead,
     MLPProbeHead,
     PANSleepEEGDataset,
+    is_checkpoint_improvement,
     seed_everything,
     setup_data_loader_and_criterion,
     setup_training_cli_parser
@@ -215,6 +216,7 @@ class ProbeTrainer(CBraModTrainer):
 
         best_primary_metrics = {}
         best_primary_f1 = 0.0
+        best_primary_auc = 0.0
         best_thresholds = {}
         patience_counter = 0
         best_model_path = Path(self.config.checkpoint_dir) / self.config.checkpoint_filename
@@ -305,9 +307,14 @@ class ProbeTrainer(CBraModTrainer):
                 f"Subj AUC: {primary_auc:.4f}"
             )
 
-            # Model Selection & Checkpointing based on Primary Subject-Level Macro F1
-            if primary_f1 > best_primary_f1:
+            # Model Selection & Checkpointing: Pareto criterion on Primary Subject-Level Macro F1 AND
+            # AUC (accepts a strict F1 improvement regardless of AUC, but ALSO accepts an AUC-only
+            # improvement as long as F1 hasn't regressed -- an F1-only check never saves during a
+            # stretch where F1 sits at its per-epoch optimal-threshold plateau while AUC keeps
+            # climbing. See is_checkpoint_improvement()'s docstring in cbramod_common.py.)
+            if is_checkpoint_improvement(primary_f1, primary_auc, best_primary_f1, best_primary_auc):
                 best_primary_f1 = primary_f1
+                best_primary_auc = primary_auc
                 best_primary_metrics = primary_metrics
                 best_thresholds = {strat: res["optimal_threshold"] for strat, res in pooling_results.items()}
 
@@ -317,6 +324,7 @@ class ProbeTrainer(CBraModTrainer):
                         "epoch": epoch,
                         "model_state_dict": head.state_dict(),
                         "best_macro_f1": best_primary_f1,
+                        "best_auc": best_primary_auc,
                         "primary_pooling": self.config.primary_pooling,
                         "top_percentile": self.config.top_percentile,
                         "t_window": self.config.t_window,
@@ -338,7 +346,8 @@ class ProbeTrainer(CBraModTrainer):
 
         self.logger.info("=" * 125)
         self.logger.info(
-            f"Training Complete. Best Validation Subject Macro F1 ({self.config.primary_pooling}): {best_primary_f1:.4f}"
+            f"Training Complete. Best Validation Subject Macro F1 ({self.config.primary_pooling}): "
+            f"{best_primary_f1:.4f} | Best AUC: {best_primary_auc:.4f}"
         )
         self.logger.info(f"Calibrated Strategy Thresholds: {best_thresholds}")
 

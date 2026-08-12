@@ -1091,6 +1091,35 @@ def find_optimal_threshold(
     return float(best_t), float(best_score)
 
 
+def is_checkpoint_improvement(
+    new_f1: float, new_auc: float, best_f1: float, best_auc: float, eps: float = 1e-6
+) -> bool:
+    """
+    Checkpoint-selection criterion: F1-primary, with AUC as a tie-breaker when F1 hasn't regressed.
+
+    F1 here is computed at its own per-epoch optimal threshold (find_optimal_threshold() sweeps 99
+    thresholds and reports the max), so it only tracks ONE point on the ROC curve. AUC integrates
+    improvement across the ENTIRE curve. A model can keep separating classes better in regions away
+    from the current max-F1 operating point -- AUC keeps rising while F1 plateaus exactly at its prior
+    best -- and an F1-only "> best" check (what this replaces) never saves during that stretch, even
+    though the model is genuinely improving.
+
+    A strict F1 improvement is ALWAYS accepted, regardless of what AUC does (F1 stays primary, exactly
+    matching the original selection behavior in that case). When F1 is only tied (not strictly worse,
+    within `eps`), an AUC improvement is also accepted -- this is the new case, fixing the plateau
+    scenario. An F1 improvement is never rejected just because AUC happened to drop; that would be a
+    strictly more restrictive selection than before, not what was asked for.
+
+    `eps` guards the "not strictly worse" side against float noise -- without it, a new_f1 that's
+    numerically 1e-9 below best_f1 (semantically tied) would wrongly reject a real AUC improvement.
+    """
+    f1_improved = new_f1 > best_f1
+    f1_not_worse = new_f1 >= best_f1 - eps
+    auc_improved = new_auc > best_auc
+
+    return f1_improved or (f1_not_worse and auc_improved)
+
+
 def seed_everything(seed: int = 42) -> None:
     """Ensures end-to-end reproducibility across NumPy and PyTorch."""
     random.seed(seed)
