@@ -44,6 +44,24 @@ that can be read off the baseline distribution; it was tempting, but wrong, to r
 
 ## 3. Investigation
 
+**Real (absolute) band-power correlation structure.** Before the referencing fix, every pairwise
+correlation among the five canonical bands' absolute power was ~0.98-0.99, pooled or
+within-subject — a spuriously uniform "one latent factor" pattern that was itself a symptom of the
+near-degenerate, CAR-cancelled channel-mean signal, not real physiology. After the fix, the
+structure differentiated substantially and became physiologically coherent: delta, theta, and alpha
+form a positively-correlated cluster (within-subject median r ranging +0.33 to +0.62 across
+validation/test for the delta-theta/delta-alpha/theta-alpha pairs), delta and beta trade off
+(within-subject median r = -0.38 on validation, -0.46 on test), and — most relevant to the sigma
+story — **delta and sigma are essentially decoupled** (within-subject median r = -0.03 on
+validation, -0.005 on test). That decoupling matters directly for the causal argument: delta power
+itself correlates only weakly and inconsistently with predicted probability (within-subject median
+r = -0.11 on validation, -0.03 on test), so sigma's own correlation with probability — which, unlike
+the pooled number (r = -0.011 on validation vs. -0.240 on test, an example of the pooled/
+within-subject divergence flagged in Background), is *consistent* at the within-subject level
+(median r = -0.13 on validation, -0.14 on test) — can't be explained as sigma merely echoing a
+larger delta/slow-wave-power confound. Sigma's relationship with the model's output looks like an
+independent effect, not a secondary consequence of dominant slow-wave power.
+
 **Corroborating evidence from an independent detector (YASA).** Before moving to intervention,
 relative band power's sigma-specific signal was cross-checked against a completely different
 measurement approach: YASA's validated spindle (`spindles_detect`) and slow-wave (`sw_detect`)
@@ -90,6 +108,13 @@ determining the percentile once the distribution shifts.
 
 ## 4. Key Results
 
+- **Sigma is decoupled from delta, so it isn't a slow-wave-power echo**: on properly-referenced
+  data, absolute delta and sigma power are essentially uncorrelated within-subject (median r ≈ -0.03
+  to -0.005 across validation/test), while delta co-moves with theta/alpha (median r up to +0.62)
+  and trades off against beta (median r ≈ -0.4). Since delta itself only weakly and inconsistently
+  predicts probability, sigma's own consistent within-subject correlation with probability (median
+  r ≈ -0.13 to -0.14 on both sets) looks like an independent signal, not something riding along with
+  a larger slow-wave confound.
 - **Independent corroboration, and a telling asymmetry**: YASA-detected spindle count (a
   waveform-based detector, not a spectral-power measurement) correlates negatively with predicted
   probability on both validation and test sets, pooled and within-subject, converging with the
