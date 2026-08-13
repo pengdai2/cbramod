@@ -204,20 +204,81 @@ class AttentionPoolingHead(nn.Module):
 # 3. WINDOW-LEVEL PROBE (frozen) FORWARD PASS
 # =====================================================================
 
-def build_frozen_probe(config: argparse.Namespace, device: torch.device) -> nn.Module:
-    """Reconstructs the probe head architecture and loads frozen weights from --probe-checkpoint."""
-    if config.head_type == "linear":
-        probe = LinearProbeHead(num_patches=config.num_patches, emb_dim=config.cbra_dim, num_classes=config.num_classes)
-    elif config.head_type == "mlp":
-        probe = MLPProbeHead(
-            num_patches=config.num_patches, emb_dim=config.cbra_dim,
-            hidden_dim=config.head_dim, num_classes=config.num_classes, dropout=config.dropout,
-        )
-    else:
-        raise ValueError(f"Unknown --head-type: {config.head_type}")
+def infer_probe_architecture(state_dict: Dict[str, torch.Tensor]) -> Dict[str, object]:
+    """
+    Infers head_type (and, for MLP, hidden_dim) directly from a probe checkpoint's own state_dict
+    keys/shapes, rather than trusting --head-type/--head-dim to happen to match whatever the
+    checkpoint was actually trained with. A probe checkpoint only stores weights, not architecture --
+    --head-type's default is "mlp" (setup_common_cli_parser's shared default across every script that
+    uses it), but this investigation has mostly trained and used the LINEAR head, so relying on the
+    flag alone is a real, easy-to-hit footgun: forgetting --head-type=linear would try to
+    load_state_dict() a linear checkpoint into an MLPProbeHead, which raises a size-mismatch/missing-key
+    RuntimeError -- not silent corruption, but also not an obviously-actionable message pointing at
+    the real cause. Determining architecture from the file itself removes the whole failure mode.
 
+    LinearProbeHead.head is Sequential(Rearrange, LayerNorm, Linear) -> keys head.1.*, head.2.*.
+    MLPProbeHead.head is Sequential(Rearrange, LayerNorm, Linear, ELU, Dropout, Linear) -> keys
+    head.1.*, head.2.*, head.5.* (ELU/Dropout have no parameters, so no head.3.*/head.4.* keys exist).
+    """
+    if "head.5.weight" in state_dict:
+        return {"head_type": "mlp", "hidden_dim": int(state_dict["head.2.weight"].shape[0])}
+    elif "head.2.weight" in state_dict:
+        return {"head_type": "linear"}
+    raise KeyError(
+        f"Could not recognize probe checkpoint architecture from its state_dict keys "
+        f"({sorted(state_dict.keys())}) -- expected either LinearProbeHead's keys ('head.1.*', "
+        f"'head.2.*') or MLPProbeHead's keys ('head.1.*', 'head.2.*', 'head.5.*')."
+    )
+
+
+def build_frozen_probe(config: argparse.Namespace, device: torch.device, logger) -> nn.Module:
+    """
+    Reconstructs the probe head architecture and loads frozen weights from --probe-checkpoint.
+
+    Architecture is determined in this priority order, NEVER trusting --head-type/--head-dim blindly:
+      1. Explicit metadata saved IN the checkpoint itself (p08b_finetune_probing.py now writes
+         "head_type"/"head_dim" at save time) -- the single source of truth going forward, no
+         guessing involved.
+      2. For checkpoints that predate that fix (saved before this change), fall back to inferring
+         architecture from the state_dict's own key/shape pattern (see infer_probe_architecture()) --
+         still derived from the file itself, just less direct than explicit metadata.
+    Either way, --head-type/--head-dim are only ever used as a cross-check (mismatch logged loudly),
+    never as the actual source of the reconstructed architecture -- a probe checkpoint only stores
+    weights (plus, now, this metadata), and the file must be the one to say what it is.
+    """
     ckpt = torch.load(config.probe_checkpoint, map_location="cpu", weights_only=True)
     state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+
+    if "head_type" in ckpt:
+        resolved = {"head_type": ckpt["head_type"]}
+        if ckpt["head_type"] == "mlp":
+            resolved["hidden_dim"] = ckpt["head_dim"]
+    else:
+        logger.warning(
+            f"--probe-checkpoint ({config.probe_checkpoint}) has no explicit head_type metadata -- "
+            f"it predates that being saved. Falling back to inferring architecture from the "
+            f"state_dict's own key/shape pattern instead of guessing from --head-type."
+        )
+        resolved = infer_probe_architecture(state_dict)
+
+    if resolved["head_type"] != config.head_type or (
+        resolved["head_type"] == "mlp" and resolved["hidden_dim"] != config.head_dim
+    ):
+        logger.warning(
+            f"--head-type/--head-dim ({config.head_type}/{config.head_dim}) do NOT match what "
+            f"--probe-checkpoint actually is ({resolved}) -- using the checkpoint's own architecture "
+            f"(this is what actually gets built), not the CLI flags. If this is unexpected, double "
+            f"check --probe-checkpoint points at the file you think it does."
+        )
+
+    if resolved["head_type"] == "linear":
+        probe = LinearProbeHead(num_patches=config.num_patches, emb_dim=config.cbra_dim, num_classes=config.num_classes)
+    else:
+        probe = MLPProbeHead(
+            num_patches=config.num_patches, emb_dim=config.cbra_dim,
+            hidden_dim=resolved["hidden_dim"], num_classes=config.num_classes, dropout=config.dropout,
+        )
+
     probe.load_state_dict(state_dict)
     probe.to(device)
     probe.eval()
@@ -368,7 +429,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     master_cache_path = Path(args.cache_dir) / args.master_cache_name
-    probe = build_frozen_probe(args, device)
+    probe = build_frozen_probe(args, device, logger)
     logger.info(f"Loaded frozen probe from {args.probe_checkpoint} (head_type={args.head_type}); probe parameters are NOT trained here.")
 
     attn_head = AttentionPoolingHead(

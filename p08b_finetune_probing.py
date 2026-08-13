@@ -302,6 +302,16 @@ class ProbeTrainer(CBraModTrainer):
                     {
                         "epoch": epoch,
                         "model_state_dict": head.state_dict(),
+                        # Explicit architecture metadata -- saved so any downstream consumer of this
+                        # checkpoint (e.g. p13_attention_mil_pooling.py's frozen-probe loader) can
+                        # reconstruct the exact right head without having to infer it from state_dict
+                        # key/shape patterns or trust a CLI flag to happen to match what this
+                        # checkpoint was actually trained with.
+                        "head_type": self.config.head_type,
+                        "head_dim": self.config.head_dim,
+                        "num_patches": self.config.num_patches,
+                        "cbra_dim": self.config.cbra_dim,
+                        "num_classes": self.config.num_classes,
                         "best_macro_f1": best_primary_f1,
                         "best_auc": best_primary_auc,
                         "primary_pooling": self.config.primary_pooling,
