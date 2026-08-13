@@ -234,6 +234,37 @@ def main():
     report_correlations(merged, "attn_weight", ["prob_extremity"])
     report_correlations(merged, "prob_extremity", band_cols + yasa_cols)
 
+    print(
+        "\n" + "=" * 88
+        + "\nSTAGE COMPOSITION CHECK: is the delta downweighting a genuine within-window-content effect, "
+          "or mostly a proxy for N2-vs-N3 stage composition?\n"
+        + "=" * 88
+        + "\nThe attn_weight vs delta_real_abspower correlation (-0.81 within-subject median, pooled "
+          "across N2+N3) could reflect the gate genuinely reacting to delta content window-by-window, "
+          "OR it could be dominated by delta differing systematically BETWEEN stages (N3 windows "
+          "having far more delta than N2) with the gate really just downweighting N3-as-a-category -- "
+          "in which case the correlation should weaken substantially once computed WITHIN a single "
+          "stage, where delta variance is only ever within-stage, never between-stage."
+    )
+    if "stage" not in merged.columns:
+        print("  No 'stage' column in the joined data -- skipping.")
+    else:
+        stage_summary = merged.groupby("stage").agg(
+            n_windows=("attn_weight", "count"),
+            n_subjects=("subject_id", "nunique"),
+            mean_attn_weight=("attn_weight", "mean"),
+            mean_delta_abspower=("delta_real_abspower", "mean"),
+        )
+        print("\n--- Stage composition (does attn_weight/delta already differ BETWEEN stages?) ---")
+        print(stage_summary.to_string(float_format=lambda x: f"{x:.4f}"))
+
+        for stage_name, group in merged.groupby("stage"):
+            if len(group) < 50:
+                print(f"\n--- WITHIN STAGE = {stage_name} -- skipped, only {len(group)} windows ---")
+                continue
+            print(f"\n--- WITHIN STAGE = {stage_name} ONLY ({len(group)} windows, {group['subject_id'].nunique()} subjects) ---")
+            report_correlations(group, "attn_weight", band_cols + yasa_cols)
+
 
 if __name__ == "__main__":
     main()
