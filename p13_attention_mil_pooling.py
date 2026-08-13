@@ -1,10 +1,21 @@
 """
 p13_attention_mil_pooling.py
 
-Option A of the attention-based MIL follow-up: replace the fixed p85-percentile subject-level
-pooling rule with a LEARNED attention-weighted aggregation, while changing nothing else -- the
-CBraMod backbone stays frozen, and the window-level probe head (trained separately by
-p08b_finetune_probing.py) stays frozen too. Only the aggregation step becomes learned.
+A hybrid, closer to Option A than Option B, of the attention-based MIL follow-up: replace the fixed
+p85-percentile subject-level pooling rule with a LEARNED attention-weighted aggregation, while the
+CBraMod backbone and the window-level probe head (trained separately by p08b_finetune_probing.py)
+both stay frozen and untouched.
+
+To be precise about where this sits relative to the original A/B framing: the quantity being
+POOLED is still the probe head's own scalar window-level probability, exactly as pure Option A
+described -- the probe is never retrained, and the pooled score stays directly comparable to every
+other pooling strategy in evaluate_subject_pooling(). But the attention GATE that decides each
+window's weight conditions on the full frozen embedding, not on that scalar alone (see
+AttentionPoolingHead's docstring for why: a 1-dimensional input to the gate would only let it learn
+a monotonic-ish reweighting of the probe's own score, degenerating into "yet another fixed pooling
+statistic" rather than genuinely contextual attention). That's a deliberate, but real, departure
+from "pure" Option A -- it pulls the gate's own capacity/overfitting-risk profile partway toward
+Option B's end of the spectrum, even though the pooled target and the frozen probe are unchanged.
 
 --------------------------------------------------------------------------
 No fixed number of windows anywhere in this architecture
@@ -113,11 +124,22 @@ class AttentionPoolingHead(nn.Module):
     by the probe head this script does not retrain), learns a per-window attention weight and
     returns the attention-weighted sum of the window probabilities as the subject-level score.
 
-    The gate conditions on the embedding (so it can learn what kind of window to trust -- e.g. the
-    causal investigation's sigma-band finding suggests the model already has an implicit notion of
-    "this window's spectral content is informative"), but the quantity being pooled is still the
-    already-validated, already-trained window-level probability -- this keeps the pooled score
-    directly comparable to every prior pooling strategy (p85_score, top_10_mean, ...).
+    The gate conditions on the full embedding rather than on the probe's scalar output alone: a
+    window-level probability is already a heavy compression of a ~num_patches*emb_dim-dimensional
+    embedding down to one number, optimized for a different objective (window-level classification).
+    Two windows can land at the same probe output (e.g. both near 0.5) for very different reasons --
+    one genuinely ambiguous-but-clean, one noisy/borderline-artifactual -- and that distinction is
+    already erased by the time a scalar-only gate would see it. Conditioning on the embedding
+    instead gives the gate a chance to learn "how much to trust this window" using information the
+    probe's own compression discarded; a gate restricted to a 1-dimensional input would only be able
+    to learn some monotonic-ish reweighting of the probe's own score, which is uncomfortably close
+    to just being another fixed pooling statistic rather than genuinely contextual attention.
+
+    The quantity being POOLED, though, is still the already-validated, already-trained window-level
+    probability, not the embedding itself -- this keeps the pooled score directly comparable to
+    every prior pooling strategy (p85_score, top_10_mean, ...) and keeps the probe head itself
+    completely untouched. See this file's module docstring for where that puts this design relative
+    to the original Option A / Option B framing (a deliberate hybrid, not pure Option A).
     """
     def __init__(self, num_patches: int = 30, emb_dim: int = 200, hidden_dim: int = 64, dropout: float = 0.1):
         super().__init__()
