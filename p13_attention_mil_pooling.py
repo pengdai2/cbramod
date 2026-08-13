@@ -57,7 +57,7 @@ Usage:
 import argparse
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -237,17 +237,30 @@ def frozen_window_probs(probe: nn.Module, bag_feats: torch.Tensor, device: torch
 # 4. THRESHOLD TUNING (mirrors CBraModTrainer.evaluate_subject_pooling's per-strategy sweep)
 # =====================================================================
 
-def tune_threshold(scores: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
-    """Sweeps 99 thresholds for the macro-F1-optimal subject-level decision boundary."""
-    best_t, best_f1 = 0.5, 0.0
-    for t in np.linspace(0.01, 0.99, 99):
-        preds = (scores >= t).astype(int)
-        f1 = f1_score(labels, preds, average="macro", zero_division=0)
-        if f1 > best_f1:
-            best_f1, best_t = f1, t
+def tune_threshold(scores: np.ndarray, labels: np.ndarray, threshold: Optional[float] = None) -> Dict[str, float]:
+    """
+    Sweeps 99 thresholds for the macro-F1-optimal subject-level decision boundary -- UNLESS a fixed
+    `threshold` is passed in (one already selected on validation), in which case it's applied as-is
+    with no sweep. This distinction matters: sweeping against a split's own labels and then reporting
+    F1/accuracy/sensitivity/specificity computed at that just-found threshold is legitimate model
+    SELECTION on validation, but doing the same thing on held-out test silently tunes the decision
+    boundary against the very labels being used to report performance -- inflating every
+    threshold-dependent metric. AUC is unaffected either way (it's rank-based, no threshold involved),
+    which is exactly why is_checkpoint_improvement() treats AUC as the more trustworthy of the two.
+    """
+    if threshold is None:
+        best_t, best_f1 = 0.5, 0.0
+        for t in np.linspace(0.01, 0.99, 99):
+            preds = (scores >= t).astype(int)
+            f1 = f1_score(labels, preds, average="macro", zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_t = f1, t
+    else:
+        best_t = threshold
+
     final_preds = (scores >= best_t).astype(int)
     return {
-        "subject_macro_f1": best_f1,
+        "subject_macro_f1": f1_score(labels, final_preds, average="macro", zero_division=0),
         "optimal_threshold": float(best_t),
         "subject_accuracy": accuracy_score(labels, final_preds),
         "subject_sensitivity": recall_score(labels, final_preds),
@@ -297,11 +310,18 @@ def run_epoch_train(
 @torch.no_grad()
 def run_epoch_eval(
     attn_head: AttentionPoolingHead, probe: nn.Module, dataset: CachedFeatureSubjectDataset, device: torch.device,
+    fixed_thresholds: Optional[Tuple[float, float]] = None,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
     Returns (attention_pooling_metrics, baseline_p85_metrics) for direct, apples-to-apples
     comparison -- both computed from the SAME frozen window-level probabilities, differing only in
     how they're aggregated into one subject-level score.
+
+    fixed_thresholds: (attn_threshold, p85_threshold), already selected on validation. Pass this for
+    ANY split that isn't the one doing model selection (i.e. test, or a --eval-only re-check) -- the
+    thresholds are held fixed and simply applied, never re-swept against that split's own labels. Leave
+    None only for the validation split during training, where sweeping IS the legitimate model-selection
+    step (see tune_threshold()'s docstring).
     """
     attn_head.eval()
     attn_scores, p85_scores, labels = [], [], []
@@ -317,8 +337,9 @@ def run_epoch_eval(
         labels.append(int(label.item()))
 
     labels = np.array(labels)
-    attn_metrics = tune_threshold(np.array(attn_scores), labels)
-    p85_metrics = tune_threshold(np.array(p85_scores), labels)
+    attn_threshold, p85_threshold = fixed_thresholds if fixed_thresholds is not None else (None, None)
+    attn_metrics = tune_threshold(np.array(attn_scores), labels, threshold=attn_threshold)
+    p85_metrics = tune_threshold(np.array(p85_scores), labels, threshold=p85_threshold)
     return attn_metrics, p85_metrics
 
 
@@ -366,12 +387,19 @@ def main():
         attn_head.load_state_dict(ckpt["attn_head_state_dict"])
         logger.info(f"Loaded attention-head weights from {args.resume_checkpoint} (epoch {ckpt.get('epoch', '?')}) -- evaluation only, no training.")
 
+        # Thresholds must come from validation, never be re-swept on test (see tune_threshold()'s
+        # docstring). Prefer a fresh sweep on --val-manifest if given (this invocation's own
+        # legitimate model-selection split); otherwise fall back to whatever threshold the checkpoint
+        # itself was saved with, from whichever validation run originally produced it.
+        fixed_thresholds = (ckpt["attn_metrics"]["optimal_threshold"], ckpt["p85_metrics_same_epoch"]["optimal_threshold"])
         if args.val_manifest:
             val_ds = CachedFeatureSubjectDataset(master_cache_path, filter_subject=load_subject_ids(args.val_manifest))
-            log_split_metrics(logger, "VAL", *run_epoch_eval(attn_head, probe, val_ds, device))
+            val_attn_metrics, val_p85_metrics = run_epoch_eval(attn_head, probe, val_ds, device)
+            log_split_metrics(logger, "VAL", val_attn_metrics, val_p85_metrics)
+            fixed_thresholds = (val_attn_metrics["optimal_threshold"], val_p85_metrics["optimal_threshold"])
         if args.test_manifest:
             test_ds = CachedFeatureSubjectDataset(master_cache_path, filter_subject=load_subject_ids(args.test_manifest))
-            log_split_metrics(logger, "TEST", *run_epoch_eval(attn_head, probe, test_ds, device))
+            log_split_metrics(logger, "TEST", *run_epoch_eval(attn_head, probe, test_ds, device, fixed_thresholds=fixed_thresholds))
         return
 
     if not args.train_manifest or not args.val_manifest:
@@ -449,13 +477,23 @@ def main():
         attn_head.load_state_dict(ckpt["attn_head_state_dict"])
         logger.info(f"Reloaded best checkpoint (epoch {ckpt['epoch']}) from {best_model_path} for held-out test scoring.")
 
+        # Thresholds are the ones selected on validation AT that best epoch -- held fixed and applied
+        # to test, never re-swept against test's own labels (see tune_threshold()'s docstring for why
+        # that distinction matters: it's the difference between an honest test score and one that's
+        # silently tuned against the labels it's being scored on).
+        fixed_thresholds = (ckpt["attn_metrics"]["optimal_threshold"], ckpt["p85_metrics_same_epoch"]["optimal_threshold"])
+
         test_ds = CachedFeatureSubjectDataset(master_cache_path, filter_subject=load_subject_ids(args.test_manifest))
         leaked_test = (set(train_ds.unique_subjects) | set(val_ds.unique_subjects)) & set(test_ds.unique_subjects)
         assert not leaked_test, f"[CRITICAL LEAKAGE] {len(leaked_test)} subject(s) in test AND (train or val): {leaked_test}"
 
         logger.info("=" * 125)
-        logger.info(f"HELD-OUT TEST ({len(test_ds)} subjects) -- scored with the BEST checkpoint selected on validation:")
-        log_split_metrics(logger, "TEST", *run_epoch_eval(attn_head, probe, test_ds, device))
+        logger.info(
+            f"HELD-OUT TEST ({len(test_ds)} subjects) -- scored with the BEST checkpoint selected on "
+            f"validation, using that SAME validation-selected threshold (attn={fixed_thresholds[0]:.2f}, "
+            f"p85={fixed_thresholds[1]:.2f}), not re-tuned on test:"
+        )
+        log_split_metrics(logger, "TEST", *run_epoch_eval(attn_head, probe, test_ds, device, fixed_thresholds=fixed_thresholds))
         logger.info("=" * 125)
 
 
