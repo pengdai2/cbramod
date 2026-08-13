@@ -168,6 +168,177 @@ the frozen-backbone probing line of work.
 
 ---
 
+## 6. Attention-MIL Follow-Up: Architecture, Performance, and Interpretability
+
+Section 5 proposed replacing the fixed p85-percentile pooling rule with a learned aggregation.
+This chapter covers the first implementation (Option A), what it changed relative to the p85
+baseline, and — more importantly — a full interpretability investigation of *what the learned
+aggregation actually does*, since a model that pools differently but for reasons unrelated to real
+signal would be a regression, not an improvement.
+
+### 6.1 Architecture
+
+The implementation (`p13_attention_mil_pooling.py`) is a deliberate hybrid, closer to pure Option A
+than Option B, and it's worth being precise about exactly where it sits:
+
+- **Unchanged from the original pipeline**: the CBraMod backbone (frozen) and the window-level probe
+  head (`p08b`-trained linear head, frozen, never retrained). Each window still produces a scalar
+  probability exactly as before.
+- **New**: an `AttentionPoolingHead` — a small gate (`LayerNorm → Linear(6000→64) → Tanh → Dropout →
+  Linear(64→1)`) applied independently to every window's frozen embedding, producing one
+  unnormalized score per window. Softmax-normalizing these scores over a subject's whole window set
+  gives a set of attention weights (summing to 1) with no dependence on how many windows that subject
+  has — the gate's parameters are shared across windows regardless of bag size, and softmax
+  normalizes over whatever length it's given at call time. The subject-level score is
+  `Σ attn_weight_i × window_prob_i` — the *quantity pooled* is still the probe's own scalar output
+  (pure Option A), but the *gate's input* is the full frozen embedding, not just that scalar (a
+  deliberate departure toward Option B's expressiveness, made because a 1-dimensional gate input
+  would only be able to learn a monotonic reweighting of the probe's own score — collapsing into "yet
+  another fixed pooling statistic" rather than genuine contextual attention).
+- **Training**: subjects are processed one bag at a time (no padding/masking needed for variable
+  bag sizes), with gradient accumulation over `--subjects-per-step` subjects before each optimizer
+  step. Checkpoint selection reuses the same strict-Pareto (+large-gain/small-dip exception) F1/AUC
+  criterion as the rest of the pipeline. Both the probe and attention-head checkpoints now save
+  their own architecture metadata (`head_type`/`head_dim`/`attn_hidden_dim`/etc.) rather than relying
+  on CLI flags to happen to match what was actually trained — a footgun caught and fixed twice during
+  this work.
+
+### 6.2 Performance vs. the p85 baseline
+
+On a full-cohort run (154 train / 32 val / 35 test subjects), attention pooling beat p85 by a
+consistent, replicating margin:
+
+| | Validation (best checkpoint) | Held-out test (same, val-selected threshold) |
+|---|---|---|
+| Attention AUC | 0.980 | 0.918 |
+| p85 AUC | 0.944 | 0.882 |
+| **Gap** | **+0.036** | **+0.036** |
+
+The identical gap at val and test is the important part — it's not a validation-set artifact. F1 is
+noisier at this cohort size (a 99-way threshold sweep over a few dozen subjects is a high-variance
+statistic, per `is_checkpoint_improvement()`'s own rationale) and dropped from val to test for *both*
+methods, a normal generalization gap rather than something specific to attention. Training also
+showed a real overfitting shape — validation AUC peaked around epoch 8–10 then drifted down while
+train loss kept falling — consistent with a ~384K-parameter gate (`num_patches × emb_dim × hidden_dim`
+≈ 6000×64) being fit against only 154 subject-level labels; a capacity/data-size tension worth
+keeping in mind rather than assuming the current hyperparameters are optimal.
+
+### 6.3 Interpretability: what did the gate actually learn?
+
+The natural next question — does the learned gate rely on real signal, and does it relate to the
+sigma-band mechanism from Chapters 3–4 — turned out to have a more interesting answer than "yes, it
+rediscovered sigma."
+
+**The dominant signal is delta, not sigma**, and it's strong and essentially universal:
+
+| Feature | Within-subject median r vs. `attn_weight` | Consistency |
+|---|---|---|
+| Delta power | **-0.81** | 100% of subjects < -0.2 |
+| Slow-wave count | -0.44 | 94% of subjects < -0.2 |
+| Beta power | +0.52 | 91% of subjects > 0.2 |
+| Theta power | -0.40 | 86% of subjects < -0.2 |
+| Spindle count | +0.36 | 74% of subjects > 0.2 |
+| Sigma power | +0.15 | split 40%/11%, no clear majority |
+
+Sigma — the band the causal perturbation chapter validated as the reliable driver of *predicted
+probability* — is only weakly and inconsistently related to the gate's own weighting. This isn't a
+contradiction (see 6.5); it's a clue that the gate learned something orthogonal to the sigma
+mechanism, not a restatement of it.
+
+**A large categorical bias on top of the delta effect**: N2 windows receive roughly 25× the average
+per-window attention weight that N3 windows do (mean 0.0025 vs. 0.0001) — despite being only 2.5×
+more numerous (71% vs. 29% of windows). In aggregate, N2 gets ≈98.5% of total attention mass; N3
+gets ≈1.5%. Stratifying by stage confirmed the delta relationship is *not* just this categorical bias
+in disguise — it persists strongly within N2 alone (median r = -0.68) and within N3 alone (median r
+= -0.47), just at different magnitudes.
+
+**A Simpson's-paradox-style finding, stage-specific sigma sensitivity**: pooled across both stages,
+sigma looked weak and inconsistent (median r ≈ +0.15). Stratified by stage, a real signal emerged
+specifically within N3: sigma correlates much more strongly and consistently there (median r = +0.34,
+74% of subjects > 0.2), as does alpha (median r = +0.30, 66% > 0.2) — a relationship the pooled
+number was diluting, not one that didn't exist.
+
+**Two confounds tested and ruled out** as explanations for the strong delta effect:
+- *Informativeness filtering* (does the gate just downweight windows where the frozen probe's own
+  prediction is near-0.5/uninformative?): real but small — `attn_weight` vs. prediction "extremity"
+  showed median r = +0.19, and extremity vs. delta showed median r = -0.17 — both far too small to
+  account for the -0.68/-0.81 direct effect.
+- *Time-of-night* (delta is known to decline across the night — could the gate simply favor later
+  windows for an unrelated reason?): a partial correlation controlling for window position
+  (`raw_epoch_index`) barely moved the direct effect (pooled -0.727 vs. raw -0.750; within-subject
+  median -0.762 vs. raw -0.805) — confirming the delta relationship is direct, not mediated by time.
+
+**Physiological grounding**: this cohort's clinical condition is schizophrenia, which changes how to
+read the sigma-band causal finding specifically. Reduced sleep spindle density is one of the most
+robustly replicated EEG findings in schizophrenia (Ferrarelli, Tononi; Manoach, Stickgold, and
+others), observed even in unaffected first-degree relatives, and linked to thalamocortical circuit
+dysfunction — proposed as a genuine illness endophenotype, not just a corollary. The causal result
+that more sigma-band (spindle-range) power pushes the prediction toward "control" lines up directly
+with that literature. Delta/SWA findings in schizophrenia are less uniformly replicated but have
+support too (the synaptic homeostasis hypothesis links reduced SWA to reduced cortical synaptic
+density). The most important **unresolved confound**, specific to this diagnosis, is antipsychotic
+medication — independently well-documented to alter both SWA and spindle density — which could not
+be tested here since medication status wasn't available in the subject metadata.
+
+### 6.4 Does the causal mechanism survive under attention pooling?
+
+The interpretability findings raised a sharp follow-up question: since the final score is
+`Σ attn_weight_i × window_prob_i`, and the validated sigma-causal effect lives in `window_prob`
+(produced by the untouched, frozen probe), does that effect actually need to also show up in
+`attn_weight` to reach the final decision — or could the gate be doing something else entirely
+without breaking the causal chain? Correlational analysis of `attn_weight` alone can't answer this;
+it only tests whether the gate *itself* tracks a band, not whether that band's effect *reaches the
+final score*.
+
+This was tested directly (`p15_attention_pooled_perturbation_test.py`): perturb sigma power on the
+raw waveform (identical mechanics to Chapter 3's causal test), and compare how much of that effect
+reaches the p85-pooled score vs. the attention-pooled score, computed from the *identical* perturbed
+window-level probabilities at every step.
+
+| | p85 | Attention |
+|---|---|---|
+| frac(slope < 0) | 1.00 | 1.00 |
+| mean slope | -0.060 | -0.117 |
+| mean propagation_ratio | 1.16 | 2.70 |
+| median propagation_ratio | 0.99 | 1.92 |
+
+Every subject shows the same directional response under both pooling methods — perfect agreement.
+But attention pooling doesn't just preserve the causal effect, it **amplifies** it: roughly double
+the raw slope, and a propagation ratio well above 1 (vs. p85's near-1.0), meaning the attention-pooled
+score moves *more* than a naive average of window-level shifts would predict. The paired comparison
+confirms this isn't a fluke of aggregate statistics: attention's propagation ratio exceeds p85's in
+94% of (subject, fraction) rows.
+
+**The mechanistic explanation ties directly back to 6.3**: the gate concentrates the overwhelming
+majority of its attention on N2 windows — plausibly the windows where sigma-band manipulation has the
+most room to affect `window_prob` (lighter sleep, active spindle generation), versus N3 windows where
+a deep, delta-saturated signal may leave less headroom for a sigma perturbation to move the
+prediction. An aggregation that concentrates weight on exactly the windows where the causal signal is
+clearest will naturally show a stronger aggregate response than a percentile statistic that doesn't
+discriminate this way.
+
+### 6.5 Synthesis: division of labor between probe and gate
+
+Putting 6.3 and 6.4 together gives a clean picture of how this specific architecture splits the work:
+
+- **The frozen probe head** carries the validated sigma/spindle causal signal — established in
+  Chapters 3–4 and structurally unchanged here, since the probe is never retrained.
+- **The attention gate** learned something largely orthogonal: a stage/content-informativeness axis
+  favoring N2, delta-light, spindle/beta-rich windows over N3, delta-heavy ones — not a re-encoding of
+  the sigma signal itself.
+- **These compose constructively, not by coincidence**: the gate's learned preference happens to
+  concentrate pooling weight on the windows where the probe's sigma-sensitivity is (plausibly)
+  strongest, so the causal effect doesn't just survive the new pooling rule — it's amplified by it.
+
+This "division of labor" is a property of *this* hybrid design specifically — a frozen probe
+producing an already-informative scalar, with a separately-learned gate reweighting those scalars.
+It is an explicit, testable prediction (not yet checked) that this division might not hold under
+Option B, where there is no separate frozen scalar channel for a causal signal to live in — the
+attention mechanism there would have to learn everything about *both* what a window says and how much
+to trust it, jointly, from the raw embedding alone.
+
+---
+
 ## Appendix A: Data Preparation & Cleansing
 
 **Referencing.** Recordings are re-referenced (A1/A2 linked-earlobe reference, matching the
