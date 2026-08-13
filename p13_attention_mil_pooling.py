@@ -439,10 +439,6 @@ def main():
     probe = build_frozen_probe(args, device, logger)
     logger.info(f"Loaded frozen probe from {args.probe_checkpoint} (head_type={args.head_type}); probe parameters are NOT trained here.")
 
-    attn_head = AttentionPoolingHead(
-        num_patches=args.num_patches, emb_dim=args.cbra_dim,
-        hidden_dim=args.attn_hidden_dim, dropout=args.attn_dropout,
-    ).to(device)
     best_model_path = Path(args.checkpoint_dir) / args.checkpoint_filename if args.checkpoint_dir else Path(args.checkpoint_filename)
 
     if args.eval_only:
@@ -452,6 +448,31 @@ def main():
             raise ValueError("--eval-only requires at least one of --val-manifest / --test-manifest to evaluate against.")
 
         ckpt = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=True)
+
+        # Same principle as build_frozen_probe(): the checkpoint's OWN saved architecture (if
+        # present) is the source of truth, not whatever --attn-hidden-dim happens to be on this
+        # invocation's command line -- --eval-only is commonly a separate process/CLI invocation
+        # from the one that trained the checkpoint, so there's no guarantee the flags still match.
+        if "attn_hidden_dim" in ckpt:
+            hidden_dim = ckpt["attn_hidden_dim"]
+            if hidden_dim != args.attn_hidden_dim:
+                logger.warning(
+                    f"--attn-hidden-dim ({args.attn_hidden_dim}) does not match the checkpoint's own "
+                    f"saved attn_hidden_dim ({hidden_dim}) -- using the checkpoint's value."
+                )
+        else:
+            hidden_dim = args.attn_hidden_dim
+            logger.warning(
+                f"--resume-checkpoint ({args.resume_checkpoint}) has no saved attn_hidden_dim metadata "
+                f"-- it predates that being saved. Falling back to --attn-hidden-dim ({hidden_dim}); "
+                f"if that doesn't match what this checkpoint was actually trained with, load_state_dict "
+                f"will fail with a shape-mismatch error below."
+            )
+
+        attn_head = AttentionPoolingHead(
+            num_patches=args.num_patches, emb_dim=args.cbra_dim,
+            hidden_dim=hidden_dim, dropout=args.attn_dropout,
+        ).to(device)
         attn_head.load_state_dict(ckpt["attn_head_state_dict"])
         logger.info(f"Loaded attention-head weights from {args.resume_checkpoint} (epoch {ckpt.get('epoch', '?')}) -- evaluation only, no training.")
 
@@ -488,6 +509,10 @@ def main():
         f"Bag sizes are NOT fixed -- window counts per subject vary freely."
     )
 
+    attn_head = AttentionPoolingHead(
+        num_patches=args.num_patches, emb_dim=args.cbra_dim,
+        hidden_dim=args.attn_hidden_dim, dropout=args.attn_dropout,
+    ).to(device)
     optimizer = torch.optim.AdamW(attn_head.parameters(), lr=args.attn_lr, weight_decay=args.weight_decay)
 
     best_f1, best_auc = 0.0, 0.0
@@ -517,6 +542,14 @@ def main():
                 {
                     "epoch": epoch,
                     "attn_head_state_dict": attn_head.state_dict(),
+                    # Explicit architecture metadata, same rationale as p08b's probe checkpoint --
+                    # --eval-only is commonly a separate invocation from the one that trained this
+                    # checkpoint, so --attn-hidden-dim on that later command line can't be trusted to
+                    # still match what was actually trained. See main()'s --eval-only branch.
+                    "attn_hidden_dim": args.attn_hidden_dim,
+                    "attn_dropout": args.attn_dropout,
+                    "num_patches": args.num_patches,
+                    "cbra_dim": args.cbra_dim,
                     "best_macro_f1": best_f1,
                     "best_auc": best_auc,
                     "attn_metrics": attn_metrics,
