@@ -265,6 +265,20 @@ def main():
             print(f"\n--- WITHIN STAGE = {stage_name} ONLY ({len(group)} windows, {group['subject_id'].nunique()} subjects) ---")
             report_correlations(group, "attn_weight", band_cols + yasa_cols)
 
+    print(
+        "\n" + "=" * 88
+        + "\nTIME-OF-NIGHT CHECK: is the delta downweighting actually a position-in-recording confound?\n"
+        + "=" * 88
+        + "\nDelta/slow-wave power is well known to decline across the night as sleep pressure "
+          "dissipates. If the gate simply learned 'later windows in the recording are more "
+          "trustworthy' for some reason UNRELATED to delta content itself, and delta happens to "
+          "decline over that same span, that alone would produce a strong attn_weight-vs-delta "
+          "correlation without the gate actually reacting to delta. raw_epoch_index (this subject's "
+          "own window ordering, a proxy for time-of-night/position-in-recording) lets us check both "
+          "halves of that chain directly."
+    )
+    report_correlations(merged, "raw_epoch_index", ["attn_weight", "delta_real_abspower"])
+
 
 if __name__ == "__main__":
     main()
