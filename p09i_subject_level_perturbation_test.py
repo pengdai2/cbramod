@@ -344,14 +344,17 @@ def report_fraction_sweep(df: pd.DataFrame, perturb_fractions: List[float], band
             median_slope=("subject_level_slope", "median"),
             frac_neg=("subject_level_slope", lambda s: (s < 0).mean()),
             mean_r2=("subject_level_r2", "mean"),
-            mean_ratio=("propagation_ratio", "mean"),
-            median_ratio=("propagation_ratio", "median"),
+            mean_propagation_ratio=("propagation_ratio", "mean"),
+            median_propagation_ratio=("propagation_ratio", "median"),
         )
         print(summary.to_string(float_format=lambda x: f"{x:+.4f}" if abs(x) < 10 else f"{x:.1f}"))
         print(
-            "\nIf the subject-level effect is robust (not an artifact of changing essentially the whole "
-            "recording), mean/median slope and frac_neg should stay reasonably stable as perturb_fraction "
-            "decreases, rather than collapsing toward zero/0.5."
+            "\nSlope is a RAW effect size, not normalized by how much of the recording was perturbed -- under "
+            "a dilution/whole-distribution-shift model it is EXPECTED to scale down roughly proportionally "
+            "with perturb_fraction (this is not evidence against the effect). What indicates the effect is "
+            "robust (not an artifact of perturbing essentially the whole recording) is frac_neg and "
+            "propagation_ratio (the fraction-normalized quantity) staying reasonably stable as perturb_fraction "
+            "decreases, rather than collapsing toward 0.5 / 0."
         )
     else:
         print(f"  mean subject-level slope   = {df['subject_level_slope'].mean():+.4f}")
@@ -361,6 +364,12 @@ def report_fraction_sweep(df: pd.DataFrame, perturb_fractions: List[float], band
         print(f"  mean subject-level fit R^2 = {df['subject_level_r2'].mean():.3f}")
         print(f"\n  mean propagation_ratio   = {df['propagation_ratio'].mean():+.4f}")
         print(f"  median propagation_ratio = {df['propagation_ratio'].median():+.4f}")
+    if len(perturb_fractions) > 1:
+        print(
+            "\n  Note: mean_propagation_ratio can be noisy/unstable across fractions -- a subject with a "
+            "small-but-nonzero mean_window_level_shift denominator produces an outsized ratio that skews the "
+            "mean. median_propagation_ratio is the more robust summary to compare across perturb_fraction."
+        )
     print(
         "\n  A ratio near 1.0 means the pooled score moves about as much as a naive window average would --"
         " pooling isn't losing much of the window-level effect. A ratio well below 1 (or negative) means"
