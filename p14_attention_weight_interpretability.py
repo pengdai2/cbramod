@@ -95,6 +95,63 @@ def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+def partial_spearman_corr(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> float:
+    """
+    Partial Spearman correlation of x and y, controlling for z, via the standard partial-correlation
+    formula applied to rank-transformed values: r_xy.z = (r_xy - r_xz*r_yz) / sqrt((1-r_xz^2)(1-r_yz^2)).
+    Answers a different, stronger question than just eyeballing whether r_xz and r_yz are both large --
+    it directly measures whether the x-y relationship survives once z's shared influence on both is
+    removed, rather than requiring a napkin-math guess at how much of r_xy a mediating variable could
+    plausibly account for.
+    """
+    r_xy, r_xz, r_yz = spearman_corr(x, y), spearman_corr(x, z), spearman_corr(y, z)
+    denom = np.sqrt((1 - r_xz ** 2) * (1 - r_yz ** 2))
+    if denom == 0 or np.isnan(denom):
+        return float("nan")
+    return float((r_xy - r_xz * r_yz) / denom)
+
+
+def report_partial_correlation(
+    df: pd.DataFrame, x_col: str, y_col: str, z_col: str, subject_col: str = "subject_id"
+) -> None:
+    """Raw vs. partial (controlling for z_col) Spearman correlation of x_col and y_col, pooled + within-subject."""
+    valid = df[[x_col, y_col, z_col]].notna().all(axis=1)
+    r_raw_pooled = spearman_corr(df.loc[valid, x_col].values, df.loc[valid, y_col].values)
+    r_partial_pooled = partial_spearman_corr(
+        df.loc[valid, x_col].values, df.loc[valid, y_col].values, df.loc[valid, z_col].values
+    )
+    print(
+        f"  POOLED: raw Spearman({x_col}, {y_col}) = {r_raw_pooled:+.4f}  |  "
+        f"partial (controlling for {z_col}) = {r_partial_pooled:+.4f}  (n={int(valid.sum())})"
+    )
+
+    raw_rs, partial_rs = [], []
+    for _, g in df.groupby(subject_col):
+        gvalid = g[[x_col, y_col, z_col]].notna().all(axis=1)
+        if gvalid.sum() < 4:
+            continue
+        r_raw = spearman_corr(g.loc[gvalid, x_col].values, g.loc[gvalid, y_col].values)
+        r_partial = partial_spearman_corr(
+            g.loc[gvalid, x_col].values, g.loc[gvalid, y_col].values, g.loc[gvalid, z_col].values
+        )
+        if not np.isnan(r_raw):
+            raw_rs.append(r_raw)
+        if not np.isnan(r_partial):
+            partial_rs.append(r_partial)
+    raw_rs, partial_rs = np.array(raw_rs), np.array(partial_rs)
+    if len(raw_rs) == 0 or len(partial_rs) == 0:
+        print(f"  WITHIN-SUBJECT: not enough per-subject variance to compute this.")
+        return
+    print(
+        f"  WITHIN-SUBJECT: raw median r = {np.median(raw_rs):+.4f} (n_subjects={len(raw_rs)})  |  "
+        f"partial median r (controlling for {z_col}) = {np.median(partial_rs):+.4f} (n_subjects={len(partial_rs)})"
+    )
+    print(
+        f"  If the partial median stays close to the raw median, {z_col} explains little of the "
+        f"{x_col}-{y_col} relationship. If it collapses toward 0, {z_col} was doing most of the work."
+    )
+
+
 def report_correlations(df: pd.DataFrame, reference_col: str, feature_cols: List[str], subject_col: str = "subject_id") -> None:
     """Pooled + within-subject Spearman correlation of `reference_col` against each of `feature_cols`."""
     print("\n" + "=" * 88)
@@ -278,6 +335,14 @@ def main():
           "halves of that chain directly."
     )
     report_correlations(merged, "raw_epoch_index", ["attn_weight", "delta_real_abspower"])
+
+    print(
+        "\n--- Does attn_weight vs delta_real_abspower SURVIVE controlling for raw_epoch_index? ---\n"
+        "A napkin-math guess (multiplying the two legs' correlation magnitudes above) isn't a real "
+        "test of mediation -- this partial correlation is: it removes whatever of the attn_weight-delta "
+        "relationship raw_epoch_index could explain, then reports what's left."
+    )
+    report_partial_correlation(merged, "attn_weight", "delta_real_abspower", "raw_epoch_index")
 
 
 if __name__ == "__main__":
