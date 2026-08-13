@@ -37,12 +37,21 @@ in contrast to an architecture that assumes a fixed input size (e.g. a fixed-len
 or a sequence model built for one specific sequence length).
 
 Usage:
+    # Train (fixed split), then score the BEST saved checkpoint against held-out test:
     python p13_attention_mil_pooling.py \
         --cache-dir /data/eeg_study/cache \
         --train-manifest /data/eeg_study/train_manifest.csv \
         --val-manifest /data/eeg_study/val_manifest.csv \
+        --test-manifest /data/eeg_study/test_manifest.csv \
         --probe-checkpoint /data/eeg_study/checkpoints-probe-linear/cbramod_ckpt.pt \
         --epochs 40 --attn-lr 1e-3
+
+    # Re-evaluate a previously-saved attention-head checkpoint, no training:
+    python p13_attention_mil_pooling.py \
+        --cache-dir /data/eeg_study/cache \
+        --probe-checkpoint /data/eeg_study/checkpoints-probe-linear/cbramod_ckpt.pt \
+        --resume-checkpoint /data/eeg_study/checkpoints-attn/best_attn.pt --eval-only \
+        --test-manifest /data/eeg_study/test_manifest.csv
 """
 
 import argparse
@@ -104,6 +113,26 @@ def parse_cli_args() -> argparse.Namespace:
         help="Number of subjects (bags) whose losses get averaged before each optimizer.step() -- "
              "a form of gradient accumulation that smooths single-subject noise WITHOUT requiring "
              "padding/masking across bags of different sizes."
+    )
+
+    eval_group = parser.add_argument_group("Evaluation")
+    eval_group.add_argument(
+        "--test-manifest", type=str, default=None,
+        help="Optional p03 test_manifest.csv. If given, after training the BEST saved checkpoint "
+             "(not whatever the last epoch happened to leave in memory -- early stopping means those "
+             "can differ) is reloaded and scored against these held-out subjects, attention vs. p85, "
+             "the same side-by-side comparison as every validation epoch."
+    )
+    eval_group.add_argument(
+        "--eval-only", action="store_true",
+        help="Skip training entirely; just load --resume-checkpoint and evaluate against "
+             "--val-manifest (and --test-manifest, if given)."
+    )
+    eval_group.add_argument(
+        "--resume-checkpoint", type=str, default=None,
+        help="Path to a previously-saved attention-head checkpoint (this script's own output). "
+             "Required with --eval-only; also used to reload the actual best checkpoint for the "
+             "post-training --test-manifest pass."
     )
 
     log_group = parser.add_argument_group("Logging")
@@ -297,20 +326,57 @@ def run_epoch_eval(
 # 6. MAIN
 # =====================================================================
 
+def load_subject_ids(manifest_csv: str) -> List[str]:
+    df = pd.read_csv(manifest_csv)
+    return df["subject_id"].astype(str).tolist()
+
+
+def log_split_metrics(logger, split_name: str, attn_metrics: Dict[str, float], p85_metrics: Dict[str, float]) -> None:
+    logger.info(
+        f"  [{split_name}] Attn: F1={attn_metrics['subject_macro_f1']:.4f} AUC={attn_metrics['roc_auc']:.4f} "
+        f"Acc={attn_metrics['subject_accuracy']:.4f} Sens={attn_metrics['subject_sensitivity']:.4f} "
+        f"Spec={attn_metrics['subject_specificity']:.4f} | "
+        f"p85 (same frozen probs): F1={p85_metrics['subject_macro_f1']:.4f} AUC={p85_metrics['roc_auc']:.4f}"
+    )
+
+
 def main():
     args = parse_cli_args()
     logger = setup_logger(args.log_filename)
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    master_cache_path = Path(args.cache_dir) / args.master_cache_name
+    probe = build_frozen_probe(args, device)
+    logger.info(f"Loaded frozen probe from {args.probe_checkpoint} (head_type={args.head_type}); probe parameters are NOT trained here.")
+
+    attn_head = AttentionPoolingHead(
+        num_patches=args.num_patches, emb_dim=args.cbra_dim,
+        hidden_dim=args.attn_hidden_dim, dropout=args.attn_dropout,
+    ).to(device)
+    best_model_path = Path(args.checkpoint_dir) / args.checkpoint_filename if args.checkpoint_dir else Path(args.checkpoint_filename)
+
+    if args.eval_only:
+        if not args.resume_checkpoint:
+            raise ValueError("--eval-only requires --resume-checkpoint (a checkpoint saved by a prior training run of this script).")
+        if not args.val_manifest and not args.test_manifest:
+            raise ValueError("--eval-only requires at least one of --val-manifest / --test-manifest to evaluate against.")
+
+        ckpt = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=True)
+        attn_head.load_state_dict(ckpt["attn_head_state_dict"])
+        logger.info(f"Loaded attention-head weights from {args.resume_checkpoint} (epoch {ckpt.get('epoch', '?')}) -- evaluation only, no training.")
+
+        if args.val_manifest:
+            val_ds = CachedFeatureSubjectDataset(master_cache_path, filter_subject=load_subject_ids(args.val_manifest))
+            log_split_metrics(logger, "VAL", *run_epoch_eval(attn_head, probe, val_ds, device))
+        if args.test_manifest:
+            test_ds = CachedFeatureSubjectDataset(master_cache_path, filter_subject=load_subject_ids(args.test_manifest))
+            log_split_metrics(logger, "TEST", *run_epoch_eval(attn_head, probe, test_ds, device))
+        return
+
     if not args.train_manifest or not args.val_manifest:
         raise ValueError("--train-manifest and --val-manifest are both required (fixed split only in this first version).")
 
-    def load_subject_ids(manifest_csv: str) -> List[str]:
-        df = pd.read_csv(manifest_csv)
-        return df["subject_id"].astype(str).tolist()
-
-    master_cache_path = Path(args.cache_dir) / args.master_cache_name
     train_subject_ids = load_subject_ids(args.train_manifest)
     val_subject_ids = load_subject_ids(args.val_manifest)
 
@@ -326,18 +392,10 @@ def main():
         f"Bag sizes are NOT fixed -- window counts per subject vary freely."
     )
 
-    probe = build_frozen_probe(args, device)
-    logger.info(f"Loaded frozen probe from {args.probe_checkpoint} (head_type={args.head_type}); probe parameters are NOT trained here.")
-
-    attn_head = AttentionPoolingHead(
-        num_patches=args.num_patches, emb_dim=args.cbra_dim,
-        hidden_dim=args.attn_hidden_dim, dropout=args.attn_dropout,
-    ).to(device)
     optimizer = torch.optim.AdamW(attn_head.parameters(), lr=args.attn_lr, weight_decay=args.weight_decay)
 
     best_f1, best_auc = 0.0, 0.0
     patience_counter = 0
-    best_model_path = Path(args.checkpoint_dir) / args.checkpoint_filename if args.checkpoint_dir else Path(args.checkpoint_filename)
 
     logger.info(f"Starting Attention-MIL Pooling Training ({args.epochs} epochs max | subjects/step: {args.subjects_per_step})")
     logger.info("=" * 125)
@@ -382,6 +440,23 @@ def main():
 
     logger.info("=" * 125)
     logger.info(f"Training Complete. Best Attention-Pooling Subject Macro F1: {best_f1:.4f} | Best AUC: {best_auc:.4f}")
+
+    if args.test_manifest:
+        # Reload the actual BEST saved checkpoint before scoring test -- attn_head in memory right now
+        # is whatever the LAST epoch trained produced, which early stopping means is not necessarily
+        # (and in this run's case, was not) the same as the best-F1/AUC checkpoint that got saved.
+        ckpt = torch.load(best_model_path, map_location="cpu", weights_only=True)
+        attn_head.load_state_dict(ckpt["attn_head_state_dict"])
+        logger.info(f"Reloaded best checkpoint (epoch {ckpt['epoch']}) from {best_model_path} for held-out test scoring.")
+
+        test_ds = CachedFeatureSubjectDataset(master_cache_path, filter_subject=load_subject_ids(args.test_manifest))
+        leaked_test = (set(train_ds.unique_subjects) | set(val_ds.unique_subjects)) & set(test_ds.unique_subjects)
+        assert not leaked_test, f"[CRITICAL LEAKAGE] {len(leaked_test)} subject(s) in test AND (train or val): {leaked_test}"
+
+        logger.info("=" * 125)
+        logger.info(f"HELD-OUT TEST ({len(test_ds)} subjects) -- scored with the BEST checkpoint selected on validation:")
+        log_split_metrics(logger, "TEST", *run_epoch_eval(attn_head, probe, test_ds, device))
+        logger.info("=" * 125)
 
 
 if __name__ == "__main__":
