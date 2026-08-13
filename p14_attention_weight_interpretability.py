@@ -95,17 +95,18 @@ def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
-def report_correlations(df: pd.DataFrame, feature_cols: List[str], subject_col: str = "subject_id") -> None:
+def report_correlations(df: pd.DataFrame, reference_col: str, feature_cols: List[str], subject_col: str = "subject_id") -> None:
+    """Pooled + within-subject Spearman correlation of `reference_col` against each of `feature_cols`."""
     print("\n" + "=" * 88)
-    print("POOLED CORRELATION (all windows, all subjects together -- conflates within/between-subject variance)")
+    print(f"POOLED CORRELATION ({reference_col} vs. features, all windows/subjects together -- conflates within/between-subject variance)")
     print("=" * 88)
     for col in feature_cols:
         valid = df[col].notna()
-        r = spearman_corr(df.loc[valid, "attn_weight"].values, df.loc[valid, col].values)
-        print(f"  attn_weight vs {col:<24}: Spearman r = {r:+.4f}  (n={int(valid.sum())})")
+        r = spearman_corr(df.loc[valid, reference_col].values, df.loc[valid, col].values)
+        print(f"  {reference_col} vs {col:<24}: Spearman r = {r:+.4f}  (n={int(valid.sum())})")
 
     print("\n" + "=" * 88)
-    print("WITHIN-SUBJECT CORRELATION (summarized across subjects -- the direct test)")
+    print(f"WITHIN-SUBJECT CORRELATION ({reference_col} vs. features, summarized across subjects -- the direct test)")
     print("=" * 88)
     for col in feature_cols:
         per_subject_r = []
@@ -113,15 +114,15 @@ def report_correlations(df: pd.DataFrame, feature_cols: List[str], subject_col: 
             valid = g[col].notna()
             if valid.sum() < 3:
                 continue
-            r = spearman_corr(g.loc[valid, "attn_weight"].values, g.loc[valid, col].values)
+            r = spearman_corr(g.loc[valid, reference_col].values, g.loc[valid, col].values)
             if not np.isnan(r):
                 per_subject_r.append(r)
         per_subject_r = np.array(per_subject_r)
         if len(per_subject_r) == 0:
-            print(f"  attn_weight vs {col:<24}: no subjects had enough variance to compute this.")
+            print(f"  {reference_col} vs {col:<24}: no subjects had enough variance to compute this.")
             continue
         print(
-            f"  attn_weight vs {col:<24}: mean r = {per_subject_r.mean():+.4f}, "
+            f"  {reference_col} vs {col:<24}: mean r = {per_subject_r.mean():+.4f}, "
             f"median r = {np.median(per_subject_r):+.4f}, "
             f"frac(r>0.2) = {(per_subject_r > 0.2).mean():.2f}, "
             f"frac(r<-0.2) = {(per_subject_r < -0.2).mean():.2f} (n_subjects={len(per_subject_r)})"
@@ -198,6 +199,8 @@ def main():
         logger.error("No rows survived the join -- nothing to correlate. Check --morphology-csv matches --manifest.")
         return
 
+    merged["prob_extremity"] = (merged["window_prob"] - 0.5).abs()
+
     output_path = Path(args.output_csv)
     merged.to_csv(output_path, index=False)
     logger.info(f"Saved {len(merged)} joined rows to {output_path}")
@@ -213,7 +216,23 @@ def main():
         "learning to suppress their influence on the pooled score, though the causal investigation's "
         "perturbation tests (not a correlation like this one) remain the actual causal evidence."
     )
-    report_correlations(merged, band_cols + yasa_cols)
+    report_correlations(merged, "attn_weight", band_cols + yasa_cols)
+
+    print(
+        "\n" + "=" * 88
+        + "\nEXTREMITY CHECK: is the gate filtering by how INFORMATIVE the frozen probe's own prediction "
+          "is for a window, rather than (or in addition to) discovering a new spectral marker?\n"
+        + "=" * 88
+        + "\nprob_extremity = |window_prob - 0.5| -- how far the frozen probe's own window-level "
+          "prediction sits from maximally uninformative. If attn_weight correlates POSITIVELY with "
+          "prob_extremity, the gate favors windows where the probe already has something confident to "
+          "say, regardless of which band drives that. If delta_real_abspower correlates NEGATIVELY "
+          "with prob_extremity too, that's consistent with high-delta windows being less discriminative "
+          "for the probe in the first place -- i.e. the gate's strong delta downweighting could be "
+          "explained as 'downweight uninformative windows' rather than 'delta itself is the signal'."
+    )
+    report_correlations(merged, "attn_weight", ["prob_extremity"])
+    report_correlations(merged, "prob_extremity", band_cols + yasa_cols)
 
 
 if __name__ == "__main__":
