@@ -339,6 +339,167 @@ to trust it, jointly, from the raw embedding alone.
 
 ---
 
+## 7. Option B: Gated Attention Over Embeddings — What It Learned, and What It Didn't
+
+Option B (`p16_gated_attention_embedding_mil.py`) removes the frozen probe entirely: gated attention
+(Ilse, Tomczak & Welling, 2018 — a tanh branch elementwise-gated by a sigmoid branch, more expressive
+than Option A's single-nonlinearity gate) operates directly on frozen CBraMod embeddings, and a
+freshly-trained head maps the resulting pooled representation to the subject-level prediction. There
+is no per-window probability anywhere in this pipeline — everything is learned jointly from
+subject-level labels alone. This chapter covers what that bought (and cost) relative to Option A, and
+a genuinely important epistemological correction that emerged partway through interpreting it.
+
+### 7.1 Architecture and head-type choice
+
+Two head variants were tried, `mlp` (default, 2-layer) and `linear` (1-layer):
+
+| | Parameters | Val F1 / AUC | Test F1 / AUC | Val→test AUC gap |
+|---|---|---|---|---|
+| MLP head | ~780K | 0.873 / 0.917 | 0.825 / 0.852 | **-0.065** |
+| Linear head | ~408K | 0.905 / 0.929 | 0.853 / 0.918 | **-0.011** |
+
+The linear head won decisively on every axis — higher validation and test performance, and roughly
+6× smaller generalization gap — not merely a capacity-vs-interpretability tradeoff but a real,
+practical improvement in this small-cohort regime. It's also exactly decomposable: because
+`pooled = Σ attn_weight_i · embedding_i` and a linear head distributes over that sum,
+`head(pooled) = Σ attn_weight_i · head(embedding_i)` **exactly** — verified numerically to
+float-precision on both synthetic data (~1e-16 error) and the real trained model (~4.77e-07 error,
+consistent with float32 rounding). This gives a genuine per-window "evidence" term, unlike Option A's
+`window_prob` (inherited from a separately-trained probe) or any of the approximate proxies used
+earlier in this investigation. An MLP head breaks this property entirely (nonlinear functions don't
+commute with a weighted sum), so all interpretability work in this chapter is specific to the linear
+head. All results below use it.
+
+Linear head's test AUC (0.918) is an exact match to Option A's (0.918) — both also beating the
+original p85 baseline (0.882) by the identical +0.036 margin. Plausible coincidence rather than a
+deep result: AUC on 35 subjects is a coarse statistic, and both models share the same frozen backbone
+underneath.
+
+### 7.2 Interpretability: a weaker echo, and a striking internal anti-correlation
+
+Correlating the gate's `attn_weight` against band power (same methodology as Chapter 6.3) showed the
+**same-signed** content preference as Option A (delta/theta/slow-waves down, beta/spindles up), but
+roughly a third to a half the magnitude and far less universal (delta's `frac(r<-0.2)` dropped from
+100% in Option A to 46% here; beta's `frac(r>0.2)` dropped from 91% to 34%). That two independently
+trained, architecturally different models converge on the same qualitative preference is a point in
+favor of that content axis being a real, robust regularity — just a much weaker signal without a
+frozen probe to lean on.
+
+A second per-window quantity — `window_evidence = head(embedding_i)`, the exact per-window
+contribution the linear head makes before pooling — correlates against band power with **nearly
+mirror-image signs** of `attn_weight`'s own correlations (e.g. delta +0.13 vs. attn_weight's -0.20).
+Directly testing this: `attn_weight` vs. `window_evidence` shows a strong, essentially universal
+**negative** correlation (within-subject median r = -0.49, 100% of 35 subjects < -0.2) — the gate
+systematically downweights exactly the windows that, scored in isolation, look most patient-like, and
+upweights the windows that look most control-like, for nearly every subject regardless of their true
+label.
+
+### 7.3 A necessary epistemological correction
+
+Before ablating this pattern, a sharp objection was raised and is worth recording precisely: `attn_weight`
+and `window_evidence` are two jointly-optimized components of one machine trained to produce a good
+*aggregate* subject-level prediction. Nothing in that training objective requires either component to
+carry an independently sensible meaning — the network is only ever evaluated on the sum, never on the
+individual terms (the exact-decomposition property in 7.1 is a fact about *how the final number is
+computed*, verified by direct computation; it does not by itself establish that either term is
+semantically meaningful in isolation). Two components can develop a jointly-compensating relationship
+that "gets the job done" together while being individually arbitrary — a well-recognized risk in
+interpreting any jointly-trained intermediate representation (attention weights in particular have a
+literature specifically warning against over-interpreting them, e.g. "Attention is not Explanation").
+The strong anti-correlation in 7.2 is exactly consistent with either story — a semantically meaningful
+one (the gate distrusts noisy extreme evidence) or a functionally arbitrary but jointly load-bearing
+one — and correlating against band power cannot distinguish them.
+
+### 7.4 Does the specific pairing matter functionally? (permutation test)
+
+A first ablation design — averaging many within-subject random shuffles of `window_evidence` into one
+score per subject, then comparing whole-cohort TRUE/UNIFORM/SHUFFLED metrics — was caught as
+mathematically vacuous *before running it*: because `attn_weight` sums to 1 (softmax),
+`E[Σ attn_weight_i · evidence_perm(i)] = mean(evidence)` **exactly**, for *any* pairing whatsoever.
+Averaging many shuffles per subject therefore converges to the uniform baseline by linearity of
+expectation alone, with zero dependence on whether the true pairing carries information — a tautology,
+not a test.
+
+The corrected design is a genuine permutation test: generate K independent whole-cohort "shuffled
+worlds" (each subject gets its own random permutation of `window_evidence` in that world, `attn_weight`
+untouched), compute one whole-cohort AUC/F1 per world, and compare the model's actual (TRUE)
+performance against that empirical null distribution. Validated on synthetic cases before trusting it
+(a constructed "pairing matters" case placed TRUE at the 100th percentile of the shuffled distribution;
+a "pairing doesn't matter" case placed it at an unremarkable 74th).
+
+Applied to the real model (300 shuffles, 35 test subjects):
+
+| | F1 | AUC |
+|---|---|---|
+| TRUE (as trained) | 0.8528 | 0.9178 |
+| UNIFORM weights | 0.7200 | 0.9112 |
+| SHUFFLED null (mean ± std) | 0.7201 ± 0.0020 | 0.9094 ± 0.0033 |
+
+TRUE beat every one of the 300 shuffles on both metrics (100th percentile) — in units of the null
+distribution's own spread, ~66 standard deviations above the shuffled mean on F1, ~25 on AUC. The
+specific learned pairing is genuinely, overwhelmingly load-bearing, not incidental. (A useful side
+effect: UNIFORM and the shuffled mean match almost exactly — 0.7200 vs. 0.7201, 0.9112 vs. 0.9094 —
+empirically confirming the `E[shuffled] = uniform` identity that caught the first design's flaw, and
+validating the whole pipeline end to end.)
+
+The benefit is concentrated specifically in **specificity** (0.50 → 0.75), with **sensitivity
+unchanged** (0.9474 across TRUE, uniform, and shuffled alike) — whatever the pairing mechanism does,
+its practical value is entirely about not misclassifying controls as patients, not about catching more
+patients.
+
+Worth being honest about why uniform/shuffled still score respectably (AUC ~0.91, not chance-level
+~0.5) rather than collapsing: `uniform_score = mean(window_evidence)` over several hundred windows per
+subject is not "no signal" — it's "signal, averaged blindly." Since `window_evidence` already carries
+real (if noisy) per-window content (7.2's band-power correlations confirm this), averaging it over
+hundreds of redundant windows from the same recording is itself a fairly strong subject-level estimator
+by the law of large numbers, with or without smart attention weighting. The attention mechanism's
+statistically overwhelming contribution is therefore better understood as a genuine *refinement* on top
+of an already-decent averaging baseline (mostly fixing specificity) — not the primary source of
+predictive power. A large share of this model's performance comes from simple redundancy across many
+EEG windows and a plain per-window linear read-out, not from the sophistication of the attention
+mechanism.
+
+### 7.5 Does Option B still rest on the validated sigma mechanism?
+
+Before trusting any of the above, the more fundamental question was checked first: does the *whole*
+Option B pipeline (backbone → fresh embedding → gated attention → head, recomputed at every step, no
+separate probe anywhere) still show the same sigma-band causal effect validated for p85 and confirmed
+to survive Option A's pooling? Perturbing sigma power on the raw waveform and re-running the full
+pipeline at each scale factor (`p19_gated_attention_perturbation_test.py`):
+
+| | frac(slope < 0) | R² |
+|---|---|---|
+| p85 (original) | ~0.95 | ~0.97 |
+| Option A | 1.00 | 0.993 |
+| **Option B** | **0.97** | **0.930** |
+
+Option B lands squarely between the other two on every metric. Despite having no frozen probe to
+anchor a causal signal to, and despite its internal `attn_weight`/`window_evidence` not individually
+tracking sigma the way Option A's gate did, the *aggregate* subject-level decision still responds to
+sigma perturbation almost exactly like the other two pipelines. Option B didn't lose the mechanism —
+it re-encoded it differently internally, distributed across the entangled `attn_weight`/
+`window_evidence` pair rather than carried cleanly by either alone.
+
+### 7.6 Verdict
+
+Unlike Option A, Option B's internal mechanism does **not** map cleanly onto physically-grounded EEG
+content — its dominant per-window signal (`window_evidence`) and its attention weighting are
+individually only weakly interpretable, and the strong relationship between them is functionally
+necessary (7.4) without being semantically transparent (7.3). In that specific sense, this
+architecture did not track the real world the way Option A's hybrid design did.
+
+But the exercise still served its purpose. It reaffirmed, in a second and architecturally very
+different model — one trained completely end to end with no shared component with Option A beyond the
+frozen backbone — that the sigma-band causal mechanism established back in Chapters 3–4 is a robust
+invariant, not an artifact of any one pooling or aggregation scheme. And it surfaced a genuine,
+generalizable methodological lesson for interpreting any jointly-trained multi-component model: exact
+mathematical decomposability of a final score into per-component terms does not imply those terms are
+individually meaningful, and testing whether a discovered internal relationship is *functionally
+necessary* (permutation test) is a categorically different question from testing whether it is
+*semantically interpretable* — answering one does not answer the other.
+
+---
+
 ## Appendix A: Data Preparation & Cleansing
 
 **Referencing.** Recordings are re-referenced (A1/A2 linked-earlobe reference, matching the
