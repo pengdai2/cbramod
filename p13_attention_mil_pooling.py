@@ -414,11 +414,18 @@ def load_subject_ids(manifest_csv: str) -> List[str]:
 
 
 def log_split_metrics(logger, split_name: str, attn_metrics: Dict[str, float], p85_metrics: Dict[str, float]) -> None:
+    # optimal_threshold is printed explicitly for both methods -- attn and p85 are thresholded
+    # independently (each gets its own value, whether swept fresh on validation or held fixed from
+    # a prior validation sweep for test/eval-only), so an identical F1 between the two is NOT evidence
+    # they secretly shared a threshold; this makes that verifiable directly from the log instead of
+    # requiring anyone to trust that claim.
     logger.info(
         f"  [{split_name}] Attn: F1={attn_metrics['subject_macro_f1']:.4f} AUC={attn_metrics['roc_auc']:.4f} "
+        f"thr={attn_metrics['optimal_threshold']:.2f} "
         f"Acc={attn_metrics['subject_accuracy']:.4f} Sens={attn_metrics['subject_sensitivity']:.4f} "
         f"Spec={attn_metrics['subject_specificity']:.4f} | "
-        f"p85 (same frozen probs): F1={p85_metrics['subject_macro_f1']:.4f} AUC={p85_metrics['roc_auc']:.4f}"
+        f"p85 (same frozen probs): F1={p85_metrics['subject_macro_f1']:.4f} AUC={p85_metrics['roc_auc']:.4f} "
+        f"thr={p85_metrics['optimal_threshold']:.2f}"
     )
 
 
