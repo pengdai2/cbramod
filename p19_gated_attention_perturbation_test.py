@@ -37,7 +37,7 @@ from cbramod_common import (
     PANSubjectEEGDataset,
     perturb_window_band_power,
     seed_everything,
-    setup_inference_cli_parser,
+    setup_common_cli_parser,
 )
 from p09c_clinical_subject_diagnostics import load_subject_ids_from_json
 from p16_gated_attention_embedding_mil import GatedAttentionMIL
@@ -68,7 +68,22 @@ def sigmoid(x: float) -> float:
 
 
 def parse_cli_args() -> argparse.Namespace:
-    parser = setup_inference_cli_parser(description="Option B Subject-Level Perturbation Test (no separate probe)")
+    # Deliberately setup_common_cli_parser, NOT setup_inference_cli_parser: the latter's --checkpoint
+    # (required) and --pooling-strategy/--top-percentile/--t-window/--override-threshold all exist for
+    # the OLD fused CBraModE2EClassifier + p85 pooling path (p09h/p09i/p15) -- Option B doesn't use any
+    # of that, it loads its own model entirely via --model-checkpoint below, and pooling is whatever the
+    # trained GatedAttentionMIL does, not a configurable p85-style choice.
+    parser = argparse.ArgumentParser(
+        description="Option B Subject-Level Perturbation Test (no separate probe)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    setup_common_cli_parser(parser)
+
+    data_group = parser.add_argument_group("Data")
+    data_group.add_argument("--manifest", type=str, required=True, help="Path to test_manifest.csv for raw .npy inference")
+    data_group.add_argument("--subject-id", type=str, default=None, help="Optional comma-separated list of specific Subject IDs to analyze")
+    data_group.add_argument("--output-dir", type=str, default=None, help="Output directory for results")
+
     group = parser.add_argument_group("Perturbation Test")
     group.add_argument("--band", type=str, default="sigma", choices=list(BAND_DEFS.keys()))
     group.add_argument("--scale-factors", type=str, default="0.5,0.75,1.0,1.25,1.5")
@@ -99,8 +114,6 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else Path("./gated_attention_perturbation_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.features_pt:
-        raise ValueError("This script perturbs the raw waveform directly (--manifest); --features-pt has no raw signal left to filter.")
     if args.num_classes != 2:
         raise ValueError("This script assumes binary classification.")
 
