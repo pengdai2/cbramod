@@ -129,7 +129,7 @@ class GatedAttentionMIL(nn.Module):
     """
     def __init__(
         self, num_patches: int = 30, emb_dim: int = 200, attn_hidden_dim: int = 32,
-        head_hidden_dim: int = 64, dropout: float = 0.3, num_classes: int = 2,
+        head_hidden_dim: int = 64, dropout: float = 0.3, num_classes: int = 2, head_type: str = "mlp",
     ):
         super().__init__()
         in_features = num_patches * emb_dim
@@ -138,12 +138,29 @@ class GatedAttentionMIL(nn.Module):
         self.U = nn.Linear(in_features, attn_hidden_dim)
         self.w = nn.Linear(attn_hidden_dim, 1)
         self.gate_dropout = nn.Dropout(dropout)
-        self.head = nn.Sequential(
-            nn.Linear(in_features, head_hidden_dim),
-            nn.ELU(),
-            nn.Dropout(dropout),
-            nn.Linear(head_hidden_dim, num_classes),
-        )
+
+        # head_type="linear" isn't just fewer parameters than "mlp" -- it's a qualitatively different
+        # interpretability position. Because pooled = sum(attn_weight_i * embedding_i) and a LINEAR
+        # head distributes over that sum, logit = W . pooled + b = sum(attn_weight_i * (W . embedding_i))
+        # + b -- the final decision decomposes EXACTLY into a per-window "evidence" term (W . embedding_i)
+        # weighted by attn_weight_i, the same clean additive structure Option A had
+        # (attn_weight_i * window_prob_i), enabling an exact per-window attribution (correlate
+        # W . embedding_i against band power, same as p14 did for window_prob) rather than an
+        # approximation. An MLP head breaks this: MLP(sum(a_i * x_i)) != sum(a_i * MLP(x_i)) in
+        # general, since nonlinear functions don't commute with a weighted sum -- there is no exact
+        # per-window decomposition once the head is nonlinear, only approximate attribution methods
+        # (leave-one-out, gradients, etc.).
+        if head_type == "linear":
+            self.head = nn.Linear(in_features, num_classes)
+        elif head_type == "mlp":
+            self.head = nn.Sequential(
+                nn.Linear(in_features, head_hidden_dim),
+                nn.ELU(),
+                nn.Dropout(dropout),
+                nn.Linear(head_hidden_dim, num_classes),
+            )
+        else:
+            raise ValueError(f"Unknown head_type: {head_type!r} -- choose 'linear' or 'mlp'.")
 
     def forward(self, bag_feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """bag_feats: [n_windows, num_patches, emb_dim] -- one subject's windows, n_windows arbitrary."""
@@ -254,15 +271,17 @@ def main():
         ckpt = torch.load(args.resume_checkpoint, map_location="cpu", weights_only=True)
         attn_hidden_dim = ckpt.get("attn_hidden_dim", args.attn_hidden_dim)
         head_hidden_dim = ckpt.get("head_hidden_dim", args.head_hidden_dim)
+        head_type = ckpt.get("head_type", args.head_type)
         if "attn_hidden_dim" not in ckpt:
             logger.warning(
                 f"--resume-checkpoint has no saved architecture metadata -- falling back to CLI flags "
-                f"(attn_hidden_dim={attn_hidden_dim}, head_hidden_dim={head_hidden_dim}); "
-                f"load_state_dict will fail below if either is wrong."
+                f"(attn_hidden_dim={attn_hidden_dim}, head_hidden_dim={head_hidden_dim}, head_type={head_type}); "
+                f"load_state_dict will fail below if any of these is wrong."
             )
         model = GatedAttentionMIL(
             num_patches=args.num_patches, emb_dim=args.cbra_dim, attn_hidden_dim=attn_hidden_dim,
             head_hidden_dim=head_hidden_dim, dropout=args.dropout, num_classes=args.num_classes,
+            head_type=head_type,
         ).to(device)
         model.load_state_dict(ckpt["model_state_dict"])
         logger.info(f"Loaded model from {args.resume_checkpoint} (epoch {ckpt.get('epoch', '?')}) -- evaluation only, no training.")
@@ -291,9 +310,13 @@ def main():
     model = GatedAttentionMIL(
         num_patches=args.num_patches, emb_dim=args.cbra_dim, attn_hidden_dim=args.attn_hidden_dim,
         head_hidden_dim=args.head_hidden_dim, dropout=args.dropout, num_classes=args.num_classes,
+        head_type=args.head_type,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"GatedAttentionMIL: {n_params:,} trainable parameters (attn_hidden_dim={args.attn_hidden_dim}, head_hidden_dim={args.head_hidden_dim})")
+    logger.info(
+        f"GatedAttentionMIL: {n_params:,} trainable parameters (attn_hidden_dim={args.attn_hidden_dim}, "
+        f"head_hidden_dim={args.head_hidden_dim}, head_type={args.head_type})"
+    )
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.head_lr, weight_decay=args.weight_decay)
 
@@ -324,6 +347,7 @@ def main():
                     "model_state_dict": model.state_dict(),
                     "attn_hidden_dim": args.attn_hidden_dim,
                     "head_hidden_dim": args.head_hidden_dim,
+                    "head_type": args.head_type,
                     "num_patches": args.num_patches,
                     "cbra_dim": args.cbra_dim,
                     "num_classes": args.num_classes,
