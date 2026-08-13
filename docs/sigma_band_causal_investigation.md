@@ -500,6 +500,46 @@ necessary* (permutation test) is a categorically different question from testing
 
 ---
 
+## 8. Weighing Option A vs. Option B
+
+With both variants carried through to a full performance, causal, and interpretability
+characterization, the choice between them comes down to what's actually being optimized for.
+
+| Dimension | Option A (attention over probe outputs) | Option B (gated attention over embeddings, linear head) |
+|---|---|---|
+| Test AUC | 0.918 | 0.918 (tied) |
+| Test F1 | 0.797 | 0.853 |
+| Val→test AUC gap | -0.062 | **-0.011** (much tighter) |
+| Causal preservation (`frac(slope<0)`) | **1.00** | 0.97 |
+| Causal fit quality (R²) | **0.993** | 0.930 |
+| New parameters | ~396K | ~408K (similar) |
+| Moving parts | Two trained components (frozen probe + gate) | One jointly-trained component |
+| Internal mechanism | Partially interpretable — gate echoes a real content axis (N2/spindle-rich vs. N3/delta-heavy), causal signal lives cleanly in the separately-validated probe | Not interpretable — pairing is functionally necessary (confirmed at ~25-66σ) but individually arbitrary; explicitly could not be tied to physical content |
+| Tie to established literature | Direct — sigma/spindle mechanism maps onto the schizophrenia spindle-deficit literature via an unmodified, independently-validated probe | Present but indirect — same aggregate mechanism holds, but not attributable to any interpretable internal component |
+
+**Where each wins.** Option B is measurably better calibrated on this split — a tighter generalization
+gap and a higher test F1 — and architecturally simpler to train (one model, not two). Option A has a
+cleaner, stronger causal signature (100% vs. 97% directional consistency, higher R²) and, more
+importantly, a genuinely interpretable internal mechanism traceable to real neuroscience literature
+rather than a black box that happens to preserve the right aggregate behavior.
+
+**Recommendation: Option A.** The generalization-gap and F1 edge for Option B is real but modest, and
+with only one train/val/test split on ~35 test subjects, it's plausible that gap narrows or reverses
+under a different split or seed — neither variant has been cross-validated yet. What doesn't wash out
+with more data is the qualitative difference: Option A gives a defensible story (a frozen, validated
+probe carries the spindle-deficit signal; a gate that does something separately explicable on top),
+while Option B's own investigation concluded that it is provably necessary internally but not
+explainable. Given the goal of this entire investigation has been to understand *why* the model
+predicts what it does, not just to maximize a metric, that difference is weighted heavily enough to
+prefer Option A going forward — with Option B kept as the valuable generalization check it turned out
+to be (confirming the sigma mechanism isn't p85- or Option-A-specific), rather than a candidate for
+further development.
+
+This is not a purely technical call, though — if raw calibration/F1 on this cohort matters more than
+mechanistic transparency, Option B's numbers are a legitimate basis for the opposite conclusion.
+
+---
+
 ## Appendix A: Data Preparation & Cleansing
 
 **Referencing.** Recordings are re-referenced (A1/A2 linked-earlobe reference, matching the
