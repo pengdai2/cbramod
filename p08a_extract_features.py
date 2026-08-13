@@ -91,6 +91,11 @@ def extract_and_cache(config: argparse.Namespace, logger, manifest_path: Path, o
         "indices": all_indices
     }, output_cache_path)
 
+    # Computed BEFORE the `del` below -- num_subjects is a plain int, so nothing downstream needs
+    # all_subject_ids to stay alive for the log line, unlike the previous ordering which deleted it
+    # first and then tried to read it in the f-string, raising UnboundLocalError every run.
+    num_subjects = len(set(all_subject_ids))
+
     del extractor, dataset, loader, all_embeddings, all_labels, all_subject_ids
     gc.collect()
     if torch.cuda.is_available():
@@ -99,7 +104,7 @@ def extract_and_cache(config: argparse.Namespace, logger, manifest_path: Path, o
     elapsed = time.time() - start_time
     file_size_mb = output_cache_path.stat().st_size / (1024 * 1024)
     logger.info(
-        f"✓ Extraction complete ({elapsed:.1f}s) | Subjects: {len(set(all_subject_ids)):,} | "
+        f"✓ Extraction complete ({elapsed:.1f}s) | Subjects: {num_subjects:,} | "
         f"Windows: {len(cached_feats):,} | Cache Size: {file_size_mb:.2f} MB"
     )
 
