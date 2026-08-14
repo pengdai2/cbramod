@@ -540,6 +540,170 @@ mechanistic transparency, Option B's numbers are a legitimate basis for the oppo
 
 ---
 
+## 9. Option C: Standard-MI Probe Training — A Failed Attempt, and Why
+
+### 9.1 Motivation: how we got here
+
+This chapter started from a step back, not a new result. After weighing Option A against Option B
+(Chapter 8), the question was raised: given all three approaches tried so far — p85 pooling, Option
+A, Option B — none of them actually fits an *ideal* model. Working through why, a few things fell
+into place:
+
+- **p85 pooling is best understood as a deterministic special case of Option A**, with the learned
+  attention weights simply replaced by a fixed statistic (the 85th percentile). Seeing it this way
+  unifies what looked like two separate baselines into one family, differing only in whether the
+  aggregation rule is learned or fixed.
+- **But Option A's frozen probe — the one component both p85 and Option A depend on — is itself
+  trained on a flawed premise.** `p08b` copies each subject's diagnosis onto every one of their
+  windows and trains a plain per-window classifier against that. A patient can have plenty of
+  ordinary-looking sleep windows; forcing the classifier to call *all* of them positive injects real
+  label noise into the one component every other approach in this investigation has treated as
+  ground truth. This is the "collective assumption" in multiple-instance-learning (MIL) terms — every
+  instance in a bag shares the bag's label — and it's a known-wrong assumption for exactly this kind
+  of data. The more realistic "standard MI assumption" is asymmetric: a negative bag's instances are
+  safely assumed uniformly negative (a true control has no pathological windows), but a positive bag
+  only guarantees *at least one* instance is positive — the rest can look arbitrarily normal.
+- **The natural fix proposed was: train each window against its own label, and use attention to pick
+  out which windows matter most for the subject-level decision.** Windows don't have independent
+  ground truth, so this cashes out concretely as the asymmetric standard-MI loss above, rather than
+  literally acquiring new labels.
+
+**Before any of this was built, a sharper objection was raised and is worth recording precisely,
+because it turned out to anticipate exactly what went wrong**: *does this new design still suffer
+from the same lack-of-constraints problem that made Option B obscure? There's nothing forcing the
+model to select windows that are actually physically grounded, as long as it gets the final
+prediction right.* This is exactly correct, and it reframed the whole design problem. The answer
+worked out at the time was: Option A's causal signal stayed traceable specifically because the probe
+converged *before* any learned aggregation (attention) ever saw it — there was no second learnable
+module for it to jointly co-adapt with, the way Option B's scorer and attention weights did. So Option
+C's design constraint became: keep the window scorer's positive-bag aggregation **fixed and
+non-learnable** (max, or mean-of-top-k) during its own training stage, preserving that same
+no-two-learnable-modules-in-the-same-loss guard, while fixing the labeling flaw the objection didn't
+directly address. As Section 9.5 covers, that guard turned out to be necessary but not sufficient —
+the objection was righter than either of us realized at the time.
+
+### 9.2 Design
+
+`p20_mi_probe_training.py` trains the same `LinearProbeHead`/`MLPProbeHead` classes `p08b` uses, but
+with an asymmetric loss:
+- **Negative bags**: every window supervised directly, `BCE(window_prob_i, 0)`, averaged over the
+  whole bag.
+- **Positive bags**: only `BCE(mean_of_top_k(window_prob), 1)` — a **fixed, non-learnable**
+  aggregation (max when `top_k=1`), not attention. Because it has no parameters of its own, there is
+  no second learnable module for the scorer to collude with — the same structural guard that kept
+  Option A's causal signal traceable.
+
+The checkpoint format matches `p08b`'s exactly, so no new Stage 2 script was needed at all —
+`p13_attention_mil_pooling.py` works unmodified once pointed at whatever `p20` produces.
+
+### 9.3 Tuning
+
+The first run (`top_k=1`, i.e. pure max, `pos_loss_weight=1.0`) was clearly unhealthy: validation AUC
+plateaued at 0.72, F1 and AUC diverged in later epochs (AUC still climbing while F1 collapsed), and
+the calibrated p85 threshold landed at an extreme 0.01 — the signature of a collapsed, heavily
+skewed score distribution. Increasing `pos_loss_weight` alone did not fix this. Increasing `top_k` to
+10 did: validation AUC rose to 0.845, thresholds normalized across all four pooling strategies
+(0.07–0.08, not 0.01), and F1/AUC tracked together sensibly through training. This makes sense in
+hindsight — pure max gives an extremely high-variance training signal (one window's gradient per
+positive subject per step); averaging the top 10 smooths it considerably. `trimmed_top_10` also
+turned out to be a somewhat more robust pooling statistic than p85 under the *original*, untuned
+hyperparameters (a less extreme threshold even before tuning) — a secondary, nice-to-have finding
+about which validation statistic is more robust to a poorly-tuned training regime, though it stopped
+mattering once `top_k` itself was fixed.
+
+Even after tuning, the best Stage 1 checkpoint (val AUC 0.845, p85-pooled) still fell short of the
+naive `p08b` probe's own p85-pooled val AUC (0.944) — a real gap, though plausibly an expected "cost
+of honesty": the naive probe's higher number may partly reflect exploiting the collective assumption's
+label noise (an easier pattern to fit than genuine per-window content) rather than being genuinely
+more discriminative.
+
+### 9.4 Grounding verification — a mixed, then concerning, result
+
+**Relative-power correlation** (`p09f`) against the new probe showed every single band's correlation
+sign flipped relative to the naive probe. This matched the exact signature the investigation already
+learned to distrust — relative power's sum-to-1 compositional constraint can flip every other band's
+correlation as a pure arithmetic consequence of a shift in the model's relationship to whichever band
+dominates total power, independent of any real per-band signal.
+
+**Absolute-power correlation** (`p09k`) confirmed the flip was *not* uniform — ruling out a pure
+compositional artifact — but revealed something more specific and, ultimately, more concerning: the
+probe's strongest driver had shifted. Sigma weakened substantially (within-subject median r from
+~-0.13/-0.16 in the naive probe to ~-0.03/-0.06 here); delta strengthened substantially (from
+~-0.03/-0.11 to ~-0.25); beta strengthened from near-zero to ~+0.21. The new probe appeared to have
+moved its primary reliance away from sigma — the one relationship validated causally across p85,
+Option A, and Option B, and tied to the schizophrenia sleep-spindle-deficit literature — toward delta,
+a band never before causally validated in this investigation.
+
+**The decisive causal check made this concrete, and worse than the correlational shift alone
+suggested.** Perturbing sigma power on this new probe moved the subject-level score in the *opposite*
+direction from every other model tested: `frac(slope>0) = 1.00`, R² = 0.958 — increasing sigma power
+*increased* predicted patient-probability, the reverse of p85 (~95% negative), Option A (100%
+negative), and Option B (97% negative), all of which matched the literature. This was not a weak or
+noisy effect; it was clean and completely consistent across all 35 subjects, just reversed.
+
+Perturbing delta, by contrast, gave a directionally *plausible* result — `frac(slope<0) = 1.00`, R² =
+0.962, increasing delta power decreased predicted patient-probability, consistent with the (weaker,
+less-established) synaptic-homeostasis hypothesis that schizophrenia involves reduced slow-wave
+activity. So the final picture was genuinely mixed, not uniformly broken: one causally real,
+correctly-oriented signal (delta), and one causally real, robustly reproduced, but *reversed* signal
+(sigma) — both equally clean (R² 0.958 vs. 0.962) and equally faithfully propagated (propagation ratio
+0.74 vs. 0.78).
+
+### 9.5 Diagnosis: a self-reinforcing selection loop
+
+Avoiding co-adaptation between two *learnable* modules — the original design goal, achieved by making
+the positive-bag aggregation function fixed and parameter-free — turned out to be **necessary but not
+sufficient**. Even with no second learnable module, *which windows count as "top-k" is still
+determined by the scorer's own current parameters*, creating a self-reinforcing loop within a single
+training run: whatever the model currently scores highest keeps receiving gradient and getting
+reinforced, whether that's genuine diagnostic content or an incidental confound. This is a milder,
+continuous version of the "confirmation bias" risk classically associated with iterative
+self-training MIL schemes — a risk the single-run max/top-k design was specifically chosen to avoid,
+but evidently does not fully escape.
+
+With only ~154 training subjects, and positive bags supervised through only `top_k` windows against
+negative bags' full-bag supervision, this asymmetry in effective sample size can plausibly push
+optimization toward whatever cheaply separates patient/control *populations* on average — a
+confound — rather than which specific windows within one patient's recording are genuinely abnormal.
+One concrete, testable-in-principle (but currently untestable, since medication status isn't
+available in this cohort's metadata) hypothesis for the specific sigma reversal: antipsychotic
+medication effects on spindle/sigma activity are documented to be complex and drug-specific, not
+uniformly suppressive. If top-k selection locked onto medication-influenced high-sigma windows rather
+than illness-intrinsic low-spindle windows, that would produce exactly this pattern — a real, robust,
+reproducible effect reflecting a different underlying cause than the literature-grounded mechanism it
+superficially resembles.
+
+### 9.6 Verdict and future directions
+
+Not a clean success or failure. Standard-MI training *can* surface genuine, correctly-oriented
+physiological signal (delta) — something Option B never achieved at all. But at this data size and
+these hyperparameters, it is not constrained enough to reliably preserve the single most robustly
+validated mechanism from every prior chapter (sigma), and appears to have displaced it with something
+that runs backwards — plausibly a confound the self-reinforcing selection dynamic locked onto. This
+reinforces, a third time now, the throughline across this entire investigation: no amount of
+architectural cleverness substitutes for empirically verifying groundedness via causal tests, every
+time, regardless of how principled the design looks on paper.
+
+Given this, Option C is set aside as a failed attempt for now, with concrete directions for anyone
+picking it back up:
+1. Check whether the sigma reversal is specific to this hyperparameter combination
+   (`top_k=10`/`pos_loss_weight=5.0`) or a robust pattern across a wider sweep — a single
+   configuration isn't enough to distinguish a tuning problem from a fundamental limitation.
+2. Directly inspect which windows get top-k-selected for positive-bag subjects — clustering by
+   subject, time, or some other feature would support or refute the confound hypothesis more
+   concretely than the current speculation.
+3. If medication status ever becomes available for this cohort, test the antipsychotic-confound
+   hypothesis directly rather than leaving it as an untestable conjecture.
+4. Consider hybrid designs that keep standard-MI's demonstrated ability to surface real signal (delta)
+   while adding some additional constraint or regularization anchored to the already-validated sigma
+   mechanism, rather than training entirely from scratch with no such anchor.
+5. Consider whether this approach simply needs more training subjects than this cohort provides — the
+   standard-MI assumption inherently supplies less effective per-subject supervision for positive bags
+   than the naive collective assumption does, and 154 training subjects may not be enough to reliably
+   avoid drifting into population-level confounds.
+
+---
+
 ## Appendix A: Data Preparation & Cleansing
 
 **Referencing.** Recordings are re-referenced (A1/A2 linked-earlobe reference, matching the
