@@ -17,13 +17,15 @@ investigation has been careful to keep separate throughout).
                                  Answers "is there a broad, cohort-wide group difference?"
   2. within_subject_shape.png -- per-subject percentile shape (p10-p99), averaged within each group.
                                  Answers "is a typical subject's own shift broad, or tail-concentrated?"
-  3. window_level_relationship.png -- window_prob vs. sigma/delta power, WITHIN-SUBJECT CENTERED
-                                 (each window's value minus that subject's own mean) before binning,
-                                 split by group. Answers the piece the other two don't: does
-                                 window_prob actually TRACK real signal, including WITHIN each group
-                                 separately (not just as a byproduct of patients/controls differing
-                                 on both quantities independently, or of subject-to-subject baseline
-                                 spread within a group swamping the true within-subject slope)?
+  3. window_level_relationship.png -- one point per subject at their own TRUE (mean band power,
+                                 mean probability), with a short tangent line through it showing
+                                 that subject's OWN within-subject slope (fit using only their own
+                                 windows). Point position shows the between-subject offset (should
+                                 match between_subject.png); tangent direction shows the within-
+                                 subject relationship -- deliberately kept separate rather than
+                                 collapsed into one pooled or fully-centered trend line, which can
+                                 only show one of these two facts at a time and risks looking like
+                                 it denies the other.
 
 Usage:
     python p23_capstone_figures.py \
@@ -78,15 +80,6 @@ def parse_cli_args() -> argparse.Namespace:
         help="Path to a p09k (or p09f) output CSV. Repeat this flag to combine multiple runs."
     )
     parser.add_argument("--output-dir", type=str, default="figures")
-    parser.add_argument(
-        "--n-bins", type=int, default=15,
-        help="Number of quantile bins per group for the window-level relationship trend lines."
-    )
-    parser.add_argument(
-        "--scatter-sample", type=int, default=400,
-        help="Number of windows per group to show as a faint background scatter in Figure 3 "
-             "(0 disables the scatter, showing only the binned trend line)."
-    )
     parser.add_argument("--dpi", type=int, default=150)
     return parser.parse_args()
 
@@ -184,77 +177,80 @@ def within_subject_median_spearman(windows: pd.DataFrame, x_col: str, y_col: str
     return float(np.median(per_subject_r)) if per_subject_r else float("nan")
 
 
-def plot_window_level_relationship(
-    windows: pd.DataFrame, output_path: Path, n_bins: int, scatter_sample: int, dpi: int,
-) -> None:
-    """One panel per band: does window_prob actually track real signal, including WITHIN each group
-    separately? A pooled scatter across both groups can't distinguish "probability tracks band power"
-    from "patients happen to differ on both quantities independently" -- fitting the trend separately
-    within each group is what actually tests the former.
+def per_subject_slope_stats(windows: pd.DataFrame, x_col: str, y_col: str = "probability") -> pd.DataFrame:
+    """Per subject: that subject's own TRUE (mean_x, mean_y) location, plus the LOCAL slope of y on
+    x fit using ONLY that subject's own windows (simple OLS), plus that subject's own SD of x (used
+    to size the tangent segment drawn through their point). These are the two pieces of information
+    Figure 3 needs to show together without conflating them: WHERE a subject sits (the between-
+    subject offset, which should match between_subject.png) and WHICH WAY their own windows tilt
+    (the within-subject slope) -- a single pooled or fully-centered trend line can only show one of
+    these at a time."""
+    rows = []
+    for subject_id, sub in windows.groupby("subject_id"):
+        x = sub[x_col].to_numpy(dtype=np.float64)
+        y = sub[y_col].to_numpy(dtype=np.float64)
+        if len(x) < 5 or np.std(x) == 0:
+            continue
+        slope, _intercept = np.polyfit(x, y, 1)
+        rows.append({
+            "subject_id": subject_id,
+            "ground_truth": int(sub["ground_truth"].iloc[0]),
+            "mean_x": float(np.mean(x)),
+            "mean_y": float(np.mean(y)),
+            "sd_x": float(np.std(x)),
+            "slope": float(slope),
+        })
+    return pd.DataFrame(rows)
 
-    Critically, the trend itself is computed on WITHIN-SUBJECT CENTERED values (each window's value
-    minus that subject's own mean), not raw pooled values. Pooling raw values across subjects within
-    a group reintroduces exactly the between-/within-subject conflation this investigation has
-    repeatedly had to catch and correct elsewhere: with substantial subject-to-subject baseline
-    spread (see between_subject.png), a raw pooled-and-binned trend mostly traces out WHICH SUBJECT a
-    window came from, not how that subject's own probability moves with their own band power -- and
-    can visually contradict the (correctly-computed) within-subject correlation annotated on the plot.
-    Centering first makes the line consistent with what the annotation actually measures."""
+
+def plot_window_level_relationship(windows: pd.DataFrame, output_path: Path, dpi: int) -> None:
+    """One panel per band. Each subject is ONE point at their own true (mean band power, mean
+    probability) -- recovering the between-subject offset, which should visually match
+    between_subject.png -- with a short tangent line through it showing that subject's OWN
+    within-subject slope (fit using only their own windows). Deliberately NOT a single pooled or
+    within-subject-centered trend line: centering alone shows the slope but erases the group
+    offset (looks like it denies a difference between_subject.png already shows); pooling raw
+    values without centering reintroduces the between-/within-subject conflation this investigation
+    has repeatedly had to catch elsewhere. Plotting both facts side by side, without collapsing
+    them into one number, avoids having to choose which one to hide."""
     specs = [s for s in RELATIONSHIP_BANDS if s["col"] in windows.columns]
-    fig, axes = plt.subplots(1, len(specs), figsize=(5.2 * len(specs), 4.6))
+    fig, axes = plt.subplots(1, len(specs), figsize=(5.6 * len(specs), 4.8))
     if len(specs) == 1:
         axes = [axes]
 
     for ax, spec in zip(axes, specs):
         col = spec["col"]
-        sub_all = windows[["subject_id", "ground_truth", col, "probability"]].dropna().copy()
-
-        # Within-subject centering: subtract each subject's OWN mean from their own windows, for
-        # both axes, before binning -- isolates within-subject covariation from between-subject
-        # baseline differences, which is what the annotated statistic below actually measures.
-        col_c = f"{col}_centered"
-        sub_all[col_c] = sub_all[col] - sub_all.groupby("subject_id")[col].transform("mean")
-        sub_all["probability_centered"] = (
-            sub_all["probability"] - sub_all.groupby("subject_id")["probability"].transform("mean")
-        )
+        clean = windows[["subject_id", "ground_truth", col, "probability"]].dropna()
+        stats_df = per_subject_slope_stats(clean, col)
 
         for gt in (0, 1):
-            sub = sub_all[sub_all["ground_truth"] == gt]
-            if len(sub) < n_bins:
+            sub = stats_df[stats_df["ground_truth"] == gt]
+            if len(sub) == 0:
                 continue
             style = GROUP_STYLE[gt]
+            ax.scatter(sub["mean_x"], sub["mean_y"], color=style["color"], alpha=0.85, s=30,
+                       zorder=3, label=style["label"], edgecolors="white", linewidths=0.6)
+            for _, row in sub.iterrows():
+                half = max(row["sd_x"], 1e-9)
+                x0, x1 = row["mean_x"] - half, row["mean_x"] + half
+                y0, y1 = row["mean_y"] - row["slope"] * half, row["mean_y"] + row["slope"] * half
+                ax.plot([x0, x1], [y0, y1], color=style["color"], alpha=0.55, linewidth=1.4, zorder=2)
 
-            if scatter_sample > 0:
-                sample = sub.sample(n=min(scatter_sample, len(sub)), random_state=0)
-                ax.scatter(sample[col_c], sample["probability_centered"], color=style["color"],
-                           alpha=0.10, s=10, edgecolors="none", zorder=1)
-
-            try:
-                bins = pd.qcut(sub[col_c], q=n_bins, duplicates="drop")
-            except ValueError:
-                continue
-            binned = sub.groupby(bins, observed=True).agg(
-                x=(col_c, "mean"), y=("probability_centered", "mean")
-            ).dropna()
-            ax.plot(binned["x"], binned["y"], color=style["color"], linestyle=style["linestyle"],
-                    marker=style["marker"], label=style["label"], markersize=5, zorder=3, linewidth=2)
-
-        r_patient = within_subject_median_spearman(sub_all[sub_all["ground_truth"] == 1], col)
-        r_control = within_subject_median_spearman(sub_all[sub_all["ground_truth"] == 0], col)
-        ax.axhline(0, color="lightgray", linewidth=0.8, zorder=0)
-        ax.axvline(0, color="lightgray", linewidth=0.8, zorder=0)
+        r_patient = within_subject_median_spearman(clean[clean["ground_truth"] == 1], col)
+        r_control = within_subject_median_spearman(clean[clean["ground_truth"] == 0], col)
         ax.text(
             0.02, 0.02,
-            f"within-subject median r\npatient: {r_patient:+.2f}   control: {r_control:+.2f}",
+            f"within-subject median r\npatient: {r_patient:+.2f}   control: {r_control:+.2f}\n"
+            f"(point = subject mean; tick = that subject's own slope)",
             transform=ax.transAxes, fontsize=8, va="bottom", ha="left",
-            bbox=dict(boxstyle="round", facecolor="white", alpha=0.7, edgecolor="lightgray"),
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.75, edgecolor="lightgray"),
         )
-        ax.set_xlabel(f"{spec['label']} (within-subject centered)", fontsize=9)
-        ax.set_ylabel("Model window probability (within-subject centered)", fontsize=9)
+        ax.set_xlabel(spec["label"], fontsize=9)
+        ax.set_ylabel("Model window probability", fontsize=9)
         ax.legend(fontsize=9, loc="upper right")
 
     fig.suptitle(
-        "Window-level relationship: does probability track real signal WITHIN each group, not just between groups?",
+        "Window-level relationship: between-subject offset (point position) vs. within-subject slope (tick direction)",
         fontsize=11,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.93])
@@ -281,8 +277,7 @@ def main():
 
     plot_between_subject(subject_df, output_dir / "between_subject.png", args.dpi)
     plot_within_subject_shape(subject_df, output_dir / "within_subject_shape.png", args.dpi)
-    plot_window_level_relationship(windows, output_dir / "window_level_relationship.png",
-                                    args.n_bins, args.scatter_sample, args.dpi)
+    plot_window_level_relationship(windows, output_dir / "window_level_relationship.png", args.dpi)
 
 
 if __name__ == "__main__":
