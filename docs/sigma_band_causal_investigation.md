@@ -934,6 +934,96 @@ now — a natural point to pause the investigation.
 
 ---
 
+## 13. Capstone Figures
+
+The three figures below (`p23_capstone_figures.py`, generated from the test cohort's `p09k`/`p09f`
+window-level CSVs plus `p21`'s stratification output — no new model inference in any of them) are
+the visual record of Chapters 10–12: they exist to make the between-subject/within-subject
+distinction and the sigma mechanism directly inspectable, not just reported as numbers.
+
+### 13.1 Between-subject
+
+![Between-subject comparison of model window probability, sigma power, delta power, spindle count, and slow-wave count, patient vs. control](figures/between_subject.png)
+
+Five panels, one per quantity, each a box-and-jittered-point comparison of patients vs. controls.
+Two design choices carry real information beyond a standard boxplot: every subject occupies the
+*same* horizontal slot in all five panels (ordered by their own model probability), so a single
+subject's profile across quantities can be followed by eye without a connecting line for all ~70
+subjects; and subjects model[0] misclassifies (from `p21`'s calibrated threshold, never re-derived
+here) are drawn as numbered diamonds sharing one numbering scheme with Figure 3 below.
+
+What the real cohort shows: **model window probability** separates the two groups almost completely,
+with only a handful of points overlapping near the boundary. **Sigma power** and **spindle count**
+both run clearly lower in patients, consistent across the bulk of both distributions rather than
+driven by a few extreme subjects — the model-independent confirmation of the spindle-deficit story
+this whole investigation is built around. **Delta power** and **slow-wave count** run higher in
+patients on average, but with substantially more overlap between the groups than sigma/spindles show
+— a real but noisier group difference, matching the weaker, less consistent within-subject
+relationship delta has with predicted probability (Section 10.4, Chapter 12).
+
+The n=11 flagged diamonds split into two kinds the panels make visible at a glance: misclassified
+*patients* (false negatives) cluster toward the low end of the patient probability distribution, and
+cross-referencing them against the sigma/spindle panels is exactly the Chapter 12 case study — most
+of them sit at unusually high, control-like sigma/spindle values within the patient group. The
+misclassified *controls* (false positives) are the mirror set, clustering toward the high end of the
+control probability distribution; whether they mirror the same pattern in reverse (unusually low,
+patient-like sigma/spindle values within the control group) is a natural follow-up this document
+hasn't yet checked — the numbering makes it directly readable off this figure and Figure 3 without
+any further computation.
+
+### 13.2 Within-subject shape
+
+![Within-subject percentile shape of model window probability, sigma power, delta power, spindle count, and slow-wave count, patient vs. control](figures/within_subject_shape.png)
+
+Five panels, one per quantity, each plotting the percentile ladder p10→p99 — but every point is the
+**mean, across subjects in a group, of that subject's own percentile** (never a raw pooled-window
+percentile; see Section 10 and the docstring in `p23_capstone_figures.py`). This is the figure that
+actually distinguishes a broad shift from a fat tail: parallel, uniformly-separated lines across the
+whole percentile range mean most of a typical subject's own recording differs from the other group,
+not just a rare extreme minority of their windows.
+
+**Model window probability** and **sigma power** both show close to textbook broad shifts: the
+patient/control gap is present and roughly consistent from p10 all the way through p99, not
+concentrated at either tail. **Spindle count** shows the same broad-shift shape, mirroring sigma, as
+expected given the two are independently-measured versions of the same spindle-deficit story.
+**Delta power** and **slow-wave count** tell a subtler story: the two groups' lines sit much closer
+together through the low-to-mid percentiles, with the patient/control gap visibly widening mainly at
+the upper percentiles — a real, broadly-present difference (Section 10.3 confirmed six of seven
+percentiles move the same direction), but with a shape closer to a widening tail than sigma's
+uniformly-separated one.
+
+### 13.3 Window-level relationship
+
+![Window-level relationship between model window probability and sigma/delta power, showing between-subject offset and within-subject slope, patient vs. control](figures/window_level_relationship.png)
+
+Two panels (sigma, delta), each showing every subject as one point at their own true (mean band
+power, mean probability) — the between-subject offset, which should visually match 13.1 — with a
+faint tangent line through each point showing that subject's *own* within-subject slope (a plain OLS
+fit on just their own windows), a bold tangent per group at the group centroid using that group's
+median slope, and numbered diamonds for misclassified subjects (same numbering as 13.1). The tangent
+*length* is fixed (the panel's median subject spread) and carries no information; only its
+*direction* does — this was a deliberate fix after an earlier version let a few high-spread subjects
+produce visually dominant, misleading lines.
+
+**Sigma** shows both facts cleanly at once: patient points cluster toward lower sigma/higher
+probability, controls toward higher sigma/lower probability (matching 13.1), and both groups' bold
+tangents point the same negative direction — within-subject median r = −0.08 (patient), −0.21
+(control) — confirming the relationship holds *within* each group separately, not just as an artifact
+of the two groups differing on both axes independently (the concern this figure's whole design was
+built to rule out). **Delta** shows a much weaker and more mixed picture: the point clouds overlap far
+more than sigma's do, and the within-subject slopes are close to flat and inconsistent in sign
+between groups (r = −0.11 patient, +0.02 control) — visual confirmation that delta's within-subject
+relationship with probability is real but far less reliable than sigma's, consistent with delta being
+set aside as a plausible-but-unconfirmed co-contributor rather than a validated second mechanism
+(Section 10.4).
+
+The misclassified diamonds sit, for the most part, near the boundary between the two point clouds
+rather than buried deep inside either one — visually consistent with Chapter 12's finding that these
+are subjects whose own physiology is genuinely closer to the other group's typical range, not
+arbitrary model errors.
+
+---
+
 ## Appendix A: Data Preparation & Cleansing
 
 **Referencing.** Recordings are re-referenced (A1/A2 linked-earlobe reference, matching the
