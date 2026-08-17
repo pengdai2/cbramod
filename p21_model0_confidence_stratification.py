@@ -43,6 +43,28 @@ investigation, e.g. thresholds anywhere from 0.01 to 0.7). This script always pr
 signed_margin distribution (by ground_truth) BEFORE applying any --confidence-margin cutoff, so it can
 be chosen by looking at the actual numbers rather than guessed blind.
 
+--------------------------------------------------------------------------
+Window-level tail characterization (proving/quantifying the "fat tail")
+--------------------------------------------------------------------------
+p09c's window-level probability histograms suggested that for ANY subject, the bulk of windows sit
+below threshold -- what distinguishes a patient is a minority "fat tail" of windows extending above
+it, not a uniform upward shift of every window. This script makes that precise and checkable rather
+than relying on a recalled visual impression:
+
+  - tail_fraction: fraction of a subject's own windows scoring >= threshold. If the fat-tail
+    description is right, this should be small but consistently positive for patients, and smaller
+    (near zero) for controls.
+  - window_prob percentiles (p10/p25/median/p75/p90/p95/p99): characterizes the SHAPE, not just one
+    summary number -- if patients and controls have similar low/median percentiles but diverge
+    sharply at p90+, that's the fat tail showing up precisely, rather than a uniform shift.
+  - mean_naive_ce_loss: the per-window cross-entropy loss each window would contribute if trained
+    under p08b's naive collective-assumption label (every window of a subject labeled with that
+    subject's own ground truth). This is a direct, checkable prediction from the fat-tail hypothesis:
+    if most of a patient's windows score low but are labeled 1 (naive assumption), that's a real,
+    persistent mismatch and should show up as an ELEVATED mean_naive_ce_loss for positive subjects
+    relative to negative ones -- computed here directly from the already-trained checkpoint, no
+    retraining needed to check this.
+
 Usage:
     python p21_model0_confidence_stratification.py \
         --cache-dir /data/eeg_study/cache \
@@ -110,6 +132,19 @@ def load_subject_ids(manifest_csv: str) -> List[str]:
     return df["subject_id"].astype(str).tolist()
 
 
+def compute_naive_ce_loss(window_probs: np.ndarray, ground_truth: int, eps: float = 1e-7) -> float:
+    """
+    Mean per-window cross-entropy loss against p08b's naive collective-assumption label (every
+    window of a subject labeled with that subject's own ground truth) -- computed directly from an
+    already-trained probe's window_probs, no retraining needed. This is the direct, checkable
+    prediction from the fat-tail hypothesis: if the bulk of a positive subject's windows score low
+    (matching controls) despite being labeled 1, that mismatch shows up as an elevated value here.
+    """
+    p = np.clip(window_probs, eps, 1 - eps)
+    per_window_loss = -np.log(p) if ground_truth == 1 else -np.log(1 - p)
+    return float(per_window_loss.mean())
+
+
 def stratify_split(
     dataset: CachedFeatureSubjectDataset, probe, device: torch.device,
     pooling_strategy: str, threshold: float, confidence_margin: float, split_name: str,
@@ -129,6 +164,10 @@ def stratify_split(
             is_confident = abs(signed_margin) >= confidence_margin
             category = f"{'confident' if is_confident else 'marginal'}_{'correct' if is_correct else 'misclassified'}"
 
+            wp_pctl = np.percentile(window_probs, [10, 25, 50, 75, 90, 95, 99])
+            tail_fraction = float((window_probs >= threshold).mean())
+            mean_naive_ce_loss = compute_naive_ce_loss(window_probs, ground_truth)
+
             rows.append({
                 "split": split_name,
                 "subject_id": subject_id,
@@ -140,6 +179,15 @@ def stratify_split(
                 "is_correct": is_correct,
                 "is_confident": is_confident,
                 "category": category,
+                "tail_fraction": tail_fraction,
+                "mean_naive_ce_loss": mean_naive_ce_loss,
+                "window_prob_p10": wp_pctl[0],
+                "window_prob_p25": wp_pctl[1],
+                "window_prob_median": wp_pctl[2],
+                "window_prob_p75": wp_pctl[3],
+                "window_prob_p90": wp_pctl[4],
+                "window_prob_p95": wp_pctl[5],
+                "window_prob_p99": wp_pctl[6],
             })
     return pd.DataFrame(rows)
 
@@ -170,6 +218,41 @@ def report_split(df: pd.DataFrame, split_name: str, confidence_margin: float) ->
         for cat in ["confident_correct", "marginal_correct", "marginal_misclassified", "confident_misclassified"]:
             n = int((sub["category"] == cat).sum())
             print(f"    {cat:<24}: {n}")
+
+    print("\n--- Window-level shape: percentiles BY GROUND TRUTH (mean across subjects) ---")
+    print("If patients and controls track closely at low percentiles but diverge sharply at p90+,")
+    print("that's the fat tail showing up precisely, not a uniform upward shift.")
+    pctl_cols = ["window_prob_p10", "window_prob_p25", "window_prob_median", "window_prob_p75", "window_prob_p90", "window_prob_p95", "window_prob_p99"]
+    for gt in (1, 0):
+        label_name = "positive/patient" if gt == 1 else "negative/control"
+        sub = df[df["ground_truth"] == gt]
+        if len(sub) == 0:
+            continue
+        means = sub[pctl_cols].mean()
+        print(
+            f"  ground_truth={gt} ({label_name}): "
+            f"p10={means['window_prob_p10']:.4f} p25={means['window_prob_p25']:.4f} "
+            f"median={means['window_prob_median']:.4f} p75={means['window_prob_p75']:.4f} "
+            f"p90={means['window_prob_p90']:.4f} p95={means['window_prob_p95']:.4f} p99={means['window_prob_p99']:.4f}"
+        )
+
+    print("\n--- Tail fraction (fraction of a subject's own windows scoring >= threshold) BY GROUND TRUTH ---")
+    for gt in (1, 0):
+        label_name = "positive/patient" if gt == 1 else "negative/control"
+        sub = df[df["ground_truth"] == gt]["tail_fraction"]
+        if len(sub) == 0:
+            continue
+        print(f"  ground_truth={gt} ({label_name}): mean={sub.mean():.4f} median={sub.median():.4f}")
+
+    print("\n--- Mean per-window naive-label CE loss BY GROUND TRUTH (the elevated-loss prediction) ---")
+    print("If the fat-tail hypothesis is right, positive subjects should show a MEANINGFULLY HIGHER")
+    print("value here than negative subjects -- most of their windows score low but are labeled 1.")
+    for gt in (1, 0):
+        label_name = "positive/patient" if gt == 1 else "negative/control"
+        sub = df[df["ground_truth"] == gt]["mean_naive_ce_loss"]
+        if len(sub) == 0:
+            continue
+        print(f"  ground_truth={gt} ({label_name}): mean={sub.mean():.4f} median={sub.median():.4f}")
 
 
 def main():
