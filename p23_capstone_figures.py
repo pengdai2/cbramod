@@ -14,7 +14,13 @@ deliberately NOT one of them (it collapses the between-subject/within-subject di
 investigation has been careful to keep separate throughout).
 
   1. between_subject.png     -- per-subject means, patient vs control: box + jittered points.
-                                 Answers "is there a broad, cohort-wide group difference?"
+                                 Answers "is there a broad, cohort-wide group difference?" Each
+                                 subject sits at the SAME horizontal slot in every panel (ordered by
+                                 their own model probability), so one subject's profile can be
+                                 tracked across quantities by eye. If a --stratification-csv (p21's
+                                 output) is supplied, subjects model[0] misclassifies are marked
+                                 with a diamond and connected across panels -- the small subset
+                                 actually worth tracing individually.
   2. within_subject_shape.png -- per-subject percentile shape (p10-p99), averaged within each group.
                                  Answers "is a typical subject's own shift broad, or tail-concentrated?"
   3. window_level_relationship.png -- one point per subject at their own TRUE (mean band power,
@@ -31,16 +37,23 @@ Usage:
     python p23_capstone_figures.py \
         --window-csv val_ckpt/absolute_band_power_analysis.csv \
         --window-csv test_ckpt/absolute_band_power_analysis.csv \
+        --stratification-csv model0_confidence_stratification.csv \
         --output-dir figures/
+
+--stratification-csv is optional -- it's p21_model0_confidence_stratification.py's own already-saved
+output, read here only to flag which subjects it marked is_correct == False. No new model inference
+or threshold computation happens in this script either way (the threshold was already applied once,
+by p21, using model[0]'s own calibrated value from its checkpoint).
 """
 
 import argparse
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import ConnectionPatch
 import numpy as np
 import pandas as pd
 
@@ -79,6 +92,13 @@ def parse_cli_args() -> argparse.Namespace:
         "--window-csv", action="append", required=True, dest="window_csvs",
         help="Path to a p09k (or p09f) output CSV. Repeat this flag to combine multiple runs."
     )
+    parser.add_argument(
+        "--stratification-csv", action="append", default=None, dest="stratification_csvs",
+        help="Optional: path to p21_model0_confidence_stratification.py's output CSV (repeatable). "
+             "If given, subjects with is_correct == False are flagged as misclassified in "
+             "between_subject.png. Never used to compute anything, just to read an already-decided "
+             "flag off an already-calibrated threshold."
+    )
     parser.add_argument("--output-dir", type=str, default="figures")
     parser.add_argument("--dpi", type=int, default=150)
     return parser.parse_args()
@@ -99,35 +119,134 @@ def load_windows(window_csvs: List[str]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True)
 
 
+def load_stratification(stratification_csvs: Optional[List[str]]) -> Optional[pd.DataFrame]:
+    """Reads p21's already-saved per-subject output, if given -- just the is_correct flag (and
+    category, if present), never recomputed here. Returns None if no CSV was passed, so callers can
+    skip misclassification flagging entirely rather than fabricating a flag from scratch."""
+    if not stratification_csvs:
+        return None
+    frames = []
+    for csv_path in stratification_csvs:
+        path = Path(csv_path)
+        if not path.exists():
+            raise FileNotFoundError(f"--stratification-csv not found: {path}")
+        df = pd.read_csv(path)
+        missing = {"subject_id", "is_correct"} - set(df.columns)
+        if missing:
+            raise ValueError(f"{path} is missing {missing} -- not a p21 output CSV?")
+        cols = ["subject_id", "is_correct"] + (["category"] if "category" in df.columns else [])
+        frames.append(df[cols])
+        print(f"Loaded {len(df)} subject rows from {path}")
+    combined = pd.concat(frames, ignore_index=True)
+    dup = combined["subject_id"].duplicated()
+    if dup.any():
+        print(f"[Warning] {int(dup.sum())} duplicate subject_id rows across --stratification-csv "
+              f"inputs -- keeping the first occurrence of each.")
+        combined = combined.drop_duplicates(subset="subject_id", keep="first")
+    return combined
+
+
+def compute_subject_jitter_positions(subject_df: pd.DataFrame, width: float = 0.12) -> pd.Series:
+    """One FIXED x-offset per subject, ordered by that subject's own model window probability,
+    reused identically across every panel -- so the same subject sits at the same relative
+    horizontal slot in every subplot. This is what lets a viewer visually track one subject's
+    profile across quantities (without needing a connecting line for every subject, which would be
+    overwhelming with this many points) -- the misclassified subjects below get an explicit
+    connecting line on top of this, since they're the few actually worth tracing individually."""
+    order_col = "probability_mean" if "probability_mean" in subject_df.columns else "subject_id"
+    offsets = pd.Series(0.0, index=subject_df.index)
+    for gt in (0, 1):
+        idx = subject_df.index[subject_df["ground_truth"] == gt]
+        if len(idx) == 0:
+            continue
+        ordered = subject_df.loc[idx, order_col].sort_values().index
+        positions = np.linspace(-width, width, len(ordered)) if len(ordered) > 1 else np.array([0.0])
+        offsets.loc[ordered] = positions
+    return offsets
+
+
 def plot_between_subject(subject_df: pd.DataFrame, output_path: Path, dpi: int) -> None:
     """One panel per quantity: boxplot of each subject's own mean, patient vs. control, with
-    individual subjects jittered on top so overlap/outliers/n are visible, not just the summary box."""
+    individual subjects jittered on top so overlap/outliers/n are visible, not just the summary box.
+
+    Two additions on top of the basic box+jitter:
+      - Each subject gets a FIXED x-offset (compute_subject_jitter_positions), identical in every
+        panel, so the same subject can be visually tracked across quantities by horizontal position
+        alone.
+      - Subjects model[0] misclassifies (subject_df["is_correct"] == False, from an optionally
+        merged p21 stratification CSV) are drawn as a distinct diamond marker in every panel and
+        connected across panels with a thin dashed line -- the small subset actually worth tracing
+        explicitly, since their whole profile across quantities is the point (does a misclassified
+        subject's real physiology simply look like the other group on every axis?)."""
     specs = [s for s in FEATURE_SPECS if f"{s['col']}_mean" in subject_df.columns]
-    fig, axes = plt.subplots(1, len(specs), figsize=(3.4 * len(specs), 4.2))
+    fig, axes = plt.subplots(1, len(specs), figsize=(3.4 * len(specs), 4.4))
     if len(specs) == 1:
         axes = [axes]
-    rng = np.random.default_rng(0)
 
-    for ax, spec in zip(axes, specs):
+    jitter = compute_subject_jitter_positions(subject_df)
+    has_strat = "is_correct" in subject_df.columns
+    misclassified_mask = (subject_df["is_correct"] == False) if has_strat else pd.Series(False, index=subject_df.index)
+    n_misclassified = int(misclassified_mask.sum())
+
+    # subject_id -> {panel index -> (x, y)}, filled in while drawing so misclassified subjects can
+    # be connected across panels afterward without a second pass over the raw data.
+    misclassified_points = {sid: {} for sid in subject_df.loc[misclassified_mask, "subject_id"]}
+
+    for panel_idx, (ax, spec) in enumerate(zip(axes, specs)):
         col = f"{spec['col']}_mean"
+
+        for gt in (0, 1):
+            group_idx = subject_df.index[(subject_df["ground_truth"] == gt) & subject_df[col].notna()]
+            x_pos = pd.Series((1 if gt == 0 else 2), index=group_idx) + jitter.loc[group_idx]
+            vals = subject_df.loc[group_idx, col]
+
+            normal_idx = group_idx[~misclassified_mask.loc[group_idx]]
+            mis_idx = group_idx[misclassified_mask.loc[group_idx]]
+
+            ax.scatter(x_pos.loc[normal_idx], vals.loc[normal_idx], color=GROUP_STYLE[gt]["color"],
+                       alpha=0.6, s=18, zorder=3, edgecolors="none")
+            if len(mis_idx) > 0:
+                ax.scatter(x_pos.loc[mis_idx], vals.loc[mis_idx], color=GROUP_STYLE[gt]["color"],
+                           alpha=0.95, s=70, zorder=5, marker="D", edgecolors="black", linewidths=1.2)
+            for sid, x, y in zip(subject_df.loc[mis_idx, "subject_id"], x_pos.loc[mis_idx], vals.loc[mis_idx]):
+                misclassified_points[sid][panel_idx] = (x, y)
+
         data_by_group = [subject_df.loc[subject_df["ground_truth"] == gt, col].dropna() for gt in (0, 1)]
         bp = ax.boxplot(data_by_group, tick_labels=[GROUP_STYLE[0]["label"], GROUP_STYLE[1]["label"]],
-                         showfliers=False, widths=0.5, patch_artist=True)
+                         showfliers=False, widths=0.5, patch_artist=True, zorder=1)
         for patch, gt in zip(bp["boxes"], (0, 1)):
             patch.set_facecolor(GROUP_STYLE[gt]["color"])
             patch.set_alpha(0.25)
-        for i, (gt, vals) in enumerate(zip((0, 1), data_by_group), start=1):
-            jitter = rng.uniform(-0.12, 0.12, size=len(vals))
-            ax.scatter(np.full(len(vals), i) + jitter, vals, color=GROUP_STYLE[gt]["color"],
-                       alpha=0.6, s=18, zorder=3, edgecolors="none")
+
         ax.set_title(spec["label"], fontsize=10)
         ax.tick_params(axis="x", labelsize=9)
 
-    fig.suptitle("Between-subject: does the group difference show up broadly across the cohort?", fontsize=11)
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    # Connect each misclassified subject's points across consecutive panels -- the ONLY subjects
+    # traced this way (typically a handful), so this stays legible instead of overwhelming.
+    for points in misclassified_points.values():
+        panel_indices = sorted(points.keys())
+        for a, b in zip(panel_indices, panel_indices[1:]):
+            con = ConnectionPatch(
+                xyA=points[a], coordsA="data", axesA=axes[a],
+                xyB=points[b], coordsB="data", axesB=axes[b],
+                color="black", linestyle="--", linewidth=0.8, alpha=0.5, zorder=4,
+            )
+            fig.add_artist(con)
+
+    if n_misclassified:
+        misclass_handle = plt.Line2D([0], [0], marker="D", color="none", markerfacecolor="gray",
+                                      markeredgecolor="black", markersize=8, linestyle="none",
+                                      label=f"Misclassified by model[0] (n={n_misclassified})")
+        axes[0].legend(handles=[misclass_handle], fontsize=8, loc="upper left")
+
+    subtitle = "Between-subject: does the group difference show up broadly across the cohort?"
+    if has_strat:
+        subtitle += " (same subject = same slot in every panel; diamonds = misclassified)"
+    fig.suptitle(subtitle, fontsize=10.5)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
     fig.savefig(output_path, dpi=dpi)
     plt.close(fig)
-    print(f"Saved {output_path}")
+    print(f"Saved {output_path}" + (f" ({n_misclassified} misclassified subjects flagged)" if has_strat else ""))
 
 
 def plot_within_subject_shape(subject_df: pd.DataFrame, output_path: Path, dpi: int) -> None:
@@ -293,6 +412,17 @@ def main():
     print(f"Subject-level summary: {len(subject_df)} subjects "
           f"({int((subject_df['ground_truth'] == 1).sum())} patients, "
           f"{int((subject_df['ground_truth'] == 0).sum())} controls)")
+
+    strat_df = load_stratification(args.stratification_csvs)
+    if strat_df is not None:
+        subject_df = subject_df.merge(strat_df, on="subject_id", how="left")
+        n_matched = subject_df["is_correct"].notna().sum()
+        n_unmatched = len(subject_df) - n_matched
+        print(f"Merged stratification data: {n_matched} subjects matched"
+              + (f", {n_unmatched} had no match in --stratification-csv (not flagged)" if n_unmatched else ""))
+    else:
+        print("No --stratification-csv given -- misclassified subjects will not be flagged in "
+              "between_subject.png (see p21_model0_confidence_stratification.py to generate one).")
 
     plot_between_subject(subject_df, output_dir / "between_subject.png", args.dpi)
     plot_within_subject_shape(subject_df, output_dir / "within_subject_shape.png", args.dpi)
