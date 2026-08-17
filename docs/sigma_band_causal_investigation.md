@@ -704,6 +704,201 @@ picking it back up:
 
 ---
 
+## 10. Revisiting "Windows Have No Ground Truth" — Bootstrapped Labels, and What the Raw Data Actually Shows
+
+### 10.1 Motivation: challenging a premise from Chapter 9
+
+Chapter 9's framing of Option C rested on a claim made even earlier, back when the original "train
+each window with its own label" aspiration was first dismissed: *windows don't have independent
+ground truth*. That's true in the literal sense — there's no per-window clinical annotation. But it
+was pointed out that this understates what's actually available: model[0] (the naive, collective-
+assumption probe from `p08b` — the same probe every prior chapter treats as a validated baseline) has
+already been shown to (a) deliver decent subject-level performance under both p85 and Option A's
+learned pooling, and (b) produce window-level scores that are physically grounded (the sigma
+mechanism traced in Chapters 3–4 lives *in this exact probe*). Taken together, that's evidence the
+window-level scores model[0] already produces are "somewhat sensible" — a meaningfully better
+starting point for a bootstrapped pseudo-label than asking a from-scratch standard-MI probe (Option
+C) to pick out its own top-k windows with zero prior grounding at all.
+
+The proposed design: use model[0]'s own window-level probabilities to generate pseudo-labels
+(confidence-weighted, stratified by subject-level correctness), then train a new attention-MIL model
+against those pseudo-labels — an iterative-refinement idea, with the details of exactly how to
+threshold/weight pseudo-labels by subject-level confidence left open pending a stratification
+analysis of model[0]'s own behavior first.
+
+### 10.2 A tangential detour that reframed the whole question
+
+Before pseudo-labeling could be designed, a sharper diagnostic question came up: if model[0] had
+actually learned to distinguish symptomatic windows from normal-looking windows within a patient's
+recording (rather than just blindly fitting the collective-assumption label onto every window), the
+window-level training/validation loss should be *large*, not small — a model faithfully learning
+"most of this patient's windows look normal, a minority look abnormal" would necessarily rack up
+loss on all the normal-looking windows it's being told (falsely, under the collective assumption) are
+positive. A small window-level loss would instead suggest the model simply learned to push *every*
+window of a patient upward, uniformly — indistinguishable from just memorizing subject identity.
+
+This is a real, useful diagnostic — but it only bears on the *training objective's own loss value*,
+which needed to be separately verified from model[0]'s original training run, not on what its window-
+probability *distribution* looks like post-hoc. That distinction surfaced a second, independent
+question worth checking directly: had `p09c` really shown a *fat tail* (most windows low, a minority
+of patient windows spiking high), as recalled? `p21_model0_confidence_stratification.py` was built to
+verify this properly — stratifying subjects by model[0]'s subject-level correctness/confidence, then
+computing per-subject window-probability percentiles (p10 through p99) and a proper per-subject naive
+cross-entropy loss, rather than relying on a five-day-old recollection of a different script's plot.
+
+**The real result overturned the recollection.** Model[0]'s window-probability shift between patients
+and controls is a *broad* one — the whole percentile ladder (not just the upper tail) shifts, not a
+"mostly-low-with-a-spiking-minority" pattern. And **mean per-subject naive cross-entropy loss was
+*lower*, not higher, for patients** — the opposite of what the "large loss if truly discriminating
+per-window content" hypothesis predicted. Taken at face value, that's evidence pointing toward the
+less charitable interpretation: model[0] leans more on a broad, whole-recording shift than on
+correctly isolating a genuine abnormal minority within each patient's own recording.
+
+### 10.3 Does that broad shift reflect real physiology, or a labeling artifact?
+
+A model showing a broad shift is exactly consistent with *either* of two very different underlying
+stories: (a) the group-level physiological difference itself is broad (most of a patient's sleep,
+not just isolated moments, differs from a control's), in which case a broad model output is the
+*correct* thing to learn; or (b) the collective-assumption training procedure mechanically manufactures
+a broad shift as an artifact of its own objective (which rewards uniformly separating *every* window
+of a patient from every window of a control, regardless of whether the underlying signal actually
+supports that), in which case the same broad shift would appear whether or not real signal is broad.
+Model[0]'s own output shape can't distinguish these — a model-free check of the raw data was needed.
+
+**Direct, model-free band-power comparison** (`p22_ground_truth_band_power_comparison.py`, reading
+already-saved `p09k`/`p09f` output — no model inference at all) answered the between-subject version
+of this question cleanly:
+- **Sigma power and spindle count (YASA) are lower in patients** — consistent across mean, median,
+  p25, and p75 (i.e., a broad group-level effect, not a few outlier subjects skewing a mean), with
+  `n_spindles` reaching clear statistical significance (Mann-Whitney p ≈ 0.003–0.005). This is the
+  cleanest possible confirmation available for the spindle-deficit story: it doesn't depend on the
+  model at all.
+- **Delta power and slow-wave count (YASA) are *higher* in patients** — the opposite direction from
+  the (weaker, less-established) reduced-SWA literature hypothesis that Chapter 6 had used to
+  characterize Option C's delta finding as "directionally plausible." That characterization needs
+  correcting: relative to *this cohort's actual raw data*, patients showing more, not less, delta/
+  slow-wave activity is itself a surprise, independent of anything any model learned.
+
+**Extending to the within-subject shape** (does a *typical* subject's own recording show this
+group difference spread broadly across their own windows, or concentrated in a tail?) sharpened the
+delta picture further: comparing each subject's own window-level percentiles (p10 through p99,
+averaged within each ground-truth group) showed sigma essentially flat-to-slightly-higher only at the
+extreme low end but consistently lower for patients through the rest of the range, while delta's p10
+tracked closely between groups (no shift at the very bottom of a typical patient's recording) but
+every other percentile (p25 through p99) ran higher for patients — six of seven percentiles moving the
+same direction is a broad, not tail-concentrated, effect for delta too, just with the very lowest
+decile as a narrow exception rather than the rule.
+
+**Synthesis.** The raw data itself — with no model in the loop — shows the same qualitative "broad
+shift" shape that model[0]'s window probability shows, for both sigma (lower in patients, matching
+the causally-validated direction) and delta (higher in patients, a real but previously mischaracterized
+group difference). That's consistent with model[0]'s own broad output shift being at least partly
+driven by real, broadly-distributed content, rather than being purely a labeling-procedure artifact —
+though it does not rule out the collective-assumption training objective *also* contributing some
+additional, artifact-driven amplification of that broadness on top of whatever the real signal alone
+would produce. Both explanations can be true simultaneously and additively; the raw-data check only
+establishes that the "real signal" component is genuinely present and genuinely broad, not that it is
+the sole contributor.
+
+### 10.4 Two corrections to earlier reasoning, made explicit
+
+1. **The "coherent hypothesis" overreach.** An earlier attempt to explain *both* surprises (delta's
+   reversed-from-literature raw-data direction, and Option C's reversed-from-everything-else sigma
+   causality) with a single unifying story (antipsychotic medication) conflated two genuinely separate
+   questions. Medication is a reasonable candidate explanation for the first — a fact about this
+   cohort's raw data, independent of any model. It is not needed to explain the second, which Chapter
+   9.5 already fully accounts for via the self-reinforcing selection loop, a mechanism specific to how
+   Option C was trained, requiring no external confound at all.
+2. **Delta's within-subject shape was initially overstated as "not broad."** The correct
+   characterization, per 10.3, is that six of seven within-subject percentiles move in the same
+   direction — a broad shift with one narrow exception at the lowest decile, not a fundamentally
+   different (tail-concentrated) shape from sigma's.
+
+### 10.5 A retracted next step, and why
+
+A natural-seeming follow-up — apply this same shape-comparison methodology to Option C's window-level
+probe, expecting its shape to *fail* to mirror the raw data (since Option C's sigma relationship is
+causally reversed) — was proposed and then retracted on direct challenge. The objection: Option C's
+full design has two moving parts (a window-level probe, and — if a Stage 2 were ever built — a
+learned attention aggregator on top), and Chapter 6.4 already demonstrated, in Option A, that a
+learned attention gate operating on an already-frozen per-window scalar can *substantially reshape*
+the aggregate causal signal (a 2–3× amplification of the raw slope relative to what the frozen probe
+alone would produce, purely by choosing which windows to trust). Given that established capacity for
+attention to reshape — and not merely relay — whatever a frozen per-window scorer provides, there is
+no basis for assuming a hypothetical Option C Stage 2 would preserve Stage 1's confound at the final,
+pooled level rather than masking it. A shape-comparison test on Option C's Stage-1 probe alone would
+only characterize Stage 1 in isolation; it would not be a decisive test of a full two-stage Option C
+system that was never actually built past Stage 1. Since Option C is already set aside (Chapter 9.6),
+this extension isn't worth pursuing further absent a decision to revive the whole architecture.
+
+### 10.6 Where this leaves the pseudo-labeling idea
+
+The bootstrapped-pseudo-label proposal that opened this chapter (10.1) remains conceptually sound —
+model[0]'s window scores are shown here to reflect real, broadly-distributed physiological content,
+not merely a labeling artifact — but the detour through 10.2–10.5 surfaced enough separate, load-
+bearing findings (the loss-magnitude check, the raw-data broad-shift confirmation, the delta
+mischaracterization, the Option C retraction) that it's a natural place to pause and consolidate
+before designing the pseudo-labeling mechanics themselves. That design work — exactly how to threshold
+or weight pseudo-labels by subject-level confidence — remains open for a future session.
+
+---
+
+## 11. Closing the Labeling-Scheme Thread: Why the Episodic Premise Was Wrong
+
+Chapters 9 and 10 traced a long line of pursuit — from the original "train each window with its own
+label" aspiration, through the collective-vs-standard-MI framing, to Option C's asymmetric loss and
+its diagnosed self-reinforcing failure, through to bootstrapped pseudo-labeling as a proposed fix —
+all in service of one underlying goal: find a window-labeling scheme that better reflects physical
+reality than the collective assumption's crude "every window shares the subject's label." That entire
+pursuit rested on an unexamined premise, and Chapter 10's data made it possible to name precisely: that
+patients and controls share a common physiological *baseline*, with patients additionally exhibiting a
+discoverable minority of symptomatic, episodic windows layered on top. Standard-MI's asymmetric loss,
+Option C's top-k selection, and the pseudo-labeling proposal were all, in different ways, machinery
+built to find that minority — none of it makes sense without a genuine baseline/episode mixture to find.
+
+**The data refutes that premise directly, at both the level it needed to hold.** Between subjects,
+Chapter 10's raw band-power comparison showed patients and controls differ broadly across the cohort,
+not via a handful of extreme subjects. Within a single subject's own recording — the level that
+actually matters for whether "some windows are episodes, most are baseline" is true — the percentile
+comparison showed six or more of seven percentiles shifted in the same direction for both sigma and
+delta, including the low-to-middle percentiles that should represent a patient's "normal" baseline if
+the episodic model held. There is no discoverable, mostly-normal baseline sitting underneath a few
+abnormal windows to select for; the shift runs through the bulk of the distribution.
+
+**In hindsight, this is exactly what the underlying literature already implied.** The schizophrenia
+sleep-spindle-deficit finding this whole investigation traces back to is described as a *trait*
+marker — a stable, persistent signature of thalamocortical circuit dysfunction — not a *state* marker
+tied to momentary symptom flares. A trait-level deficit should manifest as a diffuse, whole-recording
+shift, which is precisely the shape Chapter 10 found. The episodic mental model this chapter's whole
+pursuit was built on was importing a state-based intuition (symptoms come and go, so windows should
+too) onto a mechanism that the literature had already characterized as trait-based (present
+throughout, not intermittent).
+
+**This closes the labeling-scheme thread, not with a solution, but with a correction to what was being
+solved for.** The collective assumption's apparent crudeness — asserting every window of a patient is
+independently diagnostic — is not a good *literal* description of any single window (no one window
+truly "proves" the diagnosis on its own), but it is a far closer *structural* match to a diffuse trait
+shift than standard-MI's episodic framing ever was. Pursuing an "improved," more physically grounded
+window-labeling scheme was, throughout Chapters 9–10, chasing a structure this cohort's actual
+physiology does not have. Option C's failure (Chapter 9) and the self-reinforcing selection loop that
+caused it were not simply a tuning or architecture problem to eventually solve with a better MIL
+variant — the entire family of episodic-instance-selection approaches was solving for a mixture that
+isn't there.
+
+**What this redirects effort toward, going forward**: not a better labeling scheme, but a better
+per-window *estimator* of a signal that is genuinely diffuse. Option A's attention mechanism, read
+under this framing, was already doing approximately the right kind of thing — not discovering which
+windows are "the diagnostic ones" (there may be no such sparse subset), but learning an
+informativeness/SNR axis (favoring N2 over N3, delta-light over delta-heavy windows) that concentrates
+weight where a diffusely-present signal is cleanest to read. Option B's finding that plain averaging
+over hundreds of windows was already a strong subject-level estimator (7.4) points the same
+direction — this is fundamentally a denoising-and-averaging problem, not an instance-selection problem,
+and the law-of-large-numbers behavior observed there is the expected signature of a diffuse, not
+episodic, ground truth. Any future refinement of this pipeline should build on that premise rather than
+resurrecting instance-selection machinery aimed at a mixture the data has now shown does not exist.
+
+---
+
 ## Appendix A: Data Preparation & Cleansing
 
 **Referencing.** Recordings are re-referenced (A1/A2 linked-earlobe reference, matching the
