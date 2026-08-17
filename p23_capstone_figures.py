@@ -18,20 +18,28 @@ investigation has been careful to keep separate throughout).
                                  subject sits at the SAME horizontal slot in every panel (ordered by
                                  their own model probability), so one subject's profile can be
                                  tracked across quantities by eye. If a --stratification-csv (p21's
-                                 output) is supplied, subjects model[0] misclassifies are marked
-                                 with a diamond and connected across panels -- the small subset
-                                 actually worth tracing individually.
-  2. within_subject_shape.png -- per-subject percentile shape (p10-p99), averaged within each group.
-                                 Answers "is a typical subject's own shift broad, or tail-concentrated?"
+                                 output) is supplied, subjects model[0] misclassifies are marked with
+                                 a diamond AND a small number (stable across panels and shared with
+                                 Figure 3) -- numbers rather than connecting lines, which get visually
+                                 overwhelming fast.
+  2. within_subject_shape.png -- for each percentile (p10-p99), the MEAN ACROSS SUBJECTS of that
+                                 subject's own percentile value -- i.e. average-of-percentiles, not a
+                                 single representative "typical" subject and not a median-of-subjects.
+                                 Answers "is a group's typical shift broad, or tail-concentrated?"
   3. window_level_relationship.png -- one point per subject at their own TRUE (mean band power,
                                  mean probability), with a short tangent line through it showing
-                                 that subject's OWN within-subject slope (fit using only their own
-                                 windows). Point position shows the between-subject offset (should
+                                 that subject's OWN within-subject slope (simple OLS fit of
+                                 probability on band power, using only that subject's own windows;
+                                 tangent length is a FIXED value shared by every subject in the
+                                 panel -- the median subject's own data spread -- not that subject's
+                                 actual range, chosen so a few wide-spread subjects don't visually
+                                 dominate). Point position shows the between-subject offset (should
                                  match between_subject.png); tangent direction shows the within-
                                  subject relationship -- deliberately kept separate rather than
                                  collapsed into one pooled or fully-centered trend line, which can
                                  only show one of these two facts at a time and risks looking like
-                                 it denies the other.
+                                 it denies the other. Misclassified subjects (same numbering as
+                                 Figure 1) are marked here too.
 
 Usage:
     python p23_capstone_figures.py \
@@ -53,7 +61,6 @@ from typing import List, Optional
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from matplotlib.patches import ConnectionPatch
 import numpy as np
 import pandas as pd
 
@@ -146,6 +153,28 @@ def load_stratification(stratification_csvs: Optional[List[str]]) -> Optional[pd
     return combined
 
 
+def assign_misclassified_numbers(subject_df: pd.DataFrame) -> pd.DataFrame:
+    """Adds a 'misclassified_number' column (1, 2, 3, ... for subjects with is_correct == False, NaN
+    for everyone else), in a stable subject_id-sorted order -- shared between Figure 1 and Figure 3
+    so the same subject carries the same number in both, without needing to draw a connecting line
+    between figures (or, within Figure 1, across panels -- see plot_between_subject)."""
+    if "is_correct" not in subject_df.columns:
+        subject_df = subject_df.copy()
+        subject_df["misclassified_number"] = np.nan
+        return subject_df
+    subject_df = subject_df.copy()
+    mis_ids = sorted(subject_df.loc[subject_df["is_correct"] == False, "subject_id"])
+    numbering = {sid: i + 1 for i, sid in enumerate(mis_ids)}
+    subject_df["misclassified_number"] = subject_df["subject_id"].map(numbering)
+    if numbering:
+        print("Misclassified subject numbering (shared across figures):")
+        for sid, num in numbering.items():
+            row = subject_df.loc[subject_df["subject_id"] == sid].iloc[0]
+            cat = f", {row['category']}" if "category" in subject_df.columns and pd.notna(row.get("category")) else ""
+            print(f"  #{num}: {sid} (ground_truth={int(row['ground_truth'])}{cat})")
+    return subject_df
+
+
 def compute_subject_jitter_positions(subject_df: pd.DataFrame, width: float = 0.12) -> pd.Series:
     """One FIXED x-offset per subject, ordered by that subject's own model window probability,
     reused identically across every panel -- so the same subject sits at the same relative
@@ -173,11 +202,10 @@ def plot_between_subject(subject_df: pd.DataFrame, output_path: Path, dpi: int) 
       - Each subject gets a FIXED x-offset (compute_subject_jitter_positions), identical in every
         panel, so the same subject can be visually tracked across quantities by horizontal position
         alone.
-      - Subjects model[0] misclassifies (subject_df["is_correct"] == False, from an optionally
-        merged p21 stratification CSV) are drawn as a distinct diamond marker in every panel and
-        connected across panels with a thin dashed line -- the small subset actually worth tracing
-        explicitly, since their whole profile across quantities is the point (does a misclassified
-        subject's real physiology simply look like the other group on every axis?)."""
+      - Subjects model[0] misclassifies (subject_df["misclassified_number"] not NaN, from
+        assign_misclassified_numbers) are drawn as a distinct diamond marker with a small number next
+        to it in every panel -- a small numeric label rather than a connecting line across panels,
+        which gets visually overwhelming fast with more than a couple of flagged subjects."""
     specs = [s for s in FEATURE_SPECS if f"{s['col']}_mean" in subject_df.columns]
     fig, axes = plt.subplots(1, len(specs), figsize=(3.4 * len(specs), 4.4))
     if len(specs) == 1:
@@ -185,14 +213,10 @@ def plot_between_subject(subject_df: pd.DataFrame, output_path: Path, dpi: int) 
 
     jitter = compute_subject_jitter_positions(subject_df)
     has_strat = "is_correct" in subject_df.columns
-    misclassified_mask = (subject_df["is_correct"] == False) if has_strat else pd.Series(False, index=subject_df.index)
+    misclassified_mask = subject_df["misclassified_number"].notna() if "misclassified_number" in subject_df.columns else pd.Series(False, index=subject_df.index)
     n_misclassified = int(misclassified_mask.sum())
 
-    # subject_id -> {panel index -> (x, y)}, filled in while drawing so misclassified subjects can
-    # be connected across panels afterward without a second pass over the raw data.
-    misclassified_points = {sid: {} for sid in subject_df.loc[misclassified_mask, "subject_id"]}
-
-    for panel_idx, (ax, spec) in enumerate(zip(axes, specs)):
+    for ax, spec in zip(axes, specs):
         col = f"{spec['col']}_mean"
 
         for gt in (0, 1):
@@ -208,8 +232,10 @@ def plot_between_subject(subject_df: pd.DataFrame, output_path: Path, dpi: int) 
             if len(mis_idx) > 0:
                 ax.scatter(x_pos.loc[mis_idx], vals.loc[mis_idx], color=GROUP_STYLE[gt]["color"],
                            alpha=0.95, s=70, zorder=5, marker="D", edgecolors="black", linewidths=1.2)
-            for sid, x, y in zip(subject_df.loc[mis_idx, "subject_id"], x_pos.loc[mis_idx], vals.loc[mis_idx]):
-                misclassified_points[sid][panel_idx] = (x, y)
+                for idx in mis_idx:
+                    num = int(subject_df.loc[idx, "misclassified_number"])
+                    ax.annotate(str(num), (x_pos.loc[idx], vals.loc[idx]), textcoords="offset points",
+                                xytext=(6, 5), fontsize=7.5, fontweight="bold", zorder=6)
 
         data_by_group = [subject_df.loc[subject_df["ground_truth"] == gt, col].dropna() for gt in (0, 1)]
         bp = ax.boxplot(data_by_group, tick_labels=[GROUP_STYLE[0]["label"], GROUP_STYLE[1]["label"]],
@@ -221,27 +247,15 @@ def plot_between_subject(subject_df: pd.DataFrame, output_path: Path, dpi: int) 
         ax.set_title(spec["label"], fontsize=10)
         ax.tick_params(axis="x", labelsize=9)
 
-    # Connect each misclassified subject's points across consecutive panels -- the ONLY subjects
-    # traced this way (typically a handful), so this stays legible instead of overwhelming.
-    for points in misclassified_points.values():
-        panel_indices = sorted(points.keys())
-        for a, b in zip(panel_indices, panel_indices[1:]):
-            con = ConnectionPatch(
-                xyA=points[a], coordsA="data", axesA=axes[a],
-                xyB=points[b], coordsB="data", axesB=axes[b],
-                color="black", linestyle="--", linewidth=0.8, alpha=0.5, zorder=4,
-            )
-            fig.add_artist(con)
-
     if n_misclassified:
         misclass_handle = plt.Line2D([0], [0], marker="D", color="none", markerfacecolor="gray",
                                       markeredgecolor="black", markersize=8, linestyle="none",
-                                      label=f"Misclassified by model[0] (n={n_misclassified})")
+                                      label=f"Misclassified by model[0], numbered (n={n_misclassified})")
         axes[0].legend(handles=[misclass_handle], fontsize=8, loc="upper left")
 
     subtitle = "Between-subject: does the group difference show up broadly across the cohort?"
     if has_strat:
-        subtitle += " (same subject = same slot in every panel; diamonds = misclassified)"
+        subtitle += " (same subject = same slot in every panel; numbered diamonds = misclassified)"
     fig.suptitle(subtitle, fontsize=10.5)
     fig.tight_layout(rect=[0, 0, 1, 0.92])
     fig.savefig(output_path, dpi=dpi)
@@ -250,9 +264,14 @@ def plot_between_subject(subject_df: pd.DataFrame, output_path: Path, dpi: int) 
 
 
 def plot_within_subject_shape(subject_df: pd.DataFrame, output_path: Path, dpi: int) -> None:
-    """One panel per quantity: each subject's own window-level percentiles, averaged within each
-    group. Parallel, uniformly-separated lines across all percentiles = broad shift. Lines that
-    hug together at low percentiles and only diverge near p90+ = a fat tail, not a broad shift."""
+    """One panel per quantity. Each line point is the MEAN, ACROSS SUBJECTS IN THAT GROUP, of that
+    subject's own percentile value (e.g. the p75 point = the average of every subject's own p75,
+    each computed from that subject's own windows first) -- explicitly NOT a median-of-subjects, and
+    NOT one single representative "typical" subject; it's an average-of-percentiles, computed
+    subject-first so it never pools raw windows across subjects (see Chapter 10 of the writeup).
+    Parallel, uniformly-separated lines across all percentiles = broad shift. Lines that hug
+    together at low percentiles and only diverge near p90+ = a fat tail, not a broad shift.
+    Being a mean, this is somewhat sensitive to outlier subjects, same as any mean would be."""
     pctl_cols_template = [f"p{p}" for p in PERCENTILES]
     specs = [s for s in FEATURE_SPECS if all(f"{s['col']}_{p}" in subject_df.columns for p in pctl_cols_template)]
     fig, axes = plt.subplots(1, len(specs), figsize=(3.4 * len(specs), 4.2))
@@ -275,8 +294,8 @@ def plot_within_subject_shape(subject_df: pd.DataFrame, output_path: Path, dpi: 
 
     axes[0].legend(fontsize=9, loc="best")
     fig.suptitle(
-        "Within-subject: is a typical subject's own recording broadly shifted, or tail-concentrated?",
-        fontsize=11,
+        "Within-subject: MEAN ACROSS SUBJECTS of each subject's own percentile -- broad shift or tail-concentrated?",
+        fontsize=10.5,
     )
     fig.tight_layout(rect=[0, 0, 1, 0.94])
     fig.savefig(output_path, dpi=dpi)
@@ -322,16 +341,29 @@ def per_subject_slope_stats(windows: pd.DataFrame, x_col: str, y_col: str = "pro
     return pd.DataFrame(rows)
 
 
-def plot_window_level_relationship(windows: pd.DataFrame, output_path: Path, dpi: int) -> None:
+def plot_window_level_relationship(windows: pd.DataFrame, subject_df: pd.DataFrame, output_path: Path, dpi: int) -> None:
     """One panel per band. Each subject is ONE point at their own true (mean band power, mean
     probability) -- recovering the between-subject offset, which should visually match
     between_subject.png -- with a short tangent line through it showing that subject's OWN
-    within-subject slope (fit using only their own windows). Deliberately NOT a single pooled or
-    within-subject-centered trend line: centering alone shows the slope but erases the group
-    offset (looks like it denies a difference between_subject.png already shows); pooling raw
-    values without centering reintroduces the between-/within-subject conflation this investigation
-    has repeatedly had to catch elsewhere. Plotting both facts side by side, without collapsing
-    them into one number, avoids having to choose which one to hide."""
+    within-subject slope: a plain OLS fit of probability on band power using ONLY that subject's
+    own windows (per_subject_slope_stats). Deliberately NOT a single pooled or within-subject-
+    centered trend line: centering alone shows the slope but erases the group offset (looks like it
+    denies a difference between_subject.png already shows); pooling raw values without centering
+    reintroduces the between-/within-subject conflation this investigation has repeatedly had to
+    catch elsewhere. Plotting both facts side by side, without collapsing them into one number,
+    avoids having to choose which one to hide.
+
+    The tangent's LENGTH is not that subject's own data range -- it's a single FIXED half-length
+    (the median subject's own sd_x in this panel) applied to every subject, so a few subjects with
+    unusually wide within-subject spread don't get long, visually dominant lines that drown out the
+    pattern; only the tangent's DIRECTION (slope) is subject-specific. The bold tangent per group is
+    the same idea at the group centroid, using that group's median per-subject slope -- the single
+    clearest signal in the panel, layered on top of (not replacing) the individually noisy ticks.
+
+    Misclassified subjects (subject_df["misclassified_number"], shared numbering with Figure 1) are
+    drawn with the same diamond-plus-number marking used there."""
+    numbering = subject_df.set_index("subject_id")["misclassified_number"] if "misclassified_number" in subject_df.columns else pd.Series(dtype=float)
+
     specs = [s for s in RELATIONSHIP_BANDS if s["col"] in windows.columns]
     fig, axes = plt.subplots(1, len(specs), figsize=(5.6 * len(specs), 4.8))
     if len(specs) == 1:
@@ -341,6 +373,7 @@ def plot_window_level_relationship(windows: pd.DataFrame, output_path: Path, dpi
         col = spec["col"]
         clean = windows[["subject_id", "ground_truth", col, "probability"]].dropna()
         stats_df = per_subject_slope_stats(clean, col)
+        stats_df["misclassified_number"] = stats_df["subject_id"].map(numbering)
 
         # A FIXED tangent half-length (not each subject's own sd_x) so a handful of subjects with
         # unusually wide within-subject spread don't get visually dominant, sprawling lines that
@@ -354,8 +387,18 @@ def plot_window_level_relationship(windows: pd.DataFrame, output_path: Path, dpi
             if len(sub) == 0:
                 continue
             style = GROUP_STYLE[gt]
-            ax.scatter(sub["mean_x"], sub["mean_y"], color=style["color"], alpha=0.85, s=30,
+            normal = sub[sub["misclassified_number"].isna()]
+            mis = sub[sub["misclassified_number"].notna()]
+
+            ax.scatter(normal["mean_x"], normal["mean_y"], color=style["color"], alpha=0.85, s=30,
                        zorder=4, label=style["label"], edgecolors="white", linewidths=0.6)
+            if len(mis) > 0:
+                ax.scatter(mis["mean_x"], mis["mean_y"], color=style["color"], alpha=0.95, s=75,
+                           zorder=6, marker="D", edgecolors="black", linewidths=1.2)
+                for _, row in mis.iterrows():
+                    ax.annotate(str(int(row["misclassified_number"])), (row["mean_x"], row["mean_y"]),
+                                textcoords="offset points", xytext=(6, 5), fontsize=7.5,
+                                fontweight="bold", zorder=7)
             for _, row in sub.iterrows():
                 half = tick_half_length
                 x0, x1 = row["mean_x"] - half, row["mean_x"] + half
@@ -378,9 +421,11 @@ def plot_window_level_relationship(windows: pd.DataFrame, output_path: Path, dpi
         ax.text(
             0.02, 0.02,
             f"within-subject median r\npatient: {r_patient:+.2f}   control: {r_control:+.2f}\n"
-            f"(dot = subject mean; faint tick = that subject's own slope;\n"
-            f"bold tick = group median slope at group centroid)",
-            transform=ax.transAxes, fontsize=8, va="bottom", ha="left",
+            f"(dot = subject mean; faint tick = that subject's own slope,\n"
+            f"drawn at a FIXED shared length, not their own data range;\n"
+            f"bold tick = group median slope at group centroid;\n"
+            f"numbered diamond = misclassified by model[0])",
+            transform=ax.transAxes, fontsize=7.5, va="bottom", ha="left",
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.75, edgecolor="lightgray"),
         )
         ax.set_xlabel(spec["label"], fontsize=9)
@@ -421,12 +466,13 @@ def main():
         print(f"Merged stratification data: {n_matched} subjects matched"
               + (f", {n_unmatched} had no match in --stratification-csv (not flagged)" if n_unmatched else ""))
     else:
-        print("No --stratification-csv given -- misclassified subjects will not be flagged in "
-              "between_subject.png (see p21_model0_confidence_stratification.py to generate one).")
+        print("No --stratification-csv given -- misclassified subjects will not be flagged "
+              "(see p21_model0_confidence_stratification.py to generate one).")
+    subject_df = assign_misclassified_numbers(subject_df)
 
     plot_between_subject(subject_df, output_dir / "between_subject.png", args.dpi)
     plot_within_subject_shape(subject_df, output_dir / "within_subject_shape.png", args.dpi)
-    plot_window_level_relationship(windows, output_dir / "window_level_relationship.png", args.dpi)
+    plot_window_level_relationship(windows, subject_df, output_dir / "window_level_relationship.png", args.dpi)
 
 
 if __name__ == "__main__":
