@@ -899,6 +899,41 @@ resurrecting instance-selection machinery aimed at a mixture the data has now sh
 
 ---
 
+## 12. A Concrete Case Study: Are model[0]'s Misclassifications Legible?
+
+As a final, concrete check on the sigma mechanism, `p23_capstone_figures.py`'s figures (`between_subject.png`,
+`window_level_relationship.png`) were used to inspect model[0]'s misclassified subjects individually,
+rather than only in aggregate. Cross-referencing which patients model[0] scores below its calibrated
+threshold (false negatives) against their own sigma/spindle and delta/slow-wave levels within the
+patient group:
+
+**Five of six misclassified patients (test cohort) are cleanly explained by the established sigma
+mechanism.** Each shows above-average, control-like sigma power and spindle count relative to the
+rest of the patient group — exactly the subjects model[0]'s own validated decision rule (elevated
+sigma/spindle activity pushes predicted probability toward "control") would be expected to miss. This
+is a sharper form of validation than the aggregate correlational/causal evidence in Chapters 3–4: it
+shows the mechanism accounts for the model's specific mistakes, not just its successes.
+
+**The sixth (subject GRINS0001) remains a genuine, unexplained exception.** It does not show elevated
+sigma/spindle activity like the other five. It does show an elevated delta/slow-wave level relative
+to the rest of the patient group, which initially looked like the same story playing out through the
+other validated band (delta's own within-subject relationship with probability is negative in
+patients, per Chapter 10's `window_level_relationship.png`). That explanation doesn't survive a direct
+check, though: GRINS0001's *own* fitted within-subject slope for delta is not negative. The mistake
+here was conflating a between-subject fact (GRINS0001 sits at an elevated delta *level* relative to
+other patients) with a within-subject one (whether *their own* windows show probability moving with
+delta) — precisely the distinction `window_level_relationship.png` was built to keep visually
+separate, re-made here in the reasoning about it despite the figure's own design. GRINS0001's data
+quality is otherwise clean (>1000 windows, ~3% rejection rate), ruling out a data-quality artifact;
+being subject #1 in cohort order looks like coincidence, not a pipeline bug.
+
+**Bottom line**: five of six misclassified patients are individually explained by the sigma mechanism
+already established throughout this investigation; the sixth is recorded honestly as an open
+exception rather than forced into a tidier story. This is left as-is rather than pursued further for
+now — a natural point to pause the investigation.
+
+---
+
 ## Appendix A: Data Preparation & Cleansing
 
 **Referencing.** Recordings are re-referenced (A1/A2 linked-earlobe reference, matching the
