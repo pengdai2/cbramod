@@ -223,25 +223,44 @@ def plot_window_level_relationship(windows: pd.DataFrame, output_path: Path, dpi
         clean = windows[["subject_id", "ground_truth", col, "probability"]].dropna()
         stats_df = per_subject_slope_stats(clean, col)
 
+        # A FIXED tangent half-length (not each subject's own sd_x) so a handful of subjects with
+        # unusually wide within-subject spread don't get visually dominant, sprawling lines that
+        # drown out the pattern -- individual per-subject slopes are already high-variance
+        # estimates from ~100-200 noisy windows each; letting a few of them stretch across most of
+        # the x-axis compounds noise with visual clutter. Sized off the median subject's spread.
+        tick_half_length = float(stats_df["sd_x"].median()) if len(stats_df) else 1.0
+
         for gt in (0, 1):
             sub = stats_df[stats_df["ground_truth"] == gt]
             if len(sub) == 0:
                 continue
             style = GROUP_STYLE[gt]
             ax.scatter(sub["mean_x"], sub["mean_y"], color=style["color"], alpha=0.85, s=30,
-                       zorder=3, label=style["label"], edgecolors="white", linewidths=0.6)
+                       zorder=4, label=style["label"], edgecolors="white", linewidths=0.6)
             for _, row in sub.iterrows():
-                half = max(row["sd_x"], 1e-9)
+                half = tick_half_length
                 x0, x1 = row["mean_x"] - half, row["mean_x"] + half
                 y0, y1 = row["mean_y"] - row["slope"] * half, row["mean_y"] + row["slope"] * half
-                ax.plot([x0, x1], [y0, y1], color=style["color"], alpha=0.55, linewidth=1.4, zorder=2)
+                ax.plot([x0, x1], [y0, y1], color=style["color"], alpha=0.35, linewidth=1.0, zorder=2)
+
+            # One bold "group average" tangent at the group's own centroid, using the group's
+            # median per-subject slope -- the single clearest signal in the panel, drawn on top of
+            # the individually-noisy per-subject ticks rather than in place of them.
+            centroid_x, centroid_y = sub["mean_x"].mean(), sub["mean_y"].mean()
+            group_slope = float(sub["slope"].median())
+            half = tick_half_length * 2.5
+            gx0, gx1 = centroid_x - half, centroid_x + half
+            gy0, gy1 = centroid_y - group_slope * half, centroid_y + group_slope * half
+            ax.plot([gx0, gx1], [gy0, gy1], color=style["color"], alpha=1.0, linewidth=3.5,
+                    zorder=5, solid_capstyle="round")
 
         r_patient = within_subject_median_spearman(clean[clean["ground_truth"] == 1], col)
         r_control = within_subject_median_spearman(clean[clean["ground_truth"] == 0], col)
         ax.text(
             0.02, 0.02,
             f"within-subject median r\npatient: {r_patient:+.2f}   control: {r_control:+.2f}\n"
-            f"(point = subject mean; tick = that subject's own slope)",
+            f"(dot = subject mean; faint tick = that subject's own slope;\n"
+            f"bold tick = group median slope at group centroid)",
             transform=ax.transAxes, fontsize=8, va="bottom", ha="left",
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.75, edgecolor="lightgray"),
         )
