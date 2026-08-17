@@ -17,11 +17,13 @@ investigation has been careful to keep separate throughout).
                                  Answers "is there a broad, cohort-wide group difference?"
   2. within_subject_shape.png -- per-subject percentile shape (p10-p99), averaged within each group.
                                  Answers "is a typical subject's own shift broad, or tail-concentrated?"
-  3. window_level_relationship.png -- window_prob vs. sigma/delta power, binned trend, split by
-                                 group. Answers the piece the other two don't: does window_prob
-                                 actually TRACK real signal, including WITHIN each group separately
-                                 (not just as a byproduct of patients/controls differing on both
-                                 quantities independently)?
+  3. window_level_relationship.png -- window_prob vs. sigma/delta power, WITHIN-SUBJECT CENTERED
+                                 (each window's value minus that subject's own mean) before binning,
+                                 split by group. Answers the piece the other two don't: does
+                                 window_prob actually TRACK real signal, including WITHIN each group
+                                 separately (not just as a byproduct of patients/controls differing
+                                 on both quantities independently, or of subject-to-subject baseline
+                                 spread within a group swamping the true within-subject slope)?
 
 Usage:
     python p23_capstone_figures.py \
@@ -188,16 +190,33 @@ def plot_window_level_relationship(
     """One panel per band: does window_prob actually track real signal, including WITHIN each group
     separately? A pooled scatter across both groups can't distinguish "probability tracks band power"
     from "patients happen to differ on both quantities independently" -- fitting the trend separately
-    within each group is what actually tests the former."""
+    within each group is what actually tests the former.
+
+    Critically, the trend itself is computed on WITHIN-SUBJECT CENTERED values (each window's value
+    minus that subject's own mean), not raw pooled values. Pooling raw values across subjects within
+    a group reintroduces exactly the between-/within-subject conflation this investigation has
+    repeatedly had to catch and correct elsewhere: with substantial subject-to-subject baseline
+    spread (see between_subject.png), a raw pooled-and-binned trend mostly traces out WHICH SUBJECT a
+    window came from, not how that subject's own probability moves with their own band power -- and
+    can visually contradict the (correctly-computed) within-subject correlation annotated on the plot.
+    Centering first makes the line consistent with what the annotation actually measures."""
     specs = [s for s in RELATIONSHIP_BANDS if s["col"] in windows.columns]
     fig, axes = plt.subplots(1, len(specs), figsize=(5.2 * len(specs), 4.6))
     if len(specs) == 1:
         axes = [axes]
-    rng = np.random.default_rng(0)
 
     for ax, spec in zip(axes, specs):
         col = spec["col"]
-        sub_all = windows[["subject_id", "ground_truth", col, "probability"]].dropna()
+        sub_all = windows[["subject_id", "ground_truth", col, "probability"]].dropna().copy()
+
+        # Within-subject centering: subtract each subject's OWN mean from their own windows, for
+        # both axes, before binning -- isolates within-subject covariation from between-subject
+        # baseline differences, which is what the annotated statistic below actually measures.
+        col_c = f"{col}_centered"
+        sub_all[col_c] = sub_all[col] - sub_all.groupby("subject_id")[col].transform("mean")
+        sub_all["probability_centered"] = (
+            sub_all["probability"] - sub_all.groupby("subject_id")["probability"].transform("mean")
+        )
 
         for gt in (0, 1):
             sub = sub_all[sub_all["ground_truth"] == gt]
@@ -207,29 +226,31 @@ def plot_window_level_relationship(
 
             if scatter_sample > 0:
                 sample = sub.sample(n=min(scatter_sample, len(sub)), random_state=0)
-                ax.scatter(sample[col], sample["probability"], color=style["color"], alpha=0.10,
-                           s=10, edgecolors="none", zorder=1)
+                ax.scatter(sample[col_c], sample["probability_centered"], color=style["color"],
+                           alpha=0.10, s=10, edgecolors="none", zorder=1)
 
             try:
-                bins = pd.qcut(sub[col], q=n_bins, duplicates="drop")
+                bins = pd.qcut(sub[col_c], q=n_bins, duplicates="drop")
             except ValueError:
                 continue
             binned = sub.groupby(bins, observed=True).agg(
-                x=(col, "mean"), y=("probability", "mean")
+                x=(col_c, "mean"), y=("probability_centered", "mean")
             ).dropna()
             ax.plot(binned["x"], binned["y"], color=style["color"], linestyle=style["linestyle"],
                     marker=style["marker"], label=style["label"], markersize=5, zorder=3, linewidth=2)
 
         r_patient = within_subject_median_spearman(sub_all[sub_all["ground_truth"] == 1], col)
         r_control = within_subject_median_spearman(sub_all[sub_all["ground_truth"] == 0], col)
+        ax.axhline(0, color="lightgray", linewidth=0.8, zorder=0)
+        ax.axvline(0, color="lightgray", linewidth=0.8, zorder=0)
         ax.text(
             0.02, 0.02,
             f"within-subject median r\npatient: {r_patient:+.2f}   control: {r_control:+.2f}",
             transform=ax.transAxes, fontsize=8, va="bottom", ha="left",
             bbox=dict(boxstyle="round", facecolor="white", alpha=0.7, edgecolor="lightgray"),
         )
-        ax.set_xlabel(spec["label"], fontsize=9)
-        ax.set_ylabel("Model window probability", fontsize=9)
+        ax.set_xlabel(f"{spec['label']} (within-subject centered)", fontsize=9)
+        ax.set_ylabel("Model window probability (within-subject centered)", fontsize=9)
         ax.legend(fontsize=9, loc="upper right")
 
     fig.suptitle(
