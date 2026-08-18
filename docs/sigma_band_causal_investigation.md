@@ -20,9 +20,12 @@ shift, which is similarly broad rather than tail-concentrated — this rules out
 the raw finding or the model's behavior is being driven by a handful of unusual windows. This is
 causal evidence, not just correlational, and it converges across every measurement approach tried.
 
-**What was tried to improve on the p85 baseline, and what's recommended.** Two learned-aggregation
-alternatives were built and fully characterized: **Option A** (attention over a frozen, already-
-validated per-window probe) and **Option B** (attention over raw embeddings, no separate probe). Both
+**What was tried to improve on the p85 baseline, and what's recommended.** The original pipeline
+produces a subject-level prediction by scoring every window individually, then taking the 85th
+percentile of those scores as the subject's pooled result ("p85") — a fixed, hand-chosen aggregation
+rule, not a learned one. Two learned-aggregation alternatives were built and fully characterized:
+**Option A** (attention over a frozen, already-validated per-window probe) and **Option B** (attention
+over raw embeddings, no separate probe). Both
 beat the p85 baseline by the same margin (test AUC 0.918 vs. 0.882) and preserve the sigma mechanism
 (Option A: 100% directional consistency, R² = 0.993; Option B: 97%, R² = 0.930), but only Option A's
 internal mechanism is actually interpretable — its attention gate learns a separate, explicable
