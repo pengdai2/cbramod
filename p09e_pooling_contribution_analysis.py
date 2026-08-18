@@ -54,18 +54,19 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from cbramod_common import (
-    CBraModE2EClassifier,
     CachedFeatureSubjectDataset,
-    LinearProbeHead,
-    MLPProbeHead,
     PANSubjectEEGDataset,
+    add_log_filename_argument,
+    build_frozen_e2e_classifier,
+    build_frozen_probe,
     compute_leave_one_out_contributions,
+    extract_ckpt_metadata,
     get_operating_threshold,
-    load_model_checkpoint,
     resolve_pooling_config,
-    setup_inference_cli_parser
+    seed_everything,
+    setup_inference_cli_parser,
 )
-from cbramod_common import seed_everything
+from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector, load_subject_ids_from_json
 
 
@@ -162,40 +163,27 @@ def parse_cli_args() -> argparse.Namespace:
         help="Number of random same-size draws from each subject's full valid-window population used "
              "to build the null distribution for the temporal clustering test. Set to 0 to skip the test."
     )
+    add_log_filename_argument(parser, __file__)
     return parser.parse_args()
 
 
 def main():
     args = parse_cli_args()
     seed_everything(args.seed)
+    logger = setup_logger(args.log_filename)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     output_dir = Path(args.output_dir) if args.output_dir else Path("./pooling_contribution_results")
     output_dir.mkdir(parents=True, exist_ok=True)
     window_sec = float(args.num_patches)
 
-    # 1. Instantiate Model Architecture (same branching as p09c/p09/p10)
+    # 1. Instantiate Model Architecture + load its checkpoint, metadata-first (same helper as
+    # p09c/p09/p10), with checkpoint_kind deciding head-only vs. full-model loading deterministically.
     if args.features_pt:
-        print("Instantiating isolated Probe Head for cached feature inference.")
-        if args.head_type == "linear":
-            model = LinearProbeHead(num_patches=args.num_patches, emb_dim=args.cbra_dim, num_classes=args.num_classes)
-        else:
-            model = MLPProbeHead(
-                num_patches=args.num_patches, emb_dim=args.cbra_dim, hidden_dim=args.head_dim,
-                num_classes=args.num_classes, dropout=args.dropout
-            )
+        model, ckpt = build_frozen_probe(args, device, logger)
     else:
-        print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
-        model = CBraModE2EClassifier(
-            num_channels=args.num_channels, sfreq=args.sfreq, num_patches=args.num_patches,
-            emb_dim=args.cbra_dim, hidden_dim=args.head_dim, num_classes=args.num_classes,
-            head_type=args.head_type
-        )
-
-    # 2. Load Model Checkpoint
-    model, ckpt_thresholds, _, ckpt_pooling_params = load_model_checkpoint(model, Path(args.probe_checkpoint), device)
-    model.to(device)
-    model.eval()
+        model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+    ckpt_thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     # 2b. Resolve Pooling Config: CLI override > checkpoint's training-time config > hardcoded default
     pooling_strategy, top_percentile, t_window = resolve_pooling_config(

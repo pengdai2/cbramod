@@ -14,18 +14,19 @@ from sklearn.metrics import (
 )
 from tqdm import tqdm
 from cbramod_common import (
-    CBraModE2EClassifier,
     CachedFeatureSubjectDataset,
-    LinearProbeHead,
-    MLPProbeHead,
     PANSubjectEEGDataset,
+    add_log_filename_argument,
+    build_frozen_e2e_classifier,
+    build_frozen_probe,
     compute_pooled_scores,
+    extract_ckpt_metadata,
     find_optimal_threshold,
     get_operating_threshold,
-    load_model_checkpoint,
     resolve_pooling_config,
-    setup_inference_cli_parser
+    setup_inference_cli_parser,
 )
+from cbramod_utils import setup_logger
 
 
 @torch.no_grad()
@@ -85,45 +86,22 @@ def generate_subject_predictions(
 
 
 def evaluate_clinical_cohort(
-    args: argparse.Namespace
+    args: argparse.Namespace, logger,
 ) -> None:
     """Executes full test set inference and clinical cohort evaluation."""
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     print(f"=== Running Clinical Inference Pipeline ({args.num_classes}-Class) on [{device}] ===")
 
-    # 1. Instantiate the appropriate Model Architecture
+    # 1. Instantiate the appropriate Model Architecture + load its checkpoint, metadata-first
+    # (num_patches/cbra_dim/num_classes/num_channels/sfreq/head_type all resolved from the
+    # checkpoint's own saved metadata when present, not blindly from CLI flags) and with the
+    # checkpoint's own explicit checkpoint_kind (head_only vs. full_model) deciding how to load the
+    # state dict -- replacing the old try/except-based load_model_checkpoint() guess.
     if args.features_pt:
-        print("Instantiating isolated Probe Head for cached feature inference.")
-        if args.head_type == "linear":
-            model = LinearProbeHead(
-                num_patches=args.num_patches,
-                emb_dim=args.cbra_dim,
-                num_classes=args.num_classes
-            )
-        else:
-            model = MLPProbeHead(
-                num_patches=args.num_patches,
-                emb_dim=args.cbra_dim,
-                hidden_dim=args.head_dim,
-                num_classes=args.num_classes,
-                dropout=args.dropout
-            )
+        model, ckpt = build_frozen_probe(args, device, logger)
     else:
-        print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
-        model = CBraModE2EClassifier(
-            num_channels=args.num_channels,
-            sfreq=args.sfreq,
-            num_patches=args.num_patches,
-            emb_dim=args.cbra_dim,
-            hidden_dim=args.head_dim,
-            num_classes=args.num_classes,
-            head_type=args.head_type
-        )
-
-    # 2. Load Model Checkpoint (Head-Only or Full-Model)
-    model, ckpt_thresholds, epoch, ckpt_pooling_params = load_model_checkpoint(model, Path(args.probe_checkpoint), device)
-    model.to(device)
-    model.eval()
+        model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+    ckpt_thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     # 2b. Resolve Pooling Config: CLI override > checkpoint's training-time config > hardcoded default
     pooling_strategy, top_percentile, t_window = resolve_pooling_config(
@@ -329,6 +307,7 @@ def analyze_subject_results(
 
 def parse_cli_args()-> argparse.Namespace:
     parser = setup_inference_cli_parser(description="Multi-Class Patient-Level Clinical Inference")
+    add_log_filename_argument(parser, __file__)
     args = parser.parse_args()
     return args
 
@@ -336,5 +315,6 @@ def parse_cli_args()-> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_cli_args()
     seed_everything(args.seed)
+    logger = setup_logger(args.log_filename)
 
-    evaluate_clinical_cohort(args)
+    evaluate_clinical_cohort(args, logger)

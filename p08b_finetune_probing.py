@@ -290,12 +290,21 @@ class ProbeTrainer(CBraModTrainer):
                         # checkpoint (e.g. p13_attention_mil_pooling.py's frozen-probe loader) can
                         # reconstruct the exact right head without having to infer it from state_dict
                         # key/shape patterns or trust a CLI flag to happen to match what this
-                        # checkpoint was actually trained with.
+                        # checkpoint was actually trained with. num_channels/sfreq are included too
+                        # (not just head-shape fields) so a raw-waveform consumer (build_frozen_e2e_
+                        # classifier) can reconstruct the exact backbone this checkpoint assumes, not
+                        # just its own head -- this matters once cohorts can differ in channel count
+                        # or sampling rate. checkpoint_kind marks this as head-only (backbone weights
+                        # are NOT included -- head.state_dict() only), so a loader can pick the right
+                        # load path deterministically instead of guessing via try/except.
+                        "checkpoint_kind": "head_only",
                         "head_type": self.config.head_type,
                         "head_dim": self.config.head_dim,
                         "num_patches": self.config.num_patches,
                         "cbra_dim": self.config.cbra_dim,
                         "num_classes": self.config.num_classes,
+                        "num_channels": self.config.num_channels,
+                        "sfreq": self.config.sfreq,
                         "best_macro_f1": best_primary_f1,
                         "best_auc": best_primary_auc,
                         "primary_pooling": self.config.primary_pooling,

@@ -75,8 +75,8 @@ try:
 except ImportError:
     HAS_YASA = False
 
-from cbramod_common import CBraModE2EClassifier, load_model_checkpoint, setup_inference_cli_parser
-from cbramod_common import seed_everything
+from cbramod_common import add_log_filename_argument, build_frozen_e2e_classifier, seed_everything, setup_inference_cli_parser
+from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector
 
 
@@ -937,6 +937,7 @@ def parse_cli_args() -> argparse.Namespace:
              "runs two detectors per channel, so cost scales with total channel count, not just how many "
              "are displayed)."
     )
+    add_log_filename_argument(parser, __file__)
 
     args = parser.parse_args()
     if args.features_pt:
@@ -950,6 +951,7 @@ def parse_cli_args() -> argparse.Namespace:
 def main():
     args = parse_cli_args()
     seed_everything(args.seed)
+    logger = setup_logger(args.log_filename)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     output_dir = Path(args.output_dir) if args.output_dir else Path("./attribution_results")
@@ -976,19 +978,9 @@ def main():
             "heuristic instead of YASA's validated spindle/slow-wave detectors."
         )
 
-    print("Instantiating full CBraModE2EClassifier for raw waveform attribution.")
-    model = CBraModE2EClassifier(
-        num_channels=args.num_channels,
-        sfreq=args.sfreq,
-        num_patches=args.num_patches,
-        emb_dim=args.cbra_dim,
-        hidden_dim=args.head_dim,
-        num_classes=args.num_classes,
-        head_type=args.head_type
-    )
-    model, _, _, _ = load_model_checkpoint(model, Path(args.probe_checkpoint), device)
-    model.to(device)
-    model.eval()
+    # Metadata-first architecture resolution + deterministic (checkpoint_kind-driven) state dict
+    # loading -- same helper as p09/p09c/p09e.
+    model, _ckpt = build_frozen_e2e_classifier(args, device, logger)
 
     windows_by_subject = resolve_priority_windows(args.priority_windows, args.subject_id, args.tiers)
     total_windows = sum(len(tasks) for tasks in windows_by_subject.values())

@@ -414,6 +414,20 @@ class EndToEndTrainer(CBraModTrainer):
                         "epoch": epoch,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
+                        # Same architecture metadata p08b/p20 save, plus checkpoint_kind="full_model"
+                        # (this checkpoint's model_state_dict includes backbone weights, not just the
+                        # head) -- so a loader can pick the right load path from metadata alone
+                        # instead of a try/except-based guess. This pipeline predates that discipline;
+                        # added so full-model checkpoints participate in it too, not just head-only
+                        # ones from p08b/p20.
+                        "checkpoint_kind": "full_model",
+                        "head_type": self.config.head_type,
+                        "head_dim": self.config.head_dim,
+                        "num_patches": self.config.num_patches,
+                        "cbra_dim": self.config.cbra_dim,
+                        "num_classes": self.config.num_classes,
+                        "num_channels": self.config.num_channels,
+                        "sfreq": self.config.sfreq,
                         "best_macro_f1": best_primary_f1,
                         "best_auc": best_primary_auc,
                         "primary_pooling": self.config.primary_pooling,

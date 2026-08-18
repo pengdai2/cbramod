@@ -280,6 +280,13 @@ def main():
                     "num_patches": args.num_patches,
                     "cbra_dim": args.cbra_dim,
                     "num_classes": args.num_classes,
+                    # GatedAttentionMIL itself never touches the backbone (it operates on cached
+                    # embeddings), but num_channels/sfreq are saved anyway so a raw-waveform consumer
+                    # of THIS checkpoint (p19, which builds its own separate CBraModFeatureExtractor)
+                    # can reconstruct the exact backbone this checkpoint's embeddings assume, rather
+                    # than trusting --num-channels/--sfreq to happen to match.
+                    "num_channels": args.num_channels,
+                    "sfreq": args.sfreq,
                     "best_macro_f1": best_f1,
                     "best_auc": best_auc,
                     "optimal_threshold": val_metrics["optimal_threshold"],

@@ -123,7 +123,13 @@ def main():
     print(f"Loaded Option B model from {args.model_checkpoint} (epoch {ckpt.get('epoch', '?')}, "
           f"head_type={ckpt.get('head_type', 'mlp')}), threshold={threshold:.4f}")
 
-    extractor = CBraModFeatureExtractor(num_channels=args.num_channels, sfreq=args.sfreq).to(device)
+    # num_channels/sfreq resolved from --model-checkpoint's own metadata (already cross-checked
+    # against --num-channels/--sfreq, with a warning, inside build_gated_attention_model) -- this
+    # backbone-only extractor is separate from the GatedAttentionMIL model, but must match the exact
+    # backbone this checkpoint's embeddings were computed from.
+    extractor = CBraModFeatureExtractor(
+        num_channels=ckpt.get("num_channels", args.num_channels), sfreq=ckpt.get("sfreq", args.sfreq),
+    ).to(device)
     extractor.eval()
     print(f"Perturbing band: {args.band} ({low}-{high} Hz). Scale factors: {scale_factors.tolist()}")
 

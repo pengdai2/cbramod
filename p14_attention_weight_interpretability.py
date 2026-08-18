@@ -152,7 +152,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     master_cache_path = Path(args.cache_dir) / args.master_cache_name
-    probe = build_frozen_probe(args, device, logger)
+    probe, _probe_ckpt = build_frozen_probe(args, device, logger)
     logger.info(f"Loaded frozen probe from {args.probe_checkpoint}")
 
     attn_ckpt = torch.load(args.attn_checkpoint, map_location="cpu", weights_only=True)

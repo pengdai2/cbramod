@@ -1373,69 +1373,14 @@ def extract_ckpt_metadata(checkpoint: dict) -> Tuple[dict, Union[int, str], Dict
     return optimal_thresholds, epoch, ckpt_pooling_params
 
 
-def load_model_checkpoint(
-    model: torch.nn.Module,
-    checkpoint_path: Path,
-    device: torch.device
-) -> Tuple[torch.nn.Module, dict, Union[int, str], Dict[str, Union[str, float]]]:
-    """
-    Loads checkpoint weights into the model architecture.
-    Handles both head-only (backbone frozen / LP-FT) state dicts and full model state dicts.
-
-    Also surfaces the pooling configuration ("primary_pooling", "top_percentile",
-    "t_window") saved alongside the weights at training time, so downstream
-    inference/analysis scripts can reproduce the exact pooling that produced
-    the checkpoint's calibrated thresholds by default -- see
-    `resolve_pooling_config`. Only keys actually present in the checkpoint are
-    included, so older checkpoints saved before this field existed degrade
-    gracefully to an empty dict.
-    """
-    if not checkpoint_path.exists():
-        raise FileNotFoundError(f"Checkpoint state dict not found: {checkpoint_path}")
-
-    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
-
-    # Extract state dict dict structure if wrapped inside checkpoint metadata
-    if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
-        state_dict = checkpoint["model_state_dict"]
-    elif isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    else:
-        state_dict = checkpoint
-
-    optimal_thresholds, epoch, ckpt_pooling_params = extract_ckpt_metadata(checkpoint)
-
-    # Strategy 1: Attempt direct full-model state dict load (Full Fine-Tuning)
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print(f"Successfully loaded full model checkpoint (strict=True) from epoch {epoch}.")
-        return model, optimal_thresholds, epoch, ckpt_pooling_params
-    except Exception:
-        pass
-
-    # Strategy 2: Attempt head-only state dict load into model.head (Linear Probe / Head Frozen)
-    head_state_dict = {}
-    for k, v in state_dict.items():
-        if not k.startswith("backbone.") and not k.startswith("encoder."):
-            head_state_dict[k] = v
-
-    if hasattr(model, "head") and head_state_dict:
-        try:
-            model.head.load_state_dict(head_state_dict, strict=True)
-            print(f"Successfully loaded head-only state dict into model.head from epoch {epoch}.")
-            return model, optimal_thresholds, epoch, ckpt_pooling_params
-        except Exception:
-            pass
-
-    # Strategy 3: Fallback load with strict=False
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
-    print(f"Loaded checkpoint with strict=False from epoch {epoch}.")
-    if missing_keys:
-        print(f"  [Info] Missing keys: {len(missing_keys)}")
-    if unexpected_keys:
-        print(f"  [Info] Unexpected keys: {len(unexpected_keys)}")
-
-    return model, optimal_thresholds, epoch, ckpt_pooling_params
+# load_model_checkpoint() used to live here -- a try/except cascade (attempt a full strict load,
+# catch, fall back to head-only into model.head, catch again, fall back to strict=False) that
+# discovered whether a checkpoint was head-only or full-model by trial and error. Removed once its
+# last callers (p09/p09c/p09e/p10) were retrofitted onto build_frozen_probe()/
+# build_frozen_e2e_classifier(), which decide the same thing deterministically via
+# resolve_checkpoint_kind() (explicit "checkpoint_kind" metadata, saved by p08b/p16/p20/
+# p08_finetune_e2e.py -- falling back to state_dict key-prefix inference only for checkpoints that
+# predate that field).
 
 
 def infer_probe_architecture(state_dict: Dict[str, torch.Tensor]) -> Dict[str, object]:
@@ -1465,22 +1410,53 @@ def infer_probe_architecture(state_dict: Dict[str, torch.Tensor]) -> Dict[str, o
     )
 
 
+def resolve_checkpoint_kind(ckpt: dict, state_dict: Dict[str, torch.Tensor], checkpoint_path, logger) -> str:
+    """
+    Determines whether a checkpoint's model_state_dict is HEAD_ONLY (p08b/p20 -- backbone is never
+    saved, only the head) or FULL_MODEL (p08_finetune_e2e.py -- backbone weights are included too),
+    so a loader can pick the right load path directly instead of the old try/except-based guess
+    (load_model_checkpoint's approach: try a full strict load, catch the failure, fall back to
+    head-only, catch again, fall back to strict=False -- three chances for a load to silently
+    "succeed" against the wrong architecture). Priority order:
+      1. Explicit "checkpoint_kind" metadata (p08b/p20/p08_finetune_e2e.py all write this now).
+      2. For checkpoints that predate that field, infer from the state_dict's own key prefixes --
+         any "backbone."/"encoder." key means backbone weights are present (full model); their
+         absence means head-only. Loudly warned, same discipline as every other metadata fallback
+         in this file.
+    """
+    if "checkpoint_kind" in ckpt:
+        return ckpt["checkpoint_kind"]
+    inferred = "full_model" if any(k.startswith("backbone.") or k.startswith("encoder.") for k in state_dict) else "head_only"
+    logger.warning(
+        f"Checkpoint ({checkpoint_path}) has no explicit checkpoint_kind metadata -- it predates "
+        f"that being saved. Inferring {inferred!r} from the state_dict's own key prefixes instead of "
+        f"a try/except-based load guess."
+    )
+    return inferred
+
+
 def resolve_probe_architecture(checkpoint_path, config: argparse.Namespace, logger) -> Tuple[Dict[str, object], Dict[str, torch.Tensor], dict]:
     """
-    Resolves a p08b/p20-trained probe checkpoint's ACTUAL head architecture (head_type, and
-    hidden_dim for MLP), NEVER trusting --head-type/--head-dim blindly. Priority order:
-      1. Explicit metadata saved IN the checkpoint itself (p08b/p20 write "head_type"/"head_dim" at
-         save time) -- the single source of truth going forward, no guessing involved.
-      2. For checkpoints that predate that fix, fall back to inferring architecture from the
-         state_dict's own key/shape pattern (infer_probe_architecture()) -- still derived from the
-         file itself, just less direct than explicit metadata.
-    Either way, --head-type/--head-dim are only ever used as a cross-check (mismatch logged loudly),
-    never as the actual source of the reconstructed architecture. Shared by both consumers of a
-    probe checkpoint: build_frozen_probe() (bare head, for cached-embedding scripts) and
-    build_frozen_e2e_classifier() (full backbone+head, for raw-waveform scripts).
+    Resolves a p08b/p20-trained probe checkpoint's ACTUAL architecture -- head_type (and hidden_dim
+    for MLP), plus num_patches/cbra_dim/num_classes/num_channels/sfreq -- NEVER trusting the
+    corresponding CLI flags blindly. Priority order:
+      1. Explicit metadata saved IN the checkpoint itself (p08b/p20/p08_finetune_e2e.py all write
+         every one of these fields at save time) -- the single source of truth going forward, no
+         guessing involved.
+      2. For checkpoints that predate that fix: head_type/hidden_dim fall back to inferring from the
+         state_dict's own key/shape pattern (infer_probe_architecture()), still derived from the file
+         itself. num_patches/cbra_dim/num_classes/num_channels/sfreq have no equivalent shape-based
+         fallback (a bare head's own weight shapes are consistent with many (num_patches, emb_dim)
+         factorizations, so these can't be teased apart from shape alone) -- for those, an old
+         checkpoint falls back to the CLI value, loudly flagged as unverified rather than silently
+         trusted.
+    Either way, CLI flags are only ever a cross-check (mismatch logged loudly) or a last-resort
+    fallback for genuinely unrecoverable fields on old checkpoints, never the actual source when the
+    checkpoint has an opinion. Shared by build_frozen_probe() (bare head; only needs num_patches/
+    cbra_dim/num_classes/head_type) and build_frozen_e2e_classifier() (full backbone+head; also needs
+    num_channels/sfreq to reconstruct the exact backbone this checkpoint assumes).
 
-    Returns (resolved_architecture, head_state_dict, raw_checkpoint_dict) -- callers construct the
-    module that fits their own use case and load the state dict into the right place themselves.
+    Returns (resolved_architecture, head_state_dict, raw_checkpoint_dict).
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
@@ -1507,24 +1483,53 @@ def resolve_probe_architecture(checkpoint_path, config: argparse.Namespace, logg
             f"unexpected, double check the checkpoint path points at the file you think it does."
         )
 
+    for field, cli_attr in (
+        ("num_patches", "num_patches"), ("cbra_dim", "cbra_dim"), ("num_classes", "num_classes"),
+        ("num_channels", "num_channels"), ("sfreq", "sfreq"),
+    ):
+        cli_value = getattr(config, cli_attr)
+        if field in ckpt:
+            resolved[field] = ckpt[field]
+            if resolved[field] != cli_value:
+                logger.warning(
+                    f"--{cli_attr.replace('_', '-')} ({cli_value}) does NOT match what the probe "
+                    f"checkpoint ({checkpoint_path}) actually is ({resolved[field]}) -- using the "
+                    f"checkpoint's own value, not the CLI flag."
+                )
+        else:
+            logger.warning(
+                f"Probe checkpoint ({checkpoint_path}) has no explicit {field} metadata -- it "
+                f"predates that being saved. Falling back to --{cli_attr.replace('_', '-')} "
+                f"({cli_value}); double check this actually matches what the checkpoint was trained "
+                f"with, since there is no way to verify it from the file itself."
+            )
+            resolved[field] = cli_value
+
     return resolved, state_dict, ckpt
 
 
-def build_frozen_probe(config: argparse.Namespace, device: torch.device, logger) -> nn.Module:
+def build_frozen_probe(config: argparse.Namespace, device: torch.device, logger) -> Tuple[nn.Module, dict]:
     """
     Reconstructs the bare probe head architecture and loads frozen weights from
     config.probe_checkpoint -- for scripts operating on already-extracted cached embeddings
     (p13/p14/p20/p21), which only ever need the head, not the CBraMod backbone. See
-    resolve_probe_architecture() for the metadata-first resolution this relies on.
+    resolve_probe_architecture() for the metadata-first resolution this relies on -- num_patches/
+    cbra_dim/num_classes now come from the checkpoint's own metadata (when present), not blindly
+    from CLI flags.
+
+    Returns (probe, raw_checkpoint_dict) -- consistent with build_frozen_e2e_classifier() and
+    build_gated_attention_model(), so callers can read optimal_thresholds/pooling params/etc. off
+    the same dict this function already loaded, instead of a second, redundant torch.load() of the
+    same file.
     """
-    resolved, state_dict, _ckpt = resolve_probe_architecture(config.probe_checkpoint, config, logger)
+    resolved, state_dict, ckpt = resolve_probe_architecture(config.probe_checkpoint, config, logger)
 
     if resolved["head_type"] == "linear":
-        probe = LinearProbeHead(num_patches=config.num_patches, emb_dim=config.cbra_dim, num_classes=config.num_classes)
+        probe = LinearProbeHead(num_patches=resolved["num_patches"], emb_dim=resolved["cbra_dim"], num_classes=resolved["num_classes"])
     else:
         probe = MLPProbeHead(
-            num_patches=config.num_patches, emb_dim=config.cbra_dim,
-            hidden_dim=resolved["hidden_dim"], num_classes=config.num_classes, dropout=config.dropout,
+            num_patches=resolved["num_patches"], emb_dim=resolved["cbra_dim"],
+            hidden_dim=resolved["hidden_dim"], num_classes=resolved["num_classes"], dropout=config.dropout,
         )
 
     probe.load_state_dict(state_dict)
@@ -1532,34 +1537,40 @@ def build_frozen_probe(config: argparse.Namespace, device: torch.device, logger)
     probe.eval()
     for p in probe.parameters():
         p.requires_grad_(False)
-    return probe
+    return probe, ckpt
 
 
 def build_frozen_e2e_classifier(config: argparse.Namespace, device: torch.device, logger) -> Tuple[nn.Module, dict]:
     """
     Same metadata-first architecture resolution as build_frozen_probe(), but constructs the full
-    CBraModE2EClassifier (fresh pretrained backbone + the checkpoint's own head) instead of a bare
-    head -- for scripts that need raw-waveform inference (p09f/p09h/p09i/p15), since they must run
-    the backbone forward pass themselves on (possibly perturbed) raw signal rather than reading
-    pre-extracted embeddings from the master cache.
+    CBraModE2EClassifier (backbone + the checkpoint's own head) instead of a bare head -- for scripts
+    that need raw-waveform inference (p09f/p09h/p09i/p09k/p15), since they must run the backbone
+    forward pass themselves on (possibly perturbed) raw signal rather than reading pre-extracted
+    embeddings from the master cache. num_channels/sfreq now come from the checkpoint's own metadata
+    too (when present), not just num_patches/cbra_dim/num_classes/head_type -- this matters once
+    cohorts can differ in channel count or sampling rate, not just head architecture.
 
-    Replaces the previous pattern in these scripts (construct a CBraModE2EClassifier purely from
-    --head-type/--head-dim, then load_model_checkpoint() the head weights in afterward, discovering
-    any mismatch only via a shape-mismatch RuntimeError) with the same metadata-first, loud-warning
-    discipline p13/p14/p20/p21 already had for the bare-head case.
+    Loads the state dict deterministically based on resolve_checkpoint_kind() rather than
+    load_model_checkpoint()'s old try/except cascade (full strict load, catch, fall back to
+    head-only, catch, fall back to strict=False) -- checkpoint_kind says which one to do, no guessing
+    by trial and error.
 
     Returns (model, raw_checkpoint_dict) -- the checkpoint dict is returned too so callers can read
-    optimal_thresholds/primary_pooling/etc. off it themselves, same information load_model_checkpoint()
-    used to hand back as a tuple.
+    optimal_thresholds/primary_pooling/etc. off it themselves.
     """
     resolved, state_dict, ckpt = resolve_probe_architecture(config.probe_checkpoint, config, logger)
 
     model = CBraModE2EClassifier(
-        num_channels=config.num_channels, sfreq=config.sfreq, num_patches=config.num_patches,
-        emb_dim=config.cbra_dim, hidden_dim=resolved.get("hidden_dim", config.head_dim),
-        num_classes=config.num_classes, dropout=config.dropout, head_type=resolved["head_type"],
+        num_channels=resolved["num_channels"], sfreq=resolved["sfreq"], num_patches=resolved["num_patches"],
+        emb_dim=resolved["cbra_dim"], hidden_dim=resolved.get("hidden_dim", config.head_dim),
+        num_classes=resolved["num_classes"], dropout=config.dropout, head_type=resolved["head_type"],
     )
-    model.head.load_state_dict(state_dict)
+
+    kind = resolve_checkpoint_kind(ckpt, state_dict, config.probe_checkpoint, logger)
+    if kind == "full_model":
+        model.load_state_dict(state_dict, strict=True)
+    else:
+        model.head.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     return model, ckpt
@@ -1570,17 +1581,24 @@ def build_gated_attention_model(
 ) -> Tuple[nn.Module, dict]:
     """
     Reconstructs a GatedAttentionMIL (Option B) architecture and loads frozen weights from
-    config.model_checkpoint, reading the checkpoint's own saved metadata
-    (attn_hidden_dim/head_hidden_dim/num_patches/cbra_dim/num_classes/head_type) with a LOUD warning
-    on any mismatch against the corresponding CLI flags -- replacing the silent
+    config.model_checkpoint, reading the checkpoint's own saved metadata (attn_hidden_dim/
+    head_hidden_dim/num_patches/cbra_dim/num_classes/head_type/num_channels/sfreq) with a LOUD
+    warning on any mismatch against the corresponding CLI flags -- replacing the silent
     `ckpt.get(key, args.xxx)` pattern previously duplicated across p17/p18/p19, which accepted a
-    mismatch with no warning at all.
+    mismatch with no warning at all (and, for num_patches/cbra_dim/num_classes specifically, didn't
+    even resolve-then-cross-check consistently the way attn_hidden_dim/head_hidden_dim now do).
+
+    num_channels/sfreq are resolved (and returned in `resolved`/`ckpt`) even though
+    GatedAttentionMIL itself never touches the backbone -- p19 needs them to build its own separate
+    CBraModFeatureExtractor consistently with what this checkpoint's embeddings actually assume,
+    rather than trusting --num-channels/--sfreq to happen to match.
 
     require_head_type: if given (e.g. "linear"), raises with an explanation if the checkpoint's own
     head_type doesn't match -- p17/p18 both need this since they rely on the exact per-window linear
     decomposition, which only holds for a linear head.
 
-    Returns (model, raw_checkpoint_dict) -- callers read optimal_threshold/epoch/etc. off the dict.
+    Returns (model, raw_checkpoint_dict) -- callers read optimal_threshold/epoch/num_channels/sfreq/
+    etc. off the dict.
     """
     ckpt = torch.load(config.model_checkpoint, map_location="cpu", weights_only=True)
     head_type = ckpt.get("head_type", "mlp")
@@ -1594,22 +1612,24 @@ def build_gated_attention_model(
             f"checkpoint instead."
         )
 
-    resolved = {
-        "attn_hidden_dim": ckpt.get("attn_hidden_dim", config.attn_hidden_dim),
-        "head_hidden_dim": ckpt.get("head_hidden_dim", config.head_hidden_dim),
-        "num_patches": ckpt.get("num_patches", config.num_patches),
-        "cbra_dim": ckpt.get("cbra_dim", config.cbra_dim),
-        "num_classes": ckpt.get("num_classes", config.num_classes),
-        "head_type": head_type,
-    }
-    for key in ("attn_hidden_dim", "head_hidden_dim"):
-        cli_value = getattr(config, key, None)
-        if cli_value is not None and resolved[key] != cli_value:
+    resolved = {"head_type": head_type}
+    for field in ("attn_hidden_dim", "head_hidden_dim", "num_patches", "cbra_dim", "num_classes", "num_channels", "sfreq"):
+        cli_value = getattr(config, field, None)
+        if field in ckpt:
+            resolved[field] = ckpt[field]
+            if cli_value is not None and resolved[field] != cli_value:
+                logger.warning(
+                    f"--{field.replace('_', '-')} ({cli_value}) does NOT match what --model-checkpoint "
+                    f"actually is ({resolved[field]}) -- using the checkpoint's own value (this is what "
+                    f"actually gets built), not the CLI flag."
+                )
+        else:
             logger.warning(
-                f"--{key.replace('_', '-')} ({cli_value}) does NOT match what --model-checkpoint "
-                f"actually is ({resolved[key]}) -- using the checkpoint's own value (this is what "
-                f"actually gets built), not the CLI flag."
+                f"--model-checkpoint has no explicit {field} metadata -- it predates that being "
+                f"saved. Falling back to --{field.replace('_', '-')} ({cli_value}); double check this "
+                f"actually matches what the checkpoint was trained with."
             )
+            resolved[field] = cli_value
 
     model = GatedAttentionMIL(
         num_patches=resolved["num_patches"], emb_dim=resolved["cbra_dim"],

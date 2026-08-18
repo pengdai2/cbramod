@@ -260,7 +260,9 @@ def main():
     logger = setup_logger(args.log_filename)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt = torch.load(args.probe_checkpoint, map_location="cpu", weights_only=True)
+    probe, ckpt = build_frozen_probe(args, device, logger)
+    logger.info(f"Loaded model[0] from {args.probe_checkpoint}")
+
     thresholds = ckpt.get("optimal_thresholds", {})
     if args.pooling_strategy not in thresholds:
         raise ValueError(
@@ -269,9 +271,6 @@ def main():
         )
     threshold = thresholds[args.pooling_strategy]
     logger.info(f"Using model[0]'s own calibrated threshold for {args.pooling_strategy}: {threshold:.4f} (never re-derived here)")
-
-    probe = build_frozen_probe(args, device, logger)
-    logger.info(f"Loaded model[0] from {args.probe_checkpoint}")
 
     master_cache_path = Path(args.cache_dir) / args.master_cache_name
     splits = {"train": args.train_manifest, "val": args.val_manifest}

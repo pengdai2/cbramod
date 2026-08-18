@@ -277,7 +277,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     master_cache_path = Path(args.cache_dir) / args.master_cache_name
-    probe = build_frozen_probe(args, device, logger)
+    probe, _probe_ckpt = build_frozen_probe(args, device, logger)
     logger.info(f"Loaded frozen probe from {args.probe_checkpoint} (head_type={args.head_type}); probe parameters are NOT trained here.")
 
     best_model_path = Path(args.checkpoint_dir) / args.checkpoint_filename if args.checkpoint_dir else Path(args.checkpoint_filename)
