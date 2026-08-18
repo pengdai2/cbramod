@@ -56,6 +56,7 @@ from cbramod_common import (
     CachedFeatureSubjectDataset,
     add_log_filename_argument,
     build_gated_attention_model,
+    load_subject_ids,
     seed_everything,
     setup_cache_cli_parser,
     setup_common_cli_parser,
@@ -108,11 +109,6 @@ def compute_metrics(scores: np.ndarray, labels: np.ndarray, threshold: float) ->
         "subject_specificity": recall_score(labels, preds, pos_label=0),
         "roc_auc": roc_auc_score(labels, scores) if len(np.unique(labels)) > 1 else 0.5,
     }
-
-
-def load_subject_ids(manifest_csv: str) -> List[str]:
-    df = pd.read_csv(manifest_csv)
-    return df["subject_id"].astype(str).tolist()
 
 
 def main():

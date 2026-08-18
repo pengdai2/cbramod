@@ -40,6 +40,7 @@ import torch
 from tqdm import tqdm
 
 from cbramod_common import (
+    AttentionPoolingHead,
     BAND_DEFS,
     PANSubjectEEGDataset,
     add_log_filename_argument,
@@ -55,7 +56,6 @@ from cbramod_common import (
 )
 from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import load_subject_ids_from_json
-from p13_attention_mil_pooling import AttentionPoolingHead
 
 
 def fit_local_slope(scale_factors: np.ndarray, values: np.ndarray) -> Tuple[float, float]:

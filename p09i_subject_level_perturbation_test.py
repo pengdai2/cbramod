@@ -66,6 +66,7 @@ from cbramod_common import (
     seed_everything,
     setup_inference_cli_parser,
     setup_perturbation_cli_parser,
+    spearman_corr,
 )
 from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import load_subject_ids_from_json
@@ -83,14 +84,6 @@ def fit_local_slope(scale_factors: np.ndarray, values: np.ndarray) -> Tuple[floa
     r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else float("nan")
     return float(slope), float(r2)
 
-
-def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
-    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
-        return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def parse_cli_args() -> argparse.Namespace:

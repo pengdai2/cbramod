@@ -59,17 +59,9 @@ import numpy as np
 import pandas as pd
 from scipy.stats import mannwhitneyu
 
+from cbramod_stats import spearman_corr
+
 PERCENTILES = [10, 25, 50, 75, 90, 95, 99]
-
-
-def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
-    """Spearman rank correlation via plain rank + Pearson (no scipy.stats dependency needed)."""
-    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
-        return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def parse_cli_args() -> argparse.Namespace:

@@ -21,6 +21,8 @@ from sklearn.metrics import (
     roc_auc_score
 )
 
+from cbramod_stats import spearman_corr
+
 
 # =====================================================================
 # DATASETS
@@ -386,6 +388,18 @@ def flatten_cached_feature_dataset(
     )
 
 
+def load_subject_ids(manifest_csv: str) -> List[str]:
+    """Reads just the subject_id column of a manifest CSV, raising a clear error if the column is
+    missing rather than a KeyError deep inside pandas. Shared by the whole p08b/p13-p21 family --
+    this used to be two near-identical functions (one with the validation, one without) split across
+    p08b/p20 vs. everything else, until it became clear there was no real reason not to always
+    include the clearer error message; merged into one."""
+    df = pd.read_csv(manifest_csv)
+    if "subject_id" not in df.columns:
+        raise ValueError(f"{manifest_csv} has no 'subject_id' column -- is this a p03 split manifest?")
+    return df["subject_id"].astype(str).tolist()
+
+
 class SyntheticEEGDataset(torch.utils.data.Dataset):
     """
     Generates synthetic EEG tensors matching CBraMod input specs for pipeline verification:
@@ -597,6 +611,162 @@ class GatedAttentionMIL(nn.Module):
         pooled = (attn_weights.unsqueeze(-1) * flat).sum(dim=0)  # [in_features] -- weighted sum of embeddings
         logits = self.head(pooled.unsqueeze(0)).squeeze(0)  # [num_classes]
         return logits, attn_weights
+
+
+class AttentionPoolingHead(nn.Module):
+    """
+    Option A's attention gate (p13_attention_mil_pooling.py and friends p14/p15) -- a learned
+    replacement for compute_pooled_scores(method="p85_score"). Given one subject's bag of window
+    embeddings and that same subject's FROZEN window-level probabilities (already computed by a
+    probe head this gate never retrains), learns a per-window attention weight and returns the
+    attention-weighted sum of the window probabilities as the subject-level score.
+
+    The gate conditions on the full embedding rather than on the probe's scalar output alone: a
+    window-level probability is already a heavy compression of a ~num_patches*emb_dim-dimensional
+    embedding down to one number, optimized for a different objective (window-level classification).
+    Two windows can land at the same probe output (e.g. both near 0.5) for very different reasons --
+    one genuinely ambiguous-but-clean, one noisy/borderline-artifactual -- and that distinction is
+    already erased by the time a scalar-only gate would see it. Conditioning on the embedding
+    instead gives the gate a chance to learn "how much to trust this window" using information the
+    probe's own compression discarded; a gate restricted to a 1-dimensional input would only be able
+    to learn some monotonic-ish reweighting of the probe's own score, which is uncomfortably close
+    to just being another fixed pooling statistic rather than genuinely contextual attention.
+
+    The quantity being POOLED, though, is still the already-validated, already-trained window-level
+    probability, not the embedding itself -- this keeps the pooled score directly comparable to
+    every prior pooling strategy (p85_score, top_10_mean, ...) and keeps the probe head itself
+    completely untouched -- unlike GatedAttentionMIL (Option B), which pools the embedding itself.
+    """
+    def __init__(self, num_patches: int = 30, emb_dim: int = 200, hidden_dim: int = 64, dropout: float = 0.1):
+        super().__init__()
+        in_features = num_patches * emb_dim
+        self.gate = nn.Sequential(
+            nn.LayerNorm(in_features),
+            nn.Linear(in_features, hidden_dim),
+            nn.Tanh(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, bag_feats: torch.Tensor, window_probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        bag_feats:    [n_windows, num_patches, emb_dim] -- ONE subject's windows. n_windows varies
+                      call to call; nothing about self.gate's parameters depends on it.
+        window_probs: [n_windows] -- frozen probe's P(class=1) per window, already computed
+                      upstream with no_grad().
+
+        Returns (subject_prob, attn_weights): subject_prob is a 0-dim tensor, attn_weights is
+        [n_windows] (sums to 1) -- exposed for inspection/plotting, same role as the leave-one-out
+        contribution and LOO-influence analyses used to characterize p85 pooling.
+        """
+        n_windows = bag_feats.shape[0]
+        flat = bag_feats.reshape(n_windows, -1)          # [n_windows, num_patches * emb_dim]
+        scores = self.gate(flat).squeeze(-1)              # [n_windows]
+        attn_weights = torch.softmax(scores, dim=0)        # normalizes over THIS bag's actual size
+        subject_prob = (attn_weights * window_probs).sum()
+        return subject_prob, attn_weights
+
+
+@torch.no_grad()
+def frozen_window_probs(probe: nn.Module, bag_feats: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """P(class=1) per window, from a frozen probe (build_frozen_probe()'s output), for one subject's
+    bag of windows -- shared by Option A's training/eval loop (p13) and its interpretability/
+    perturbation follow-ups (p14/p15)."""
+    logits = probe(bag_feats.to(device).float())
+    return torch.softmax(logits, dim=1)[:, 1]
+
+
+# spearman_corr lives in cbramod_stats.py (pure numpy, no torch/braindecode) -- imported below rather
+# than defined here, so the model-free scripts in this family (p09g/p09j/p22/p23) can use the exact
+# same implementation without picking up this module's heavy ML dependencies. Re-exported under this
+# name so every other script's existing `from cbramod_common import spearman_corr` keeps working.
+
+
+def report_reference_correlations(
+    df: pd.DataFrame, reference_col: str, feature_cols: List[str], subject_col: str = "subject_id",
+) -> None:
+    """Prints pooled + within-subject Spearman correlation of `reference_col` against each of
+    `feature_cols` -- shared by p14 and p17 (attn_weight/window_evidence vs. band power), which had
+    byte-identical copies differing only in print-header wording. A subject needs at least 3 valid
+    (non-NaN) rows in a column to contribute to that column's within-subject correlation.
+
+    Distinct from report_probability_correlations() below: this one takes an arbitrary
+    `reference_col` (e.g. "attn_weight"), that one hardcodes "probability" as the reference and adds
+    a couple of extra conveniences (an empty-df guard, frac(r>0.2)/frac(r<-0.2) reporting) that this
+    version doesn't -- kept as two separate functions rather than one over-parameterized one, since
+    the two callers' actual needs have diverged this much already."""
+    print("\n" + "=" * 88)
+    print(f"POOLED CORRELATION ({reference_col} vs. features, all windows/subjects together -- conflates within/between-subject variance)")
+    print("=" * 88)
+    for col in feature_cols:
+        valid = df[col].notna()
+        r = spearman_corr(df.loc[valid, reference_col].values, df.loc[valid, col].values)
+        print(f"  {reference_col} vs {col:<24}: Spearman r = {r:+.4f}  (n={int(valid.sum())})")
+
+    print("\n" + "=" * 88)
+    print(f"WITHIN-SUBJECT CORRELATION ({reference_col} vs. features, summarized across subjects -- the direct test)")
+    print("=" * 88)
+    for col in feature_cols:
+        per_subject_r = []
+        for _, g in df.groupby(subject_col):
+            valid = g[col].notna()
+            if valid.sum() < 3:
+                continue
+            r = spearman_corr(g.loc[valid, reference_col].values, g.loc[valid, col].values)
+            if not np.isnan(r):
+                per_subject_r.append(r)
+        per_subject_r = np.array(per_subject_r)
+        if len(per_subject_r) == 0:
+            print(f"  {reference_col} vs {col:<24}: no subjects had enough variance to compute this.")
+            continue
+        print(
+            f"  {reference_col} vs {col:<24}: mean r = {per_subject_r.mean():+.4f}, "
+            f"median r = {np.median(per_subject_r):+.4f}, "
+            f"frac(r>0.2) = {(per_subject_r > 0.2).mean():.2f}, "
+            f"frac(r<-0.2) = {(per_subject_r < -0.2).mean():.2f} (n_subjects={len(per_subject_r)})"
+        )
+
+
+def report_probability_correlations(df: pd.DataFrame, feature_cols: List[str], label: str) -> None:
+    """Prints pooled + within-subject Spearman correlation of the model's own "probability" column
+    against each of `feature_cols` -- shared by p09f and p09k, which had near-identical copies (p09f's
+    was the more complete of the two: an empty-df guard and frac(r>0.2)/frac(r<-0.2) reporting p09k
+    lacked, both included here so p09k gains them rather than losing anything). A subject needs at
+    least 5 windows AND nonzero variance in a column to contribute to that column's within-subject
+    correlation -- a different (stricter) bar than report_reference_correlations()'s n>=3, kept as-is
+    rather than silently harmonized, since changing either threshold would change reported numbers."""
+    print("\n" + "=" * 88)
+    print(f"POOLED CORRELATION -- {label} (all windows, all subjects together -- conflates within/between-subject variance)")
+    print("=" * 88)
+    if len(df) == 0:
+        print("  (no rows in this subset)")
+        return
+    for col in feature_cols:
+        r = spearman_corr(df["probability"].values, df[col].values)
+        print(f"  probability vs {col:20s}: Spearman r = {r:+.4f}  (n={len(df)})")
+
+    print("\n" + "-" * 88)
+    print(f"WITHIN-SUBJECT CORRELATION -- {label} (summarized across subjects -- the direct test)")
+    print("-" * 88)
+    for col in feature_cols:
+        per_subject_r = []
+        for _, group in df.groupby("subject_id"):
+            if len(group) >= 5 and group[col].std() > 0:
+                r = spearman_corr(group["probability"].values, group[col].values)
+                if not np.isnan(r):
+                    per_subject_r.append(r)
+        per_subject_r = np.array(per_subject_r)
+        if len(per_subject_r) == 0:
+            print(f"  probability vs {col:20s}: no subjects had enough variance to compute this.")
+            continue
+        frac_pos = np.mean(per_subject_r > 0.2)
+        frac_neg = np.mean(per_subject_r < -0.2)
+        print(
+            f"  probability vs {col:20s}: mean r = {per_subject_r.mean():+.4f}, "
+            f"median r = {np.median(per_subject_r):+.4f}, "
+            f"frac(r>0.2) = {frac_pos:.2f}, frac(r<-0.2) = {frac_neg:.2f} "
+            f"(n_subjects={len(per_subject_r)})"
+        )
 
 
 def compute_pooled_scores(

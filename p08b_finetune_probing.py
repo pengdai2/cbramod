@@ -62,19 +62,12 @@ from cbramod_common import (
     add_log_filename_argument,
     flatten_cached_feature_dataset,
     is_checkpoint_improvement,
+    load_subject_ids,
     seed_everything,
     setup_cache_cli_parser,
     setup_data_loader_and_criterion,
     setup_training_cli_parser,
 )
-
-
-def load_subject_ids_from_manifest(manifest_csv: Path) -> List[str]:
-    """Reads just the subject_id column of a p03-generated split manifest (train/val/test_manifest.csv)."""
-    df = pd.read_csv(manifest_csv)
-    if "subject_id" not in df.columns:
-        raise ValueError(f"{manifest_csv} has no 'subject_id' column -- is this a p03 split manifest?")
-    return df["subject_id"].astype(str).tolist()
 
 
 # =====================================================================
@@ -116,8 +109,8 @@ class ProbeTrainer(CBraModTrainer):
         if self.config.enable_sgkf:
             return self.train_cross_validation(master_cache_path)
         else:
-            train_subject_ids = load_subject_ids_from_manifest(Path(self.config.train_manifest))
-            val_subject_ids = load_subject_ids_from_manifest(Path(self.config.val_manifest))
+            train_subject_ids = load_subject_ids(Path(self.config.train_manifest))
+            val_subject_ids = load_subject_ids(Path(self.config.val_manifest))
             return self.train_fixed_split(master_cache_path, train_subject_ids, val_subject_ids)
 
     def train_fixed_split(
@@ -352,8 +345,8 @@ class ProbeTrainer(CBraModTrainer):
                 "to determine which subjects are eligible for cross-validation at all (their union), "
                 "explicitly excluding whatever's held out as test in the master cache."
             )
-        eligible_subject_ids = set(load_subject_ids_from_manifest(Path(self.config.train_manifest))) | \
-            set(load_subject_ids_from_manifest(Path(self.config.val_manifest)))
+        eligible_subject_ids = set(load_subject_ids(Path(self.config.train_manifest))) | \
+            set(load_subject_ids(Path(self.config.val_manifest)))
 
         self.logger.info(f"Loading master cache from {master_cache_path} to build SGKF splits...")
         master_data = torch.load(master_cache_path, map_location="cpu", weights_only=True)

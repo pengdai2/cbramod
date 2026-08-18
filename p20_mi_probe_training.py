@@ -75,17 +75,11 @@ from cbramod_common import (
     add_log_filename_argument,
     flatten_cached_feature_dataset,
     is_checkpoint_improvement,
+    load_subject_ids,
     seed_everything,
     setup_cache_cli_parser,
     setup_training_cli_parser,
 )
-
-
-def load_subject_ids_from_manifest(manifest_csv: Path) -> List[str]:
-    df = pd.read_csv(manifest_csv)
-    if "subject_id" not in df.columns:
-        raise ValueError(f"{manifest_csv} has no 'subject_id' column -- is this a p03 split manifest?")
-    return df["subject_id"].astype(str).tolist()
 
 
 def parse_cli_args() -> argparse.Namespace:
@@ -153,8 +147,8 @@ class MITrainer(CBraModTrainer):
         super().__init__(config, logger)
 
     def train(self, master_cache_path: Path) -> dict:
-        train_subject_ids = load_subject_ids_from_manifest(Path(self.config.train_manifest))
-        val_subject_ids = load_subject_ids_from_manifest(Path(self.config.val_manifest))
+        train_subject_ids = load_subject_ids(Path(self.config.train_manifest))
+        val_subject_ids = load_subject_ids(Path(self.config.val_manifest))
 
         self.logger.info(f"Loading cached feature tensors into RAM from {master_cache_path}...")
         train_ds = CachedFeatureSubjectDataset(master_cache_path, filter_subject=train_subject_ids)

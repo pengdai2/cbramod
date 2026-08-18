@@ -32,16 +32,16 @@ import pandas as pd
 import torch
 
 from cbramod_common import (
+    AttentionPoolingHead,
     CachedFeatureSubjectDataset,
     add_log_filename_argument,
     build_frozen_probe,
-    setup_cache_cli_parser,
-    setup_common_cli_parser,
-)
-from p13_attention_mil_pooling import (
-    AttentionPoolingHead,
     frozen_window_probs,
     load_subject_ids,
+    report_reference_correlations,
+    setup_cache_cli_parser,
+    setup_common_cli_parser,
+    spearman_corr,
 )
 from cbramod_utils import setup_logger
 
@@ -84,16 +84,6 @@ def parse_cli_args() -> argparse.Namespace:
 # =====================================================================
 # 2. CORRELATION REPORTING (same pattern as p09f/p09i/p09j/p09k/p09g)
 # =====================================================================
-
-def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
-    """Spearman rank correlation via plain rank + Pearson (no scipy.stats dependency needed)."""
-    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
-        return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    return float(np.corrcoef(ra, rb)[0, 1])
-
 
 def partial_spearman_corr(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> float:
     """
@@ -150,40 +140,6 @@ def report_partial_correlation(
         f"  If the partial median stays close to the raw median, {z_col} explains little of the "
         f"{x_col}-{y_col} relationship. If it collapses toward 0, {z_col} was doing most of the work."
     )
-
-
-def report_correlations(df: pd.DataFrame, reference_col: str, feature_cols: List[str], subject_col: str = "subject_id") -> None:
-    """Pooled + within-subject Spearman correlation of `reference_col` against each of `feature_cols`."""
-    print("\n" + "=" * 88)
-    print(f"POOLED CORRELATION ({reference_col} vs. features, all windows/subjects together -- conflates within/between-subject variance)")
-    print("=" * 88)
-    for col in feature_cols:
-        valid = df[col].notna()
-        r = spearman_corr(df.loc[valid, reference_col].values, df.loc[valid, col].values)
-        print(f"  {reference_col} vs {col:<24}: Spearman r = {r:+.4f}  (n={int(valid.sum())})")
-
-    print("\n" + "=" * 88)
-    print(f"WITHIN-SUBJECT CORRELATION ({reference_col} vs. features, summarized across subjects -- the direct test)")
-    print("=" * 88)
-    for col in feature_cols:
-        per_subject_r = []
-        for _, g in df.groupby(subject_col):
-            valid = g[col].notna()
-            if valid.sum() < 3:
-                continue
-            r = spearman_corr(g.loc[valid, reference_col].values, g.loc[valid, col].values)
-            if not np.isnan(r):
-                per_subject_r.append(r)
-        per_subject_r = np.array(per_subject_r)
-        if len(per_subject_r) == 0:
-            print(f"  {reference_col} vs {col:<24}: no subjects had enough variance to compute this.")
-            continue
-        print(
-            f"  {reference_col} vs {col:<24}: mean r = {per_subject_r.mean():+.4f}, "
-            f"median r = {np.median(per_subject_r):+.4f}, "
-            f"frac(r>0.2) = {(per_subject_r > 0.2).mean():.2f}, "
-            f"frac(r<-0.2) = {(per_subject_r < -0.2).mean():.2f} (n_subjects={len(per_subject_r)})"
-        )
 
 
 # =====================================================================
@@ -273,7 +229,7 @@ def main():
         "learning to suppress their influence on the pooled score, though the causal investigation's "
         "perturbation tests (not a correlation like this one) remain the actual causal evidence."
     )
-    report_correlations(merged, "attn_weight", band_cols + yasa_cols)
+    report_reference_correlations(merged, "attn_weight", band_cols + yasa_cols)
 
     print(
         "\n" + "=" * 88
@@ -288,8 +244,8 @@ def main():
           "for the probe in the first place -- i.e. the gate's strong delta downweighting could be "
           "explained as 'downweight uninformative windows' rather than 'delta itself is the signal'."
     )
-    report_correlations(merged, "attn_weight", ["prob_extremity"])
-    report_correlations(merged, "prob_extremity", band_cols + yasa_cols)
+    report_reference_correlations(merged, "attn_weight", ["prob_extremity"])
+    report_reference_correlations(merged, "prob_extremity", band_cols + yasa_cols)
 
     print(
         "\n" + "=" * 88
@@ -320,7 +276,7 @@ def main():
                 print(f"\n--- WITHIN STAGE = {stage_name} -- skipped, only {len(group)} windows ---")
                 continue
             print(f"\n--- WITHIN STAGE = {stage_name} ONLY ({len(group)} windows, {group['subject_id'].nunique()} subjects) ---")
-            report_correlations(group, "attn_weight", band_cols + yasa_cols)
+            report_reference_correlations(group, "attn_weight", band_cols + yasa_cols)
 
     print(
         "\n" + "=" * 88
@@ -334,7 +290,7 @@ def main():
           "own window ordering, a proxy for time-of-night/position-in-recording) lets us check both "
           "halves of that chain directly."
     )
-    report_correlations(merged, "raw_epoch_index", ["attn_weight", "delta_real_abspower"])
+    report_reference_correlations(merged, "raw_epoch_index", ["attn_weight", "delta_real_abspower"])
 
     print(
         "\n--- Does attn_weight vs delta_real_abspower SURVIVE controlling for raw_epoch_index? ---\n"

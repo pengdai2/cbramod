@@ -86,6 +86,7 @@ from cbramod_common import (
     add_log_filename_argument,
     build_frozen_probe,
     compute_pooled_scores,
+    load_subject_ids,
     setup_cache_cli_parser,
     setup_common_cli_parser,
 )
@@ -129,11 +130,6 @@ def parse_cli_args() -> argparse.Namespace:
     add_log_filename_argument(parser, __file__)
 
     return parser.parse_args()
-
-
-def load_subject_ids(manifest_csv: str) -> List[str]:
-    df = pd.read_csv(manifest_csv)
-    return df["subject_id"].astype(str).tolist()
 
 
 def compute_naive_ce_loss(window_probs: np.ndarray, ground_truth: int, eps: float = 1e-7) -> float:

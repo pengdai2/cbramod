@@ -74,9 +74,11 @@ from cbramod_common import (
     add_log_filename_argument,
     build_frozen_e2e_classifier,
     extract_ckpt_metadata,
+    report_probability_correlations,
     resolve_pooling_config,
     seed_everything,
     setup_inference_cli_parser,
+    spearman_corr,
 )
 from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector, load_subject_ids_from_json
@@ -172,15 +174,6 @@ def compute_yasa_event_counts(signal_1d: np.ndarray, sfreq: float) -> Dict[str, 
         except Exception:
             pass
     return {"n_spindles": float(n_spindles), "n_slow_waves": float(n_slow_waves)}
-
-
-def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
-    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
-        return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def parse_cli_args() -> argparse.Namespace:
@@ -347,7 +340,7 @@ def main():
     print("\n" + "=" * 88)
     print("1) PROBABILITY vs. ABSOLUTE BAND POWER (the direct re-test of p09f's relative-power finding)")
     print("=" * 88)
-    report_correlations(df, abspower_cols, "probability vs absolute power")
+    report_probability_correlations(df, abspower_cols, "probability vs absolute power")
 
     print("\n" + "=" * 88)
     print("2) CROSS-BAND COVARIATION IN ABSOLUTE POWER (does delta co-move with the others, or trade off?)")
@@ -370,31 +363,7 @@ def main():
         "the real-uV signal reflects genuine recorded amplitude (A1/A2 referencing + active-channel-only "
         "averaging), these counts are worth correlating for the first time."
     )
-    report_correlations(df, ["n_spindles", "n_slow_waves"], "probability vs YASA event counts")
-
-
-def report_correlations(df: pd.DataFrame, feature_cols: List[str], label: str) -> None:
-    print(f"\n--- POOLED -- {label} ---")
-    for col in feature_cols:
-        r = spearman_corr(df["probability"].values, df[col].values)
-        print(f"  probability vs {col:20s}: Spearman r = {r:+.4f}  (n={len(df)})")
-
-    print(f"\n--- WITHIN-SUBJECT -- {label} ---")
-    for col in feature_cols:
-        per_subject_r = []
-        for _, group in df.groupby("subject_id"):
-            if len(group) >= 5 and group[col].std() > 0:
-                r = spearman_corr(group["probability"].values, group[col].values)
-                if not np.isnan(r):
-                    per_subject_r.append(r)
-        per_subject_r = np.array(per_subject_r)
-        if len(per_subject_r) == 0:
-            print(f"  probability vs {col:20s}: no subjects had enough variance to compute this.")
-            continue
-        print(
-            f"  probability vs {col:20s}: mean r = {per_subject_r.mean():+.4f}, "
-            f"median r = {np.median(per_subject_r):+.4f} (n_subjects={len(per_subject_r)})"
-        )
+    report_probability_correlations(df, ["n_spindles", "n_slow_waves"], "probability vs YASA event counts")
 
 
 def report_pairwise(df: pd.DataFrame, cols: List[str], label: str) -> None:

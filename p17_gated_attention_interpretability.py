@@ -54,6 +54,8 @@ from cbramod_common import (
     GatedAttentionMIL,
     add_log_filename_argument,
     build_gated_attention_model,
+    load_subject_ids,
+    report_reference_correlations,
     setup_cache_cli_parser,
     setup_common_cli_parser,
 )
@@ -91,53 +93,7 @@ def parse_cli_args() -> argparse.Namespace:
 
 
 # =====================================================================
-# 2. CORRELATION REPORTING (same pattern as p14)
-# =====================================================================
-
-def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
-    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
-        return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    return float(np.corrcoef(ra, rb)[0, 1])
-
-
-def report_correlations(df: pd.DataFrame, reference_col: str, feature_cols: List[str], subject_col: str = "subject_id") -> None:
-    print("\n" + "=" * 88)
-    print(f"POOLED CORRELATION ({reference_col} vs. features)")
-    print("=" * 88)
-    for col in feature_cols:
-        valid = df[col].notna()
-        r = spearman_corr(df.loc[valid, reference_col].values, df.loc[valid, col].values)
-        print(f"  {reference_col} vs {col:<24}: Spearman r = {r:+.4f}  (n={int(valid.sum())})")
-
-    print("\n" + "=" * 88)
-    print(f"WITHIN-SUBJECT CORRELATION ({reference_col} vs. features)")
-    print("=" * 88)
-    for col in feature_cols:
-        per_subject_r = []
-        for _, g in df.groupby(subject_col):
-            valid = g[col].notna()
-            if valid.sum() < 3:
-                continue
-            r = spearman_corr(g.loc[valid, reference_col].values, g.loc[valid, col].values)
-            if not np.isnan(r):
-                per_subject_r.append(r)
-        per_subject_r = np.array(per_subject_r)
-        if len(per_subject_r) == 0:
-            print(f"  {reference_col} vs {col:<24}: no subjects had enough variance to compute this.")
-            continue
-        print(
-            f"  {reference_col} vs {col:<24}: mean r = {per_subject_r.mean():+.4f}, "
-            f"median r = {np.median(per_subject_r):+.4f}, "
-            f"frac(r>0.2) = {(per_subject_r > 0.2).mean():.2f}, "
-            f"frac(r<-0.2) = {(per_subject_r < -0.2).mean():.2f} (n_subjects={len(per_subject_r)})"
-        )
-
-
-# =====================================================================
-# 3. PER-WINDOW QUANTITY EXTRACTION
+# 2. PER-WINDOW QUANTITY EXTRACTION
 # =====================================================================
 
 @torch.no_grad()
@@ -159,13 +115,8 @@ def compute_window_quantities(model: GatedAttentionMIL, bag_feats: torch.Tensor,
 
 
 # =====================================================================
-# 4. MAIN
+# 3. MAIN
 # =====================================================================
-
-def load_subject_ids(manifest_csv: str) -> List[str]:
-    df = pd.read_csv(manifest_csv)
-    return df["subject_id"].astype(str).tolist()
-
 
 def main():
     args = parse_cli_args()
@@ -219,7 +170,7 @@ def main():
         "(delta down, beta/spindle up), or something different, now that there's no separate frozen "
         "probe for a causal signal to hide behind?"
     )
-    report_correlations(merged, "attn_weight", band_cols + yasa_cols)
+    report_reference_correlations(merged, "attn_weight", band_cols + yasa_cols)
 
     print(
         "\nQuestion 2: what does each window's OWN vote (window_evidence -- exact, not a proxy, per "
@@ -227,7 +178,7 @@ def main():
         "analog to Option A's window_prob, except it comes from a head trained jointly with the "
         "gate here, not inherited from the old probe."
     )
-    report_correlations(merged, "window_evidence", band_cols + yasa_cols)
+    report_reference_correlations(merged, "window_evidence", band_cols + yasa_cols)
 
     print(
         "\nQuestion 3: does the gate preferentially amplify windows its own head already finds "
@@ -238,7 +189,7 @@ def main():
         "trusts confident windows' from 'gate trusts windows favoring one particular class'."
     )
     merged["window_evidence_abs"] = merged["window_evidence"].abs()
-    report_correlations(merged, "attn_weight", ["window_evidence", "window_evidence_abs"])
+    report_reference_correlations(merged, "attn_weight", ["window_evidence", "window_evidence_abs"])
 
 
 if __name__ == "__main__":

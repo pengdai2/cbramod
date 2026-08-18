@@ -49,6 +49,8 @@ from typing import Dict
 import numpy as np
 import pandas as pd
 
+from cbramod_stats import spearman_corr
+
 
 def parse_cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -107,13 +109,6 @@ def label_subjects(subjects_json_path: Path) -> Dict[str, str]:
     return labels
 
 
-def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
-    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
-        return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def joint_regression(y: np.ndarray, x1: np.ndarray, x2: np.ndarray) -> Dict[str, float]:

@@ -69,6 +69,7 @@ from cbramod_common import (
     GatedAttentionMIL,
     add_log_filename_argument,
     is_checkpoint_improvement,
+    load_subject_ids,
     seed_everything,
     setup_cache_cli_parser,
     setup_training_cli_parser,
@@ -180,11 +181,6 @@ def run_epoch_eval(
 # =====================================================================
 # 5. MAIN
 # =====================================================================
-
-def load_subject_ids(manifest_csv: str) -> List[str]:
-    df = pd.read_csv(manifest_csv)
-    return df["subject_id"].astype(str).tolist()
-
 
 def main():
     args = parse_cli_args()

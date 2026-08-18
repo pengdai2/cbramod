@@ -64,6 +64,7 @@ from cbramod_common import (
     add_log_filename_argument,
     build_frozen_e2e_classifier,
     extract_ckpt_metadata,
+    report_probability_correlations,
     resolve_pooling_config,
     seed_everything,
     setup_inference_cli_parser,
@@ -90,16 +91,6 @@ def compute_band_powers(signal_1d: np.ndarray, sfreq: float) -> Dict[str, float]
         mask = (freqs >= lo) & (freqs <= hi)
         powers[f"{band}_relpower"] = float(psd[mask].sum() / total_power) if total_power > 0 else 0.0
     return powers
-
-
-def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
-    """Spearman rank correlation via plain rank + Pearson (no scipy.stats dependency needed)."""
-    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
-        return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def parse_cli_args() -> argparse.Namespace:
@@ -211,7 +202,7 @@ def main():
     feature_cols = [c for c in df.columns if c not in
                      ("subject_id", "ground_truth", "raw_epoch_index", "stage", "probability")]
 
-    report_correlations(df, feature_cols, "ALL STAGES COMBINED")
+    report_probability_correlations(df, feature_cols, "ALL STAGES COMBINED")
 
     # Stage-stratified breakdown: a feature correlating with probability across a mix of stages
     # (e.g. N2 + N3) could just be reflecting a coarse stage effect -- delta power is definitionally
@@ -222,46 +213,9 @@ def main():
     # more specific (and more interesting) claim.
     stages_present = sorted(s for s in df["stage"].unique() if s and s != "UNKNOWN")
     for stage in stages_present:
-        report_correlations(df[df["stage"] == stage], feature_cols, f"STAGE = {stage} ONLY")
+        report_probability_correlations(df[df["stage"] == stage], feature_cols, f"STAGE = {stage} ONLY")
 
 
-def report_correlations(df: pd.DataFrame, feature_cols: List[str], section_label: str) -> None:
-    """Prints both the pooled and within-subject correlation summary for one (sub)set of window rows."""
-    print("\n" + "=" * 88)
-    print(f"POOLED CORRELATION -- {section_label} "
-          f"(all windows, all subjects together -- conflates within/between-subject variance)")
-    print("=" * 88)
-    if len(df) == 0:
-        print("  (no rows in this subset)")
-        return
-    for col in feature_cols:
-        r = spearman_corr(df["probability"].values, df[col].values)
-        print(f"  probability vs {col:20s}: Spearman r = {r:+.4f}  (n={len(df)})")
-
-    print("\n" + "-" * 88)
-    print(f"WITHIN-SUBJECT CORRELATION -- {section_label} (summarized across subjects -- the direct test)")
-    print("-" * 88)
-    for col in feature_cols:
-        per_subject_r = []
-        for _, group in df.groupby("subject_id"):
-            if len(group) >= 5 and group[col].std() > 0:
-                r = spearman_corr(group["probability"].values, group[col].values)
-                if not np.isnan(r):
-                    per_subject_r.append(r)
-        per_subject_r = np.array(per_subject_r)
-        if len(per_subject_r) == 0:
-            print(f"  probability vs {col:20s}: no subjects had enough variance to compute this.")
-            continue
-        # 0.2 is a loose "meaningfully nonzero" bar for eyeballing the distribution shape, not a formal
-        # significance test -- look at the full mean/median alongside it, not this fraction alone.
-        frac_pos = np.mean(per_subject_r > 0.2)
-        frac_neg = np.mean(per_subject_r < -0.2)
-        print(
-            f"  probability vs {col:20s}: mean r = {per_subject_r.mean():+.4f}, "
-            f"median r = {np.median(per_subject_r):+.4f}, "
-            f"frac(r>0.2) = {frac_pos:.2f}, frac(r<-0.2) = {frac_neg:.2f} "
-            f"(n_subjects={len(per_subject_r)})"
-        )
 
 
 if __name__ == "__main__":

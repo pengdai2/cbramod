@@ -68,11 +68,14 @@ from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_scor
 
 from cbramod_utils import setup_logger
 from cbramod_common import (
+    AttentionPoolingHead,
     CachedFeatureSubjectDataset,
     add_log_filename_argument,
     build_frozen_probe,
     compute_pooled_scores,
+    frozen_window_probs,
     is_checkpoint_improvement,
+    load_subject_ids,
     seed_everything,
     setup_cache_cli_parser,
     setup_training_cli_parser,
@@ -135,76 +138,6 @@ def parse_cli_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     return args
-
-
-# =====================================================================
-# 2. ATTENTION POOLING HEAD
-# =====================================================================
-
-class AttentionPoolingHead(nn.Module):
-    """
-    Learned replacement for compute_pooled_scores(method="p85_score"). Given one subject's bag of
-    window embeddings and that same subject's FROZEN window-level probabilities (already computed
-    by the probe head this script does not retrain), learns a per-window attention weight and
-    returns the attention-weighted sum of the window probabilities as the subject-level score.
-
-    The gate conditions on the full embedding rather than on the probe's scalar output alone: a
-    window-level probability is already a heavy compression of a ~num_patches*emb_dim-dimensional
-    embedding down to one number, optimized for a different objective (window-level classification).
-    Two windows can land at the same probe output (e.g. both near 0.5) for very different reasons --
-    one genuinely ambiguous-but-clean, one noisy/borderline-artifactual -- and that distinction is
-    already erased by the time a scalar-only gate would see it. Conditioning on the embedding
-    instead gives the gate a chance to learn "how much to trust this window" using information the
-    probe's own compression discarded; a gate restricted to a 1-dimensional input would only be able
-    to learn some monotonic-ish reweighting of the probe's own score, which is uncomfortably close
-    to just being another fixed pooling statistic rather than genuinely contextual attention.
-
-    The quantity being POOLED, though, is still the already-validated, already-trained window-level
-    probability, not the embedding itself -- this keeps the pooled score directly comparable to
-    every prior pooling strategy (p85_score, top_10_mean, ...) and keeps the probe head itself
-    completely untouched. See this file's module docstring for where that puts this design relative
-    to the original Option A / Option B framing (a deliberate hybrid, not pure Option A).
-    """
-    def __init__(self, num_patches: int = 30, emb_dim: int = 200, hidden_dim: int = 64, dropout: float = 0.1):
-        super().__init__()
-        in_features = num_patches * emb_dim
-        self.gate = nn.Sequential(
-            nn.LayerNorm(in_features),
-            nn.Linear(in_features, hidden_dim),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-
-    def forward(self, bag_feats: torch.Tensor, window_probs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        bag_feats:    [n_windows, num_patches, emb_dim] -- ONE subject's windows. n_windows varies
-                      call to call; nothing about self.gate's parameters depends on it.
-        window_probs: [n_windows] -- frozen probe's P(class=1) per window, already computed
-                      upstream with no_grad().
-
-        Returns (subject_prob, attn_weights): subject_prob is a 0-dim tensor, attn_weights is
-        [n_windows] (sums to 1) -- exposed for inspection/plotting, same role as the leave-one-out
-        contribution and LOO-influence analyses used to characterize p85 pooling.
-        """
-        n_windows = bag_feats.shape[0]
-        flat = bag_feats.reshape(n_windows, -1)          # [n_windows, num_patches * emb_dim]
-        scores = self.gate(flat).squeeze(-1)              # [n_windows]
-        attn_weights = torch.softmax(scores, dim=0)        # normalizes over THIS bag's actual size
-        subject_prob = (attn_weights * window_probs).sum()
-        return subject_prob, attn_weights
-
-
-# =====================================================================
-# 3. WINDOW-LEVEL PROBE (frozen) FORWARD PASS
-# =====================================================================
-
-
-@torch.no_grad()
-def frozen_window_probs(probe: nn.Module, bag_feats: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """P(class=1) per window, from the frozen probe, for one subject's bag of windows."""
-    logits = probe(bag_feats.to(device).float())
-    return torch.softmax(logits, dim=1)[:, 1]
 
 
 # =====================================================================
@@ -320,11 +253,6 @@ def run_epoch_eval(
 # =====================================================================
 # 6. MAIN
 # =====================================================================
-
-def load_subject_ids(manifest_csv: str) -> List[str]:
-    df = pd.read_csv(manifest_csv)
-    return df["subject_id"].astype(str).tolist()
-
 
 def log_split_metrics(logger, split_name: str, attn_metrics: Dict[str, float], p85_metrics: Dict[str, float]) -> None:
     # optimal_threshold is printed explicitly for both methods -- attn and p85 are thresholded

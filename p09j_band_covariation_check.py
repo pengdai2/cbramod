@@ -40,6 +40,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from cbramod_stats import spearman_corr
+
 
 BAND_COLS = ["delta_relpower", "theta_relpower", "alpha_relpower", "sigma_relpower", "beta_relpower"]
 
@@ -48,15 +50,6 @@ def parse_cli_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check real covariation between band relative powers across windows.")
     parser.add_argument("--morphology-csv", type=str, required=True, help="Path to p09f's morphology_score_correlation.csv.")
     return parser.parse_args()
-
-
-def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
-    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
-    if len(a) < 3 or np.std(a) == 0 or np.std(b) == 0:
-        return float("nan")
-    ra = np.argsort(np.argsort(a)).astype(np.float64)
-    rb = np.argsort(np.argsort(b)).astype(np.float64)
-    return float(np.corrcoef(ra, rb)[0, 1])
 
 
 def report_pairwise(df: pd.DataFrame, cols, label: str):
