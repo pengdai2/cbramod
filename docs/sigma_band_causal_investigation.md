@@ -13,8 +13,12 @@ and observing a dose-proportional, consistent response (94.6% of subjects move i
 direction, R² ≈ 0.97); agreement from an independent, waveform-based spindle detector (YASA) that
 never saw the spectral-power pipeline; and a raw, model-free replication of the sleep-spindle-deficit
 literature directly in this cohort's own data (patients show significantly lower spindle counts,
-p ≈ 0.003–0.005), with no model involved at all. This is causal evidence, not just correlational, and
-it converges across every measurement approach tried.
+p ≈ 0.003–0.005), with no model involved at all. Critically, this raw-data difference is **broad, not
+episodic**: it shows up throughout the bulk of a typical subject's own recording (most percentiles of
+their own windows, not just a rare extreme minority), matching the model's own predicted-probability
+shift, which is similarly broad rather than tail-concentrated — this rules out the concern that either
+the raw finding or the model's behavior is being driven by a handful of unusual windows. This is
+causal evidence, not just correlational, and it converges across every measurement approach tried.
 
 **What was tried to improve on the p85 baseline, and what's recommended.** Two learned-aggregation
 alternatives were built and fully characterized: **Option A** (attention over a frozen, already-
