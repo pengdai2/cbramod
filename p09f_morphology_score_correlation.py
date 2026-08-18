@@ -59,23 +59,17 @@ from scipy.signal import welch
 from tqdm import tqdm
 
 from cbramod_common import (
-    CBraModE2EClassifier,
+    BAND_DEFS,
     PANSubjectEEGDataset,
-    load_model_checkpoint,
+    add_log_filename_argument,
+    build_frozen_e2e_classifier,
+    extract_ckpt_metadata,
     resolve_pooling_config,
-    setup_inference_cli_parser
+    seed_everything,
+    setup_inference_cli_parser,
 )
-from cbramod_common import seed_everything
+from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector, load_subject_ids_from_json
-
-
-BAND_DEFS = {
-    "delta": (0.5, 4.0),
-    "theta": (4.0, 8.0),
-    "alpha": (8.0, 12.0),
-    "sigma": (11.0, 16.0),
-    "beta": (16.0, 30.0),
-}
 
 
 def compute_band_powers(signal_1d: np.ndarray, sfreq: float) -> Dict[str, float]:
@@ -125,11 +119,13 @@ def parse_cli_args() -> argparse.Namespace:
         "--output-csv", type=str, default="morphology_score_correlation.csv",
         help="Filename (relative to --output-dir) for the full per-window feature table."
     )
+    add_log_filename_argument(parser, __file__)
     return parser.parse_args()
 
 
 def main():
     args = parse_cli_args()
+    logger = setup_logger(args.log_filename)
     seed_everything(args.seed)
     rng = np.random.RandomState(args.seed)
 
@@ -143,15 +139,8 @@ def main():
             "itself; --features-pt (pre-extracted embeddings) has no raw waveform left to analyze."
         )
 
-    print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
-    model = CBraModE2EClassifier(
-        num_channels=args.num_channels, sfreq=args.sfreq, num_patches=args.num_patches,
-        emb_dim=args.cbra_dim, hidden_dim=args.head_dim, num_classes=args.num_classes,
-        head_type=args.head_type
-    )
-    model, _, _, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
-    model.to(device)
-    model.eval()
+    model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+    _thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     pooling_strategy, top_percentile, t_window = resolve_pooling_config(
         pooling_strategy=args.pooling_strategy, top_percentile=args.top_percentile,

@@ -66,8 +66,11 @@ from sklearn.metrics import accuracy_score, f1_score, recall_score, roc_auc_scor
 from cbramod_utils import setup_logger
 from cbramod_common import (
     CachedFeatureSubjectDataset,
+    GatedAttentionMIL,
+    add_log_filename_argument,
     is_checkpoint_improvement,
     seed_everything,
+    setup_cache_cli_parser,
     setup_training_cli_parser,
 )
 
@@ -82,9 +85,7 @@ def parse_cli_args() -> argparse.Namespace:
                     "with a jointly-trained subject-level head -- no intermediate window-level probe."
     )
 
-    cache_group = parser.add_argument_group("Cache Controls")
-    cache_group.add_argument("--cache-dir", type=str, required=True, help="Directory containing the master cache")
-    cache_group.add_argument("--master-cache-name", type=str, default="cached_master_embeddings.pt")
+    setup_cache_cli_parser(parser)
 
     model_group = parser.add_argument_group("Gated-Attention MIL Model")
     model_group.add_argument("--attn-hidden-dim", type=int, default=32, help="Hidden dim of the V/U gated-attention projections (smaller default than Option A -- see module docstring on capacity risk)")
@@ -100,78 +101,10 @@ def parse_cli_args() -> argparse.Namespace:
     eval_group.add_argument("--eval-only", action="store_true")
     eval_group.add_argument("--resume-checkpoint", type=str, default=None)
 
-    log_group = parser.add_argument_group("Logging")
-    log_group.add_argument("--log-filename", type=str, default=Path(__file__).stem + ".log")
+    add_log_filename_argument(parser, __file__)
 
     args = parser.parse_args()
     return args
-
-
-# =====================================================================
-# 2. GATED-ATTENTION MIL MODEL (Ilse et al., 2018)
-# =====================================================================
-
-class GatedAttentionMIL(nn.Module):
-    """
-    Attention-based deep MIL with a gating mechanism (Ilse, Tomczak & Welling, 2018). Unlike Option
-    A's single-nonlinearity gate (a plain LayerNorm -> Linear -> Tanh -> Dropout -> Linear MLP), the
-    classic gated-attention formulation combines a tanh branch and a sigmoid branch elementwise before
-    the final scalar score -- the sigmoid branch acts as a learned gate controlling how much of the
-    tanh branch's (potentially non-monotonic) representation contributes, which the original paper
-    found more expressive than a tanh-only gate for exactly this kind of "which instances matter" task.
-
-    No fixed bag size anywhere (same invariant as Option A): V/U/w are applied per-window with shared
-    weights, and softmax normalizes over whatever bag length is passed at call time.
-
-    forward() returns (logits, attn_weights) for ONE subject's bag -- logits are raw (pre-softmax)
-    class scores from the pooled representation, attn_weights are exposed for the same kind of
-    interpretability analysis p14 did for Option A.
-    """
-    def __init__(
-        self, num_patches: int = 30, emb_dim: int = 200, attn_hidden_dim: int = 32,
-        head_hidden_dim: int = 64, dropout: float = 0.3, num_classes: int = 2, head_type: str = "mlp",
-    ):
-        super().__init__()
-        in_features = num_patches * emb_dim
-        self.norm = nn.LayerNorm(in_features)
-        self.V = nn.Linear(in_features, attn_hidden_dim)
-        self.U = nn.Linear(in_features, attn_hidden_dim)
-        self.w = nn.Linear(attn_hidden_dim, 1)
-        self.gate_dropout = nn.Dropout(dropout)
-
-        # head_type="linear" isn't just fewer parameters than "mlp" -- it's a qualitatively different
-        # interpretability position. Because pooled = sum(attn_weight_i * embedding_i) and a LINEAR
-        # head distributes over that sum, logit = W . pooled + b = sum(attn_weight_i * (W . embedding_i))
-        # + b -- the final decision decomposes EXACTLY into a per-window "evidence" term (W . embedding_i)
-        # weighted by attn_weight_i, the same clean additive structure Option A had
-        # (attn_weight_i * window_prob_i), enabling an exact per-window attribution (correlate
-        # W . embedding_i against band power, same as p14 did for window_prob) rather than an
-        # approximation. An MLP head breaks this: MLP(sum(a_i * x_i)) != sum(a_i * MLP(x_i)) in
-        # general, since nonlinear functions don't commute with a weighted sum -- there is no exact
-        # per-window decomposition once the head is nonlinear, only approximate attribution methods
-        # (leave-one-out, gradients, etc.).
-        if head_type == "linear":
-            self.head = nn.Linear(in_features, num_classes)
-        elif head_type == "mlp":
-            self.head = nn.Sequential(
-                nn.Linear(in_features, head_hidden_dim),
-                nn.ELU(),
-                nn.Dropout(dropout),
-                nn.Linear(head_hidden_dim, num_classes),
-            )
-        else:
-            raise ValueError(f"Unknown head_type: {head_type!r} -- choose 'linear' or 'mlp'.")
-
-    def forward(self, bag_feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """bag_feats: [n_windows, num_patches, emb_dim] -- one subject's windows, n_windows arbitrary."""
-        n_windows = bag_feats.shape[0]
-        flat = self.norm(bag_feats.reshape(n_windows, -1))  # [n_windows, in_features]
-        gated = torch.tanh(self.V(flat)) * torch.sigmoid(self.U(flat))  # [n_windows, attn_hidden_dim]
-        scores = self.w(self.gate_dropout(gated)).squeeze(-1)  # [n_windows]
-        attn_weights = torch.softmax(scores, dim=0)  # normalizes over THIS bag's actual size
-        pooled = (attn_weights.unsqueeze(-1) * flat).sum(dim=0)  # [in_features] -- weighted sum of embeddings
-        logits = self.head(pooled.unsqueeze(0)).squeeze(0)  # [num_classes]
-        return logits, attn_weights
 
 
 # =====================================================================

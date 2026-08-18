@@ -40,26 +40,22 @@ import torch
 from tqdm import tqdm
 
 from cbramod_common import (
-    CBraModE2EClassifier,
+    BAND_DEFS,
     PANSubjectEEGDataset,
+    add_log_filename_argument,
+    build_frozen_e2e_classifier,
     compute_pooled_scores,
+    extract_ckpt_metadata,
     get_operating_threshold,
-    load_model_checkpoint,
     perturb_window_band_power,
     resolve_pooling_config,
     seed_everything,
     setup_inference_cli_parser,
+    setup_perturbation_cli_parser,
 )
+from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import load_subject_ids_from_json
 from p13_attention_mil_pooling import AttentionPoolingHead
-
-BAND_DEFS = {
-    "delta": (0.5, 4.0),
-    "theta": (4.0, 8.0),
-    "alpha": (8.0, 12.0),
-    "sigma": (11.0, 16.0),
-    "beta": (16.0, 30.0),
-}
 
 
 def fit_local_slope(scale_factors: np.ndarray, values: np.ndarray) -> Tuple[float, float]:
@@ -77,30 +73,26 @@ def fit_local_slope(scale_factors: np.ndarray, values: np.ndarray) -> Tuple[floa
 
 def parse_cli_args() -> argparse.Namespace:
     parser = setup_inference_cli_parser(description="Subject-Level Perturbation Test: p85 vs. Attention Pooling")
-    group = parser.add_argument_group("Perturbation Test")
-    group.add_argument("--band", type=str, default="sigma", choices=list(BAND_DEFS.keys()))
-    group.add_argument("--scale-factors", type=str, default="0.5,0.75,1.0,1.25,1.5")
-    group.add_argument("--filter-order", type=int, default=4)
-    group.add_argument("--no-preserve-total-energy", dest="preserve_total_energy", action="store_false")
-    group.add_argument("--max-windows-per-subject", type=int, default=None)
-    group.add_argument(
+    setup_perturbation_cli_parser(parser, output_csv_default="attention_pooled_perturbation.csv")
+    perturb_group = parser.add_argument_group("Perturbation Test")
+    perturb_group.add_argument(
         "--perturb-fraction", type=str, default="1.0",
         help="Comma-separated grid of fractions (each in (0, 1]) of a subject's windows to perturb "
              "(nested-prefix sampling) -- same semantics as p09i's flag of the same name."
     )
-    group.add_argument("--subjects-json", type=str, default=None)
-    group.add_argument("--output-csv", type=str, default="attention_pooled_perturbation.csv")
 
     attn_group = parser.add_argument_group("Attention Head")
     attn_group.add_argument("--attn-checkpoint", type=str, required=True, help="p13-trained attention head checkpoint")
     attn_group.add_argument("--attn-hidden-dim", type=int, default=64, help="Fallback only -- used if --attn-checkpoint predates saved architecture metadata")
     attn_group.add_argument("--attn-dropout", type=float, default=0.1, help="Inactive at eval() time; kept for AttentionPoolingHead's constructor signature")
 
+    add_log_filename_argument(parser, __file__)
     return parser.parse_args()
 
 
 def main():
     args = parse_cli_args()
+    logger = setup_logger(args.log_filename)
     seed_everything(args.seed)
     rng = np.random.RandomState(args.seed)
 
@@ -121,15 +113,8 @@ def main():
         if not (0.0 < f <= 1.0):
             raise ValueError(f"--perturb-fraction values must be in (0, 1], got {f}.")
 
-    print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
-    model = CBraModE2EClassifier(
-        num_channels=args.num_channels, sfreq=args.sfreq, num_patches=args.num_patches,
-        emb_dim=args.cbra_dim, hidden_dim=args.head_dim, num_classes=args.num_classes,
-        head_type=args.head_type
-    )
-    model, ckpt_thresholds, _, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
-    model.to(device)
-    model.eval()
+    model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+    ckpt_thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     attn_ckpt = torch.load(args.attn_checkpoint, map_location="cpu", weights_only=True)
     if "attn_hidden_dim" in attn_ckpt:

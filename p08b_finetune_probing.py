@@ -59,11 +59,13 @@ from cbramod_common import (
     CBraModTrainer,
     LinearProbeHead,
     MLPProbeHead,
+    add_log_filename_argument,
     flatten_cached_feature_dataset,
     is_checkpoint_improvement,
     seed_everything,
+    setup_cache_cli_parser,
     setup_data_loader_and_criterion,
-    setup_training_cli_parser
+    setup_training_cli_parser,
 )
 
 
@@ -86,25 +88,14 @@ def parse_cli_args() -> argparse.Namespace:
                      "(reads a master cache built by p08a_extract_features.py)"
     )
 
-    # Cache Controls
-    cache_group = parser.add_argument_group("Cache Controls")
-    cache_group.add_argument("--cache-dir", type=str, required=True, help="Directory containing the master cache (see p08a_extract_features.py)")
-    cache_group.add_argument(
-        "--master-cache-name", type=str, default="cached_master_embeddings.pt",
-        help="Filename of the whole-cohort cached embeddings file written by p08a_extract_features.py. "
-             "--train-manifest/--val-manifest (and SGKF's own subject-level splits) filter THIS SAME "
-             "cache via CachedFeatureSubjectDataset's subject filter, rather than each needing their "
-             "own separately-extracted cache."
-    )
+    setup_cache_cli_parser(parser)
 
     # Run Options
     run_group = parser.add_argument_group("Run Options")
     run_group.add_argument("--enable-sgkf", action="store_true", help="Enable stratified group k-fold cross-validation (overrides train/val split)")
     run_group.add_argument("--sgkf-folds", type=int, default=5, help="Number of folds for stratified group k-fold CV (default: 5)")
 
-    # Logging Controls
-    log_group = parser.add_argument_group("Logging")
-    log_group.add_argument("--log-filename", type=str, default=Path(__file__).stem + ".log", help="Filename for pipeline log output")
+    add_log_filename_argument(parser, __file__)
 
     args = parser.parse_args()
     args.use_amp = not args.no_amp

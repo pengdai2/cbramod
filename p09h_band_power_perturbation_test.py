@@ -51,22 +51,17 @@ import torch
 from tqdm import tqdm
 
 from cbramod_common import (
-    CBraModE2EClassifier,
+    BAND_DEFS,
     PANSubjectEEGDataset,
-    load_model_checkpoint,
+    add_log_filename_argument,
+    build_frozen_e2e_classifier,
     perturb_window_band_power,
-    setup_inference_cli_parser
+    seed_everything,
+    setup_inference_cli_parser,
+    setup_perturbation_cli_parser,
 )
-from cbramod_common import seed_everything
+from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import load_subject_ids_from_json
-
-BAND_DEFS = {
-    "delta": (0.5, 4.0),
-    "theta": (4.0, 8.0),
-    "alpha": (8.0, 12.0),
-    "sigma": (11.0, 16.0),
-    "beta": (16.0, 30.0),
-}
 
 
 def compute_relative_band_power(signal_1d: np.ndarray, sfreq: float, low: float, high: float) -> float:
@@ -120,44 +115,16 @@ def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
 
 def parse_cli_args() -> argparse.Namespace:
     parser = setup_inference_cli_parser(description="Band Power Perturbation (Counterfactual) Test")
-    group = parser.add_argument_group("Perturbation Test")
-    group.add_argument(
-        "--band", type=str, default="sigma", choices=list(BAND_DEFS.keys()),
-        help="Which frequency band to perturb (default: sigma, the standout feature from p09f)."
+    setup_perturbation_cli_parser(
+        parser, output_csv_default="band_power_perturbation.csv", max_windows_per_subject_default=40,
     )
-    group.add_argument(
-        "--scale-factors", type=str, default="0.5,0.75,1.0,1.25,1.5",
-        help="Comma-separated grid of scale factors applied to the band's amplitude "
-             "(1.0 = unperturbed original). Used to fit a local slope per window."
-    )
-    group.add_argument("--filter-order", type=int, default=4, help="Butterworth filter order for band isolation.")
-    group.add_argument(
-        "--no-preserve-total-energy", dest="preserve_total_energy", action="store_false",
-        help="Disable renormalizing each perturbed channel back to its original std after the band "
-             "rescale. Default (preserve_total_energy=True) isolates the intended spectral-shape "
-             "effect from the confound of also shifting the channel's overall Z-scored amplitude -- "
-             "see perturb_window_band_power()'s docstring. Only disable this to reproduce/compare "
-             "against the earlier unconfounded-amplitude results."
-    )
-    group.add_argument(
-        "--max-windows-per-subject", type=int, default=40,
-        help="Randomly subsample to at most this many windows per subject (each window needs one "
-             "forward pass per scale factor, so this controls runtime directly)."
-    )
-    group.add_argument(
-        "--subjects-json", type=str, default=None,
-        help="Path to a p09d_subject_confidence_report.py --output-json report. Its subject_ids are "
-             "unioned with --subject-id (if also given) to select which subjects to analyze."
-    )
-    group.add_argument(
-        "--output-csv", type=str, default="band_power_perturbation.csv",
-        help="Filename (relative to --output-dir) for the full per-window perturbation results."
-    )
+    add_log_filename_argument(parser, __file__)
     return parser.parse_args()
 
 
 def main():
     args = parse_cli_args()
+    logger = setup_logger(args.log_filename)
     seed_everything(args.seed)
     rng = np.random.RandomState(args.seed)
 
@@ -180,15 +147,7 @@ def main():
               "the reported 'baseline_probability' will still use the true original window, "
               "but the fitted slope won't be anchored at the actual unperturbed point.")
 
-    print(f"Instantiating full CBraModE2EClassifier for raw waveform inference.")
-    model = CBraModE2EClassifier(
-        num_channels=args.num_channels, sfreq=args.sfreq, num_patches=args.num_patches,
-        emb_dim=args.cbra_dim, hidden_dim=args.head_dim, num_classes=args.num_classes,
-        head_type=args.head_type
-    )
-    model, _, _, _ = load_model_checkpoint(model, Path(args.checkpoint), device)
-    model.to(device)
-    model.eval()
+    model, _ckpt = build_frozen_e2e_classifier(args, device, logger)
 
     subject_filter = [s.strip() for s in args.subject_id.split(",")] if args.subject_id else []
     if args.subjects_json:

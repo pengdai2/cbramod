@@ -986,7 +986,7 @@ def main():
         num_classes=args.num_classes,
         head_type=args.head_type
     )
-    model, _, _, _ = load_model_checkpoint(model, Path(args.checkpoint), device)
+    model, _, _, _ = load_model_checkpoint(model, Path(args.probe_checkpoint), device)
     model.to(device)
     model.eval()
 

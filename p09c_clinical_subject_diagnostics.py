@@ -437,7 +437,7 @@ def main():
         )
 
     # 2. Load Model Checkpoint
-    model, ckpt_thresholds, epoch, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
+    model, ckpt_thresholds, epoch, ckpt_pooling_params = load_model_checkpoint(model, Path(args.probe_checkpoint), device)
     model.to(device)
     model.eval()
 

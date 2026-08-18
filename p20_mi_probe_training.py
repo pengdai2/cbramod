@@ -72,9 +72,11 @@ from cbramod_common import (
     CBraModTrainer,
     LinearProbeHead,
     MLPProbeHead,
+    add_log_filename_argument,
     flatten_cached_feature_dataset,
     is_checkpoint_improvement,
     seed_everything,
+    setup_cache_cli_parser,
     setup_training_cli_parser,
 )
 
@@ -92,9 +94,7 @@ def parse_cli_args() -> argparse.Namespace:
                     "aggregation) -- produces a p08b-compatible checkpoint for p13/p14/p09f/p09h/p09i."
     )
 
-    cache_group = parser.add_argument_group("Cache Controls")
-    cache_group.add_argument("--cache-dir", type=str, required=True, help="Directory containing the master cache")
-    cache_group.add_argument("--master-cache-name", type=str, default="cached_master_embeddings.pt")
+    setup_cache_cli_parser(parser)
 
     mi_group = parser.add_argument_group("Standard-MI Training")
     mi_group.add_argument(
@@ -115,8 +115,7 @@ def parse_cli_args() -> argparse.Namespace:
              "gradient accumulation, same rationale as p13/p16's flag of the same name."
     )
 
-    log_group = parser.add_argument_group("Logging")
-    log_group.add_argument("--log-filename", type=str, default=Path(__file__).stem + ".log")
+    add_log_filename_argument(parser, __file__)
 
     args = parser.parse_args()
     return args

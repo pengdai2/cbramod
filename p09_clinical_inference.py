@@ -121,7 +121,7 @@ def evaluate_clinical_cohort(
         )
 
     # 2. Load Model Checkpoint (Head-Only or Full-Model)
-    model, ckpt_thresholds, epoch, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
+    model, ckpt_thresholds, epoch, ckpt_pooling_params = load_model_checkpoint(model, Path(args.probe_checkpoint), device)
     model.to(device)
     model.eval()
 

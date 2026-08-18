@@ -33,11 +33,13 @@ import torch
 
 from cbramod_common import (
     CachedFeatureSubjectDataset,
+    add_log_filename_argument,
+    build_frozen_probe,
+    setup_cache_cli_parser,
     setup_common_cli_parser,
 )
 from p13_attention_mil_pooling import (
     AttentionPoolingHead,
-    build_frozen_probe,
     frozen_window_probs,
     load_subject_ids,
 )
@@ -56,9 +58,7 @@ def parse_cli_args() -> argparse.Namespace:
     )
     setup_common_cli_parser(parser)
 
-    cache_group = parser.add_argument_group("Cache Controls")
-    cache_group.add_argument("--cache-dir", type=str, required=True, help="Directory containing the master cache")
-    cache_group.add_argument("--master-cache-name", type=str, default="cached_master_embeddings.pt")
+    setup_cache_cli_parser(parser)
 
     ckpt_group = parser.add_argument_group("Checkpoints")
     ckpt_group.add_argument("--probe-checkpoint", type=str, required=True, help="p08b-trained probe head checkpoint")
@@ -76,7 +76,7 @@ def parse_cli_args() -> argparse.Namespace:
 
     out_group = parser.add_argument_group("Output")
     out_group.add_argument("--output-csv", type=str, default="attention_weight_interpretability.csv")
-    out_group.add_argument("--log-filename", type=str, default=Path(__file__).stem + ".log")
+    add_log_filename_argument(parser, __file__)
 
     return parser.parse_args()
 

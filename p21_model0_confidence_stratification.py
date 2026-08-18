@@ -81,9 +81,15 @@ import numpy as np
 import pandas as pd
 import torch
 
-from cbramod_common import CachedFeatureSubjectDataset, compute_pooled_scores, setup_common_cli_parser
+from cbramod_common import (
+    CachedFeatureSubjectDataset,
+    add_log_filename_argument,
+    build_frozen_probe,
+    compute_pooled_scores,
+    setup_cache_cli_parser,
+    setup_common_cli_parser,
+)
 from cbramod_utils import setup_logger
-from p13_attention_mil_pooling import build_frozen_probe
 
 
 def parse_cli_args() -> argparse.Namespace:
@@ -94,9 +100,7 @@ def parse_cli_args() -> argparse.Namespace:
     )
     setup_common_cli_parser(parser)
 
-    cache_group = parser.add_argument_group("Cache Controls")
-    cache_group.add_argument("--cache-dir", type=str, required=True)
-    cache_group.add_argument("--master-cache-name", type=str, default="cached_master_embeddings.pt")
+    setup_cache_cli_parser(parser)
 
     ckpt_group = parser.add_argument_group("Model[0] (frozen probe)")
     ckpt_group.add_argument("--probe-checkpoint", type=str, required=True, help="model[0] -- the already-validated probe checkpoint to stratify against")
@@ -122,7 +126,7 @@ def parse_cli_args() -> argparse.Namespace:
              "signed_margin distribution, not blind."
     )
     strat_group.add_argument("--output-csv", type=str, default="model0_confidence_stratification.csv")
-    strat_group.add_argument("--log-filename", type=str, default=Path(__file__).stem + ".log")
+    add_log_filename_argument(parser, __file__)
 
     return parser.parse_args()
 

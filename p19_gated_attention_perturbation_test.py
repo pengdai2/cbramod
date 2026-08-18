@@ -33,22 +33,18 @@ import torch
 from tqdm import tqdm
 
 from cbramod_common import (
+    BAND_DEFS,
     CBraModFeatureExtractor,
     PANSubjectEEGDataset,
+    add_log_filename_argument,
+    build_gated_attention_model,
     perturb_window_band_power,
     seed_everything,
+    setup_perturbation_cli_parser,
     setup_common_cli_parser,
 )
+from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import load_subject_ids_from_json
-from p16_gated_attention_embedding_mil import GatedAttentionMIL
-
-BAND_DEFS = {
-    "delta": (0.5, 4.0),
-    "theta": (4.0, 8.0),
-    "alpha": (8.0, 12.0),
-    "sigma": (11.0, 16.0),
-    "beta": (16.0, 30.0),
-}
 
 
 def fit_local_slope(scale_factors: np.ndarray, values: np.ndarray) -> Tuple[float, float]:
@@ -84,30 +80,27 @@ def parse_cli_args() -> argparse.Namespace:
     data_group.add_argument("--subject-id", type=str, default=None, help="Optional comma-separated list of specific Subject IDs to analyze")
     data_group.add_argument("--output-dir", type=str, default=None, help="Output directory for results")
 
-    group = parser.add_argument_group("Perturbation Test")
-    group.add_argument("--band", type=str, default="sigma", choices=list(BAND_DEFS.keys()))
-    group.add_argument("--scale-factors", type=str, default="0.5,0.75,1.0,1.25,1.5")
-    group.add_argument("--filter-order", type=int, default=4)
-    group.add_argument("--no-preserve-total-energy", dest="preserve_total_energy", action="store_false")
-    group.add_argument("--max-windows-per-subject", type=int, default=None)
-    group.add_argument(
+    setup_perturbation_cli_parser(parser, output_csv_default="gated_attention_perturbation.csv")
+    perturb_group = parser.add_argument_group("Perturbation Test")
+    perturb_group.add_argument(
         "--perturb-fraction", type=str, default="1.0",
         help="Comma-separated grid of fractions (each in (0, 1]) of a subject's windows to perturb "
              "(nested-prefix sampling) -- same semantics as p09i/p15's flag of the same name."
     )
-    group.add_argument("--subjects-json", type=str, default=None)
-    group.add_argument("--output-csv", type=str, default="gated_attention_perturbation.csv")
 
     ckpt_group = parser.add_argument_group("Option B Model")
     ckpt_group.add_argument("--model-checkpoint", type=str, required=True)
     ckpt_group.add_argument("--attn-hidden-dim", type=int, default=32, help="Fallback only")
     ckpt_group.add_argument("--head-hidden-dim", type=int, default=64, help="Fallback only, irrelevant for a linear head")
 
+    add_log_filename_argument(parser, __file__)
+
     return parser.parse_args()
 
 
 def main():
     args = parse_cli_args()
+    logger = setup_logger(args.log_filename)
     seed_everything(args.seed)
     rng = np.random.RandomState(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -125,22 +118,10 @@ def main():
         if not (0.0 < f <= 1.0):
             raise ValueError(f"--perturb-fraction values must be in (0, 1], got {f}.")
 
-    ckpt = torch.load(args.model_checkpoint, map_location="cpu", weights_only=True)
-    head_type = ckpt.get("head_type", "mlp")
-    attn_hidden_dim = ckpt.get("attn_hidden_dim", args.attn_hidden_dim)
-    head_hidden_dim = ckpt.get("head_hidden_dim", args.head_hidden_dim)
-    num_patches = ckpt.get("num_patches", args.num_patches)
-    cbra_dim = ckpt.get("cbra_dim", args.cbra_dim)
-    num_classes = ckpt.get("num_classes", args.num_classes)
+    model, ckpt = build_gated_attention_model(args, device, logger)
     threshold = ckpt.get("optimal_threshold", 0.5)
-
-    model = GatedAttentionMIL(
-        num_patches=num_patches, emb_dim=cbra_dim, attn_hidden_dim=attn_hidden_dim,
-        head_hidden_dim=head_hidden_dim, dropout=0.0, num_classes=num_classes, head_type=head_type,
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    print(f"Loaded Option B model from {args.model_checkpoint} (epoch {ckpt.get('epoch', '?')}, head_type={head_type}), threshold={threshold:.4f}")
+    print(f"Loaded Option B model from {args.model_checkpoint} (epoch {ckpt.get('epoch', '?')}, "
+          f"head_type={ckpt.get('head_type', 'mlp')}), threshold={threshold:.4f}")
 
     extractor = CBraModFeatureExtractor(num_channels=args.num_channels, sfreq=args.sfreq).to(device)
     extractor.eval()

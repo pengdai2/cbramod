@@ -49,8 +49,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from cbramod_common import CachedFeatureSubjectDataset, setup_common_cli_parser
-from p16_gated_attention_embedding_mil import GatedAttentionMIL
+from cbramod_common import (
+    CachedFeatureSubjectDataset,
+    GatedAttentionMIL,
+    add_log_filename_argument,
+    build_gated_attention_model,
+    setup_cache_cli_parser,
+    setup_common_cli_parser,
+)
 from cbramod_utils import setup_logger
 
 
@@ -66,9 +72,7 @@ def parse_cli_args() -> argparse.Namespace:
     )
     setup_common_cli_parser(parser)
 
-    cache_group = parser.add_argument_group("Cache Controls")
-    cache_group.add_argument("--cache-dir", type=str, required=True)
-    cache_group.add_argument("--master-cache-name", type=str, default="cached_master_embeddings.pt")
+    setup_cache_cli_parser(parser)
 
     ckpt_group = parser.add_argument_group("Checkpoint")
     ckpt_group.add_argument("--model-checkpoint", type=str, required=True, help="p16-trained Option B checkpoint")
@@ -81,7 +85,7 @@ def parse_cli_args() -> argparse.Namespace:
 
     out_group = parser.add_argument_group("Output")
     out_group.add_argument("--output-csv", type=str, default="gated_attention_interpretability.csv")
-    out_group.add_argument("--log-filename", type=str, default=Path(__file__).stem + ".log")
+    add_log_filename_argument(parser, __file__)
 
     return parser.parse_args()
 
@@ -168,28 +172,7 @@ def main():
     logger = setup_logger(args.log_filename)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    ckpt = torch.load(args.model_checkpoint, map_location="cpu", weights_only=True)
-    head_type = ckpt.get("head_type", "mlp")
-    if head_type != "linear":
-        raise ValueError(
-            f"--model-checkpoint has head_type={head_type!r}, not 'linear'. The exact per-window "
-            f"decomposition this script relies on (head(pooled) == sum(attn_weight_i * head(flat_i))) "
-            f"only holds for a linear head -- an MLP head does not commute with the weighted sum, so "
-            f"window_evidence would not mean what this script's docstring claims. Train (or load) a "
-            f"--head-type linear p16 checkpoint instead."
-        )
-    attn_hidden_dim = ckpt.get("attn_hidden_dim", args.attn_hidden_dim)
-    num_patches = ckpt.get("num_patches", args.num_patches)
-    cbra_dim = ckpt.get("cbra_dim", args.cbra_dim)
-    num_classes = ckpt.get("num_classes", args.num_classes)
-
-    model = GatedAttentionMIL(
-        num_patches=num_patches, emb_dim=cbra_dim, attn_hidden_dim=attn_hidden_dim,
-        head_hidden_dim=args.head_hidden_dim, dropout=0.0, num_classes=num_classes, head_type="linear",
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
-    logger.info(f"Loaded Option B (linear head) model from {args.model_checkpoint} (epoch {ckpt.get('epoch', '?')})")
+    model, _ckpt = build_gated_attention_model(args, device, logger, require_head_type="linear")
 
     master_cache_path = Path(args.cache_dir) / args.master_cache_name
     subject_ids = load_subject_ids(args.manifest)

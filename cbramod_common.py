@@ -535,6 +535,70 @@ class CBraModFeatureExtractor(nn.Module):
         return feats.mean(dim=1)
 
 
+class GatedAttentionMIL(nn.Module):
+    """
+    Attention-based deep MIL with a gating mechanism (Ilse, Tomczak & Welling, 2018) -- Option B's
+    architecture (p16_gated_attention_embedding_mil.py and friends p17-p19). Unlike Option A's
+    single-nonlinearity gate (a plain LayerNorm -> Linear -> Tanh -> Dropout -> Linear MLP), the
+    classic gated-attention formulation combines a tanh branch and a sigmoid branch elementwise before
+    the final scalar score -- the sigmoid branch acts as a learned gate controlling how much of the
+    tanh branch's (potentially non-monotonic) representation contributes, which the original paper
+    found more expressive than a tanh-only gate for exactly this kind of "which instances matter" task.
+
+    No fixed bag size anywhere (same invariant as Option A): V/U/w are applied per-window with shared
+    weights, and softmax normalizes over whatever bag length is passed at call time.
+
+    forward() returns (logits, attn_weights) for ONE subject's bag -- logits are raw (pre-softmax)
+    class scores from the pooled representation, attn_weights are exposed for the same kind of
+    interpretability analysis p14 did for Option A.
+    """
+    def __init__(
+        self, num_patches: int = 30, emb_dim: int = 200, attn_hidden_dim: int = 32,
+        head_hidden_dim: int = 64, dropout: float = 0.3, num_classes: int = 2, head_type: str = "mlp",
+    ):
+        super().__init__()
+        in_features = num_patches * emb_dim
+        self.norm = nn.LayerNorm(in_features)
+        self.V = nn.Linear(in_features, attn_hidden_dim)
+        self.U = nn.Linear(in_features, attn_hidden_dim)
+        self.w = nn.Linear(attn_hidden_dim, 1)
+        self.gate_dropout = nn.Dropout(dropout)
+
+        # head_type="linear" isn't just fewer parameters than "mlp" -- it's a qualitatively different
+        # interpretability position. Because pooled = sum(attn_weight_i * embedding_i) and a LINEAR
+        # head distributes over that sum, logit = W . pooled + b = sum(attn_weight_i * (W . embedding_i))
+        # + b -- the final decision decomposes EXACTLY into a per-window "evidence" term (W . embedding_i)
+        # weighted by attn_weight_i, the same clean additive structure Option A had
+        # (attn_weight_i * window_prob_i), enabling an exact per-window attribution (correlate
+        # W . embedding_i against band power, same as p14 did for window_prob) rather than an
+        # approximation. An MLP head breaks this: MLP(sum(a_i * x_i)) != sum(a_i * MLP(x_i)) in
+        # general, since nonlinear functions don't commute with a weighted sum -- there is no exact
+        # per-window decomposition once the head is nonlinear, only approximate attribution methods
+        # (leave-one-out, gradients, etc.).
+        if head_type == "linear":
+            self.head = nn.Linear(in_features, num_classes)
+        elif head_type == "mlp":
+            self.head = nn.Sequential(
+                nn.Linear(in_features, head_hidden_dim),
+                nn.ELU(),
+                nn.Dropout(dropout),
+                nn.Linear(head_hidden_dim, num_classes),
+            )
+        else:
+            raise ValueError(f"Unknown head_type: {head_type!r} -- choose 'linear' or 'mlp'.")
+
+    def forward(self, bag_feats: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """bag_feats: [n_windows, num_patches, emb_dim] -- one subject's windows, n_windows arbitrary."""
+        n_windows = bag_feats.shape[0]
+        flat = self.norm(bag_feats.reshape(n_windows, -1))  # [n_windows, in_features]
+        gated = torch.tanh(self.V(flat)) * torch.sigmoid(self.U(flat))  # [n_windows, attn_hidden_dim]
+        scores = self.w(self.gate_dropout(gated)).squeeze(-1)  # [n_windows]
+        attn_weights = torch.softmax(scores, dim=0)  # normalizes over THIS bag's actual size
+        pooled = (attn_weights.unsqueeze(-1) * flat).sum(dim=0)  # [in_features] -- weighted sum of embeddings
+        logits = self.head(pooled.unsqueeze(0)).squeeze(0)  # [num_classes]
+        return logits, attn_weights
+
+
 def compute_pooled_scores(
     window_probs: np.ndarray,
     method: str = "p85_score",
@@ -637,6 +701,15 @@ def compute_leave_one_out_contributions(
         mask[i] = True
 
     return contributions
+
+
+BAND_DEFS = {
+    "delta": (0.5, 4.0),
+    "theta": (4.0, 8.0),
+    "alpha": (8.0, 12.0),
+    "sigma": (11.0, 16.0),
+    "beta": (16.0, 30.0),
+}
 
 
 def perturb_window_band_power(
@@ -921,6 +994,66 @@ def setup_common_cli_parser(parser: argparse.ArgumentParser) -> None:
     sys_group.add_argument("--no-amp", action="store_true", help="Disable Automatic Mixed Precision (AMP)")
 
 
+def setup_cache_cli_parser(parser: argparse.ArgumentParser) -> None:
+    """Adds --cache-dir/--master-cache-name -- shared by every script that reads from the master
+    feature cache built by p08a_extract_features.py (p13/p14/p16/p17/p18/p20/p21), previously
+    duplicated verbatim across all of them."""
+    cache_group = parser.add_argument_group("Cache")
+    cache_group.add_argument("--cache-dir", type=str, required=True, help="Directory containing the master cache")
+    cache_group.add_argument("--master-cache-name", type=str, default="cached_master_embeddings.pt")
+
+
+def add_log_filename_argument(parser: argparse.ArgumentParser, script_file: str) -> None:
+    """Adds --log-filename with a default derived from the calling script's own filename (pass
+    __file__ from the calling script). A tiny shared helper purely so every script's --log-filename
+    has identical help text/behavior -- the one-liner itself wasn't hard to duplicate, but it had
+    drifted into a few slightly different phrasings across the p13-p21 family."""
+    group = parser.add_argument_group("Logging")
+    group.add_argument(
+        "--log-filename", type=str, default=Path(script_file).stem + ".log",
+        help="Filename for this script's own log output."
+    )
+
+
+def setup_perturbation_cli_parser(
+    parser: argparse.ArgumentParser,
+    output_csv_default: str,
+    max_windows_per_subject_default: Optional[int] = None,
+) -> None:
+    """Adds the CLI flags shared by every band-power perturbation test in this project
+    (p09h/p09i/p15/p19): band choice, scale-factor grid, filter order, total-energy preservation,
+    a subsampling cap, and a subject-selection JSON. --output-csv's default and
+    --max-windows-per-subject's default vary per script (p09h alone defaults the latter to 40, not
+    None), so both are passed in rather than hardcoded. --perturb-fraction (p09i's graded-subset
+    dose-response sweep) is intentionally NOT included here -- add it separately where needed."""
+    group = parser.add_argument_group("Perturbation Test")
+    group.add_argument(
+        "--band", type=str, default="sigma", choices=list(BAND_DEFS.keys()),
+        help="Which frequency band to perturb."
+    )
+    group.add_argument(
+        "--scale-factors", type=str, default="0.5,0.75,1.0,1.25,1.5",
+        help="Comma-separated grid of scale factors applied to the band's amplitude "
+             "(1.0 = unperturbed original)."
+    )
+    group.add_argument("--filter-order", type=int, default=4, help="Butterworth filter order for band isolation.")
+    group.add_argument(
+        "--no-preserve-total-energy", dest="preserve_total_energy", action="store_false",
+        help="Disable renormalizing each perturbed channel back to its original std after the band "
+             "rescale (see perturb_window_band_power()'s docstring). Default: preserve_total_energy=True."
+    )
+    group.add_argument(
+        "--max-windows-per-subject", type=int, default=max_windows_per_subject_default,
+        help="Optional cap on windows perturbed/analyzed per subject, for runtime control."
+    )
+    group.add_argument(
+        "--subjects-json", type=str, default=None,
+        help="Path to a p09d_subject_confidence_report.py --output-json report. Its subject_ids are "
+             "unioned with --subject-id (if also given) to select which subjects to analyze."
+    )
+    group.add_argument("--output-csv", type=str, default=output_csv_default)
+
+
 def setup_training_cli_parser(
     description: str = "CBraMod Training"
 ) -> argparse.ArgumentParser:
@@ -983,7 +1116,11 @@ def setup_inference_cli_parser(
 
     # Checkpoint Input
     ckpt_group = parser.add_argument_group("Checkpoint")
-    ckpt_group.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint (.pt)")
+    ckpt_group.add_argument(
+        "--checkpoint", "--probe-checkpoint", dest="probe_checkpoint", type=str, required=True,
+        help="Path to the p08b-trained probe checkpoint (.pt). --probe-checkpoint is accepted as an "
+             "alias for the same flag, matching the naming used by p13/p14/p20/p21."
+    )
 
     # Subject Data
     data_group = parser.add_mutually_exclusive_group(required=True)
@@ -1028,6 +1165,25 @@ def setup_inference_cli_parser(
     return parser
 
 
+def extract_ckpt_metadata(checkpoint: dict) -> Tuple[dict, Union[int, str], Dict[str, Union[str, float]]]:
+    """
+    Pulls (optimal_thresholds, epoch, pooling_params) off a raw checkpoint dict -- the same
+    extraction load_model_checkpoint() has always done internally, now also usable directly by
+    callers of build_frozen_e2e_classifier()/build_gated_attention_model() (p09i/p15), which return
+    the raw checkpoint dict instead of this pre-extracted tuple. Only keys actually present are
+    included in pooling_params, so older checkpoints saved before this field existed degrade
+    gracefully to an empty dict.
+    """
+    optimal_thresholds = checkpoint.get("optimal_thresholds", {}) if isinstance(checkpoint, dict) else {}
+    epoch = checkpoint.get("epoch", "N/A") if isinstance(checkpoint, dict) else "N/A"
+    ckpt_pooling_params = {
+        key: checkpoint[key]
+        for key in ("primary_pooling", "top_percentile", "t_window")
+        if isinstance(checkpoint, dict) and key in checkpoint
+    }
+    return optimal_thresholds, epoch, ckpt_pooling_params
+
+
 def load_model_checkpoint(
     model: torch.nn.Module,
     checkpoint_path: Path,
@@ -1058,13 +1214,7 @@ def load_model_checkpoint(
     else:
         state_dict = checkpoint
 
-    optimal_thresholds = checkpoint.get("optimal_thresholds", {}) if isinstance(checkpoint, dict) else {}
-    epoch = checkpoint.get("epoch", "N/A") if isinstance(checkpoint, dict) else "N/A"
-    ckpt_pooling_params = {
-        key: checkpoint[key]
-        for key in ("primary_pooling", "top_percentile", "t_window")
-        if isinstance(checkpoint, dict) and key in checkpoint
-    }
+    optimal_thresholds, epoch, ckpt_pooling_params = extract_ckpt_metadata(checkpoint)
 
     # Strategy 1: Attempt direct full-model state dict load (Full Fine-Tuning)
     try:
@@ -1097,6 +1247,193 @@ def load_model_checkpoint(
         print(f"  [Info] Unexpected keys: {len(unexpected_keys)}")
 
     return model, optimal_thresholds, epoch, ckpt_pooling_params
+
+
+def infer_probe_architecture(state_dict: Dict[str, torch.Tensor]) -> Dict[str, object]:
+    """
+    Infers head_type (and, for MLP, hidden_dim) directly from a probe checkpoint's own state_dict
+    keys/shapes, rather than trusting --head-type/--head-dim to happen to match whatever the
+    checkpoint was actually trained with. A probe checkpoint only stores weights, not architecture --
+    --head-type's default is "mlp" (setup_common_cli_parser's shared default across every script that
+    uses it), but this investigation has mostly trained and used the LINEAR head, so relying on the
+    flag alone is a real, easy-to-hit footgun: forgetting --head-type=linear would try to
+    load_state_dict() a linear checkpoint into an MLPProbeHead, which raises a size-mismatch/missing-key
+    RuntimeError -- not silent corruption, but also not an obviously-actionable message pointing at
+    the real cause. Determining architecture from the file itself removes the whole failure mode.
+
+    LinearProbeHead.head is Sequential(Rearrange, LayerNorm, Linear) -> keys head.1.*, head.2.*.
+    MLPProbeHead.head is Sequential(Rearrange, LayerNorm, Linear, ELU, Dropout, Linear) -> keys
+    head.1.*, head.2.*, head.5.* (ELU/Dropout have no parameters, so no head.3.*/head.4.* keys exist).
+    """
+    if "head.5.weight" in state_dict:
+        return {"head_type": "mlp", "hidden_dim": int(state_dict["head.2.weight"].shape[0])}
+    elif "head.2.weight" in state_dict:
+        return {"head_type": "linear"}
+    raise KeyError(
+        f"Could not recognize probe checkpoint architecture from its state_dict keys "
+        f"({sorted(state_dict.keys())}) -- expected either LinearProbeHead's keys ('head.1.*', "
+        f"'head.2.*') or MLPProbeHead's keys ('head.1.*', 'head.2.*', 'head.5.*')."
+    )
+
+
+def resolve_probe_architecture(checkpoint_path, config: argparse.Namespace, logger) -> Tuple[Dict[str, object], Dict[str, torch.Tensor], dict]:
+    """
+    Resolves a p08b/p20-trained probe checkpoint's ACTUAL head architecture (head_type, and
+    hidden_dim for MLP), NEVER trusting --head-type/--head-dim blindly. Priority order:
+      1. Explicit metadata saved IN the checkpoint itself (p08b/p20 write "head_type"/"head_dim" at
+         save time) -- the single source of truth going forward, no guessing involved.
+      2. For checkpoints that predate that fix, fall back to inferring architecture from the
+         state_dict's own key/shape pattern (infer_probe_architecture()) -- still derived from the
+         file itself, just less direct than explicit metadata.
+    Either way, --head-type/--head-dim are only ever used as a cross-check (mismatch logged loudly),
+    never as the actual source of the reconstructed architecture. Shared by both consumers of a
+    probe checkpoint: build_frozen_probe() (bare head, for cached-embedding scripts) and
+    build_frozen_e2e_classifier() (full backbone+head, for raw-waveform scripts).
+
+    Returns (resolved_architecture, head_state_dict, raw_checkpoint_dict) -- callers construct the
+    module that fits their own use case and load the state dict into the right place themselves.
+    """
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    state_dict = ckpt["model_state_dict"] if "model_state_dict" in ckpt else ckpt
+
+    if "head_type" in ckpt:
+        resolved = {"head_type": ckpt["head_type"]}
+        if ckpt["head_type"] == "mlp":
+            resolved["hidden_dim"] = ckpt["head_dim"]
+    else:
+        logger.warning(
+            f"Probe checkpoint ({checkpoint_path}) has no explicit head_type metadata -- it predates "
+            f"that being saved. Falling back to inferring architecture from the state_dict's own "
+            f"key/shape pattern instead of guessing from --head-type."
+        )
+        resolved = infer_probe_architecture(state_dict)
+
+    if resolved["head_type"] != config.head_type or (
+        resolved["head_type"] == "mlp" and resolved.get("hidden_dim") != config.head_dim
+    ):
+        logger.warning(
+            f"--head-type/--head-dim ({config.head_type}/{config.head_dim}) do NOT match what the "
+            f"probe checkpoint ({checkpoint_path}) actually is ({resolved}) -- using the checkpoint's "
+            f"own architecture (this is what actually gets built), not the CLI flags. If this is "
+            f"unexpected, double check the checkpoint path points at the file you think it does."
+        )
+
+    return resolved, state_dict, ckpt
+
+
+def build_frozen_probe(config: argparse.Namespace, device: torch.device, logger) -> nn.Module:
+    """
+    Reconstructs the bare probe head architecture and loads frozen weights from
+    config.probe_checkpoint -- for scripts operating on already-extracted cached embeddings
+    (p13/p14/p20/p21), which only ever need the head, not the CBraMod backbone. See
+    resolve_probe_architecture() for the metadata-first resolution this relies on.
+    """
+    resolved, state_dict, _ckpt = resolve_probe_architecture(config.probe_checkpoint, config, logger)
+
+    if resolved["head_type"] == "linear":
+        probe = LinearProbeHead(num_patches=config.num_patches, emb_dim=config.cbra_dim, num_classes=config.num_classes)
+    else:
+        probe = MLPProbeHead(
+            num_patches=config.num_patches, emb_dim=config.cbra_dim,
+            hidden_dim=resolved["hidden_dim"], num_classes=config.num_classes, dropout=config.dropout,
+        )
+
+    probe.load_state_dict(state_dict)
+    probe.to(device)
+    probe.eval()
+    for p in probe.parameters():
+        p.requires_grad_(False)
+    return probe
+
+
+def build_frozen_e2e_classifier(config: argparse.Namespace, device: torch.device, logger) -> Tuple[nn.Module, dict]:
+    """
+    Same metadata-first architecture resolution as build_frozen_probe(), but constructs the full
+    CBraModE2EClassifier (fresh pretrained backbone + the checkpoint's own head) instead of a bare
+    head -- for scripts that need raw-waveform inference (p09f/p09h/p09i/p15), since they must run
+    the backbone forward pass themselves on (possibly perturbed) raw signal rather than reading
+    pre-extracted embeddings from the master cache.
+
+    Replaces the previous pattern in these scripts (construct a CBraModE2EClassifier purely from
+    --head-type/--head-dim, then load_model_checkpoint() the head weights in afterward, discovering
+    any mismatch only via a shape-mismatch RuntimeError) with the same metadata-first, loud-warning
+    discipline p13/p14/p20/p21 already had for the bare-head case.
+
+    Returns (model, raw_checkpoint_dict) -- the checkpoint dict is returned too so callers can read
+    optimal_thresholds/primary_pooling/etc. off it themselves, same information load_model_checkpoint()
+    used to hand back as a tuple.
+    """
+    resolved, state_dict, ckpt = resolve_probe_architecture(config.probe_checkpoint, config, logger)
+
+    model = CBraModE2EClassifier(
+        num_channels=config.num_channels, sfreq=config.sfreq, num_patches=config.num_patches,
+        emb_dim=config.cbra_dim, hidden_dim=resolved.get("hidden_dim", config.head_dim),
+        num_classes=config.num_classes, dropout=config.dropout, head_type=resolved["head_type"],
+    )
+    model.head.load_state_dict(state_dict)
+    model.to(device)
+    model.eval()
+    return model, ckpt
+
+
+def build_gated_attention_model(
+    config: argparse.Namespace, device: torch.device, logger, require_head_type: Optional[str] = None,
+) -> Tuple[nn.Module, dict]:
+    """
+    Reconstructs a GatedAttentionMIL (Option B) architecture and loads frozen weights from
+    config.model_checkpoint, reading the checkpoint's own saved metadata
+    (attn_hidden_dim/head_hidden_dim/num_patches/cbra_dim/num_classes/head_type) with a LOUD warning
+    on any mismatch against the corresponding CLI flags -- replacing the silent
+    `ckpt.get(key, args.xxx)` pattern previously duplicated across p17/p18/p19, which accepted a
+    mismatch with no warning at all.
+
+    require_head_type: if given (e.g. "linear"), raises with an explanation if the checkpoint's own
+    head_type doesn't match -- p17/p18 both need this since they rely on the exact per-window linear
+    decomposition, which only holds for a linear head.
+
+    Returns (model, raw_checkpoint_dict) -- callers read optimal_threshold/epoch/etc. off the dict.
+    """
+    ckpt = torch.load(config.model_checkpoint, map_location="cpu", weights_only=True)
+    head_type = ckpt.get("head_type", "mlp")
+
+    if require_head_type is not None and head_type != require_head_type:
+        raise ValueError(
+            f"--model-checkpoint has head_type={head_type!r}, not {require_head_type!r}. This script "
+            f"relies on the exact linear-head decomposition (head(pooled) == "
+            f"sum(attn_weight_i * head(flat_i))), which only holds for a linear head -- an MLP head "
+            f"does not commute with the weighted sum. Train (or load) a --head-type linear p16 "
+            f"checkpoint instead."
+        )
+
+    resolved = {
+        "attn_hidden_dim": ckpt.get("attn_hidden_dim", config.attn_hidden_dim),
+        "head_hidden_dim": ckpt.get("head_hidden_dim", config.head_hidden_dim),
+        "num_patches": ckpt.get("num_patches", config.num_patches),
+        "cbra_dim": ckpt.get("cbra_dim", config.cbra_dim),
+        "num_classes": ckpt.get("num_classes", config.num_classes),
+        "head_type": head_type,
+    }
+    for key in ("attn_hidden_dim", "head_hidden_dim"):
+        cli_value = getattr(config, key, None)
+        if cli_value is not None and resolved[key] != cli_value:
+            logger.warning(
+                f"--{key.replace('_', '-')} ({cli_value}) does NOT match what --model-checkpoint "
+                f"actually is ({resolved[key]}) -- using the checkpoint's own value (this is what "
+                f"actually gets built), not the CLI flag."
+            )
+
+    model = GatedAttentionMIL(
+        num_patches=resolved["num_patches"], emb_dim=resolved["cbra_dim"],
+        attn_hidden_dim=resolved["attn_hidden_dim"], head_hidden_dim=resolved["head_hidden_dim"],
+        dropout=0.0, num_classes=resolved["num_classes"], head_type=resolved["head_type"],
+    ).to(device)
+    model.load_state_dict(ckpt["model_state_dict"])
+    model.eval()
+    logger.info(
+        f"Loaded Option B ({resolved['head_type']} head) model from {config.model_checkpoint} "
+        f"(epoch {ckpt.get('epoch', '?')})"
+    )
+    return model, ckpt
 
 
 def get_operating_threshold(

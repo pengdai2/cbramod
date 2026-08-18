@@ -69,23 +69,17 @@ except ImportError:
     HAS_YASA = False
 
 from cbramod_common import (
-    CBraModE2EClassifier,
+    BAND_DEFS,
     PANSubjectEEGDataset,
-    load_model_checkpoint,
+    add_log_filename_argument,
+    build_frozen_e2e_classifier,
+    extract_ckpt_metadata,
     resolve_pooling_config,
     seed_everything,
-    setup_inference_cli_parser
+    setup_inference_cli_parser,
 )
+from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector, load_subject_ids_from_json
-
-
-BAND_DEFS = {
-    "delta": (0.5, 4.0),
-    "theta": (4.0, 8.0),
-    "alpha": (8.0, 12.0),
-    "sigma": (11.0, 16.0),
-    "beta": (16.0, 30.0),
-}
 
 
 def load_norm_stats_by_window_idx(meta_path: Path) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
@@ -205,11 +199,13 @@ def parse_cli_args() -> argparse.Namespace:
         "--output-csv", type=str, default="absolute_band_power_analysis.csv",
         help="Filename (relative to --output-dir) for the full per-window feature table."
     )
+    add_log_filename_argument(parser, __file__)
     return parser.parse_args()
 
 
 def main():
     args = parse_cli_args()
+    logger = setup_logger(args.log_filename)
     seed_everything(args.seed)
     rng = np.random.RandomState(args.seed)
 
@@ -224,15 +220,8 @@ def main():
             "waveform (or normalization metadata) left to work with."
         )
 
-    print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
-    model = CBraModE2EClassifier(
-        num_channels=args.num_channels, sfreq=args.sfreq, num_patches=args.num_patches,
-        emb_dim=args.cbra_dim, hidden_dim=args.head_dim, num_classes=args.num_classes,
-        head_type=args.head_type
-    )
-    model, _, _, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
-    model.to(device)
-    model.eval()
+    model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+    _thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     pooling_strategy, top_percentile, t_window = resolve_pooling_config(
         pooling_strategy=args.pooling_strategy, top_percentile=args.top_percentile,

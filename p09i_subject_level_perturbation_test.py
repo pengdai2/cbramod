@@ -53,26 +53,22 @@ import torch
 from tqdm import tqdm
 
 from cbramod_common import (
-    CBraModE2EClassifier,
+    BAND_DEFS,
     PANSubjectEEGDataset,
+    add_log_filename_argument,
+    build_frozen_e2e_classifier,
     compute_leave_one_out_contributions,
     compute_pooled_scores,
+    extract_ckpt_metadata,
     get_operating_threshold,
-    load_model_checkpoint,
     perturb_window_band_power,
     resolve_pooling_config,
-    setup_inference_cli_parser
+    seed_everything,
+    setup_inference_cli_parser,
+    setup_perturbation_cli_parser,
 )
-from cbramod_common import seed_everything
+from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import load_subject_ids_from_json
-
-BAND_DEFS = {
-    "delta": (0.5, 4.0),
-    "theta": (4.0, 8.0),
-    "alpha": (8.0, 12.0),
-    "sigma": (11.0, 16.0),
-    "beta": (16.0, 30.0),
-}
 
 
 def fit_local_slope(scale_factors: np.ndarray, values: np.ndarray) -> Tuple[float, float]:
@@ -99,35 +95,9 @@ def spearman_corr(a: np.ndarray, b: np.ndarray) -> float:
 
 def parse_cli_args() -> argparse.Namespace:
     parser = setup_inference_cli_parser(description="Subject-Level (Pooled) Band Power Perturbation Test")
-    group = parser.add_argument_group("Subject-Level Perturbation Test")
-    group.add_argument(
-        "--band", type=str, default="sigma", choices=list(BAND_DEFS.keys()),
-        help="Which frequency band to perturb (default: sigma)."
-    )
-    group.add_argument(
-        "--scale-factors", type=str, default="0.5,0.75,1.0,1.25,1.5",
-        help="Comma-separated grid of scale factors applied to the band's amplitude, in EVERY window "
-             "of a subject simultaneously (1.0 = unperturbed original)."
-    )
-    group.add_argument("--filter-order", type=int, default=4, help="Butterworth filter order for band isolation.")
-    group.add_argument(
-        "--no-preserve-total-energy", dest="preserve_total_energy", action="store_false",
-        help="Disable renormalizing each perturbed channel back to its original std after the band "
-             "rescale (see perturb_window_band_power()'s docstring). Default: preserve_total_energy=True."
-    )
-    group.add_argument(
-        "--max-windows-per-subject", type=int, default=None,
-        help="Optional cap on windows perturbed per subject, for speed on very long recordings. The "
-             "GPU forward pass batches all sampled windows together (one pass per scale factor "
-             "regardless of window count), but the CPU-side Butterworth filtering does NOT -- it's "
-             "vectorized across channels but still runs once per window per scale factor, so it scales "
-             "linearly with window count and is the dominant cost for a full night (num_windows x "
-             "len(scale_factors) filter calls per subject). Default: use every valid window (no cap); "
-             "set this (e.g. 100-200) if runtime matters more than perturbing literally every window. "
-             "NOTE: capping means only a SUBSET of windows get perturbed while the rest keep their "
-             "original probability -- an approximation of 'the whole recording changed', not the real thing."
-    )
-    group.add_argument(
+    setup_perturbation_cli_parser(parser, output_csv_default="subject_level_perturbation.csv")
+    perturb_group = parser.add_argument_group("Subject-Level Perturbation Test")
+    perturb_group.add_argument(
         "--perturb-fraction", type=str, default="1.0",
         help="Comma-separated grid of fractions (each in (0, 1]) of a subject's sampled windows to "
              "actually perturb; the rest are left at their ORIGINAL baseline signal (never touched, "
@@ -143,20 +113,13 @@ def parse_cli_args() -> argparse.Namespace:
              "the whole sorted distribution, not a fixed set of 'important' windows, so which windows "
              "specifically get perturbed can't be cleanly separated from how many do)."
     )
-    group.add_argument(
-        "--subjects-json", type=str, default=None,
-        help="Path to a p09d_subject_confidence_report.py --output-json report. Its subject_ids are "
-             "unioned with --subject-id (if also given) to select which subjects to analyze."
-    )
-    group.add_argument(
-        "--output-csv", type=str, default="subject_level_perturbation.csv",
-        help="Filename (relative to --output-dir) for the per-subject results."
-    )
+    add_log_filename_argument(parser, __file__)
     return parser.parse_args()
 
 
 def main():
     args = parse_cli_args()
+    logger = setup_logger(args.log_filename)
     seed_everything(args.seed)
     rng = np.random.RandomState(args.seed)
 
@@ -178,15 +141,8 @@ def main():
         if not (0.0 < f <= 1.0):
             raise ValueError(f"--perturb-fraction values must be in (0, 1], got {f}.")
 
-    print("Instantiating full CBraModE2EClassifier for raw waveform inference.")
-    model = CBraModE2EClassifier(
-        num_channels=args.num_channels, sfreq=args.sfreq, num_patches=args.num_patches,
-        emb_dim=args.cbra_dim, hidden_dim=args.head_dim, num_classes=args.num_classes,
-        head_type=args.head_type
-    )
-    model, ckpt_thresholds, _, ckpt_pooling_params = load_model_checkpoint(model, Path(args.checkpoint), device)
-    model.to(device)
-    model.eval()
+    model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+    ckpt_thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     pooling_strategy, top_percentile, t_window = resolve_pooling_config(
         pooling_strategy=args.pooling_strategy, top_percentile=args.top_percentile,
