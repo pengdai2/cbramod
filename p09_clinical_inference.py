@@ -264,15 +264,35 @@ def analyze_subject_results(
             eval_preds = np.argmax(scores_arr, axis=1)
             acc = accuracy_score(ground_truths, eval_preds)
             macro_f1 = f1_score(ground_truths, eval_preds, average="macro", zero_division=0)
+            per_class_recall = recall_score(
+                ground_truths, eval_preds, average=None, zero_division=0,
+                labels=np.arange(num_classes)
+            )
+
+            try:
+                auc = roc_auc_score(
+                    ground_truths, scores_arr, multi_class="ovr", average="macro",
+                    labels=np.arange(num_classes)
+                ) if len(np.unique(ground_truths)) > 1 else 0.5
+            except Exception:
+                auc = 0.5
+
+            cm = confusion_matrix(ground_truths, eval_preds, labels=np.arange(num_classes))
 
             analysis_summary[strat] = {
                 "accuracy": acc,
-                "macro_f1": macro_f1
+                "macro_f1": macro_f1,
+                "per_class_recall": per_class_recall.tolist(),
+                "roc_auc_ovr_macro": auc,
+                "confusion_matrix": cm.tolist()
             }
 
             print(f"\n Strategy: [{strat.upper()}]")
-            print(f"  ├─ Subject Accuracy:  {acc:.4f}")
-            print(f"  └─ Subject Macro F1:  {macro_f1:.4f}")
+            print(f"  ├─ Subject Accuracy:        {acc:.4f}")
+            print(f"  ├─ Subject Macro F1:        {macro_f1:.4f}")
+            print(f"  ├─ ROC-AUC (OVR macro):     {auc:.4f}")
+            print(f"  ├─ Per-Class Recall:        {np.round(per_class_recall, 4).tolist()}")
+            print(f"  └─ Confusion Matrix (rows=truth, cols=pred):\n{cm}")
 
             export_scores = [list(s) for s in scores_arr]
             export_preds = eval_preds

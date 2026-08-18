@@ -1118,11 +1118,30 @@ class CBraModTrainer:
                 preds = np.argmax(scores, axis=1)
                 macro_f1 = f1_score(subject_labels, preds, average="macro", zero_division=0)
                 acc = accuracy_score(subject_labels, preds)
+
+                # Macro one-vs-rest AUC over all K classes -- mirrors the binary branch's use of
+                # AUC as the stable, whole-ranking-integrating complement to noisy small-cohort F1
+                # (see is_checkpoint_improvement's docstring). Needs every label to appear at least
+                # once and needs each class's row of `scores` (softmax-like) to sum to ~1 for OVR
+                # AUC to be meaningful; falls back to 0.5 (chance) if either condition isn't met,
+                # same "can't be computed on this split" convention the binary branch already uses.
+                present_classes = np.unique(subject_labels)
+                if len(present_classes) > 1 and scores.shape[1] == self.config.num_classes:
+                    try:
+                        roc_auc = roc_auc_score(
+                            subject_labels, scores, multi_class="ovr", average="macro",
+                            labels=np.arange(self.config.num_classes)
+                        )
+                    except ValueError:
+                        roc_auc = 0.5
+                else:
+                    roc_auc = 0.5
+
                 results[strat] = {
                     "subject_macro_f1": macro_f1,
                     "optimal_threshold": 0.5,
                     "subject_accuracy": acc,
-                    "roc_auc": 0.5
+                    "roc_auc": roc_auc
                 }
 
         return results  
