@@ -1,5 +1,67 @@
 # Does the Model's Clinical Prediction Rest on Real Signal? A Causal Investigation of Sigma-Band Power
 
+## Executive Summary
+
+**The question.** Does the model's patient/control prediction rest on genuine physiological signal,
+or could it be a confound/artifact that happens to correlate with the label?
+
+**The headline answer: yes, it's real.** The model has learned to treat elevated sigma-band
+(spindle-range, ~12–16 Hz) power as evidence against the patient class. This is established four
+independent ways: a consistent within-subject correlation between sigma power and predicted
+probability (median r ≈ −0.13 to −0.14); a direct causal effect confirmed by perturbing sigma power
+and observing a dose-proportional, consistent response (94.6% of subjects move in the predicted
+direction, R² ≈ 0.97); agreement from an independent, waveform-based spindle detector (YASA) that
+never saw the spectral-power pipeline; and a raw, model-free replication of the sleep-spindle-deficit
+literature directly in this cohort's own data (patients show significantly lower spindle counts,
+p ≈ 0.003–0.005), with no model involved at all. This is causal evidence, not just correlational, and
+it converges across every measurement approach tried.
+
+**What was tried to improve on the p85 baseline, and what's recommended.** Two learned-aggregation
+alternatives were built and fully characterized: **Option A** (attention over a frozen, already-
+validated per-window probe) and **Option B** (attention over raw embeddings, no separate probe). Both
+beat the p85 baseline by the same margin (test AUC 0.918 vs. 0.882) and preserve the sigma mechanism
+(Option A: 100% directional consistency, R² = 0.993; Option B: 97%, R² = 0.930), but only Option A's
+internal mechanism is actually interpretable — its attention gate learns a separate, explicable
+content preference, while Option B's internals are functionally necessary but not individually
+meaningful. **Option A is recommended.** A third approach, **Option C** (training a window-level
+probe under the more realistic standard-MI assumption instead of the naive collective one), **failed**:
+it reversed the sigma relationship entirely (`frac(slope>0) = 1.00`, R² = 0.958) due to a
+self-reinforcing selection loop — a distinct, previously underweighted MIL failure mode, kept in this
+document as a methodological lesson for any future multiple-instance-learning work.
+
+**The labeling-scheme question is closed, with a negative result.** The long pursuit of a "more
+physically grounded" window-labeling scheme (Option C, then a proposed pseudo-labeling fix) assumed
+patients have a normal baseline plus a discoverable minority of symptomatic windows. The data refutes
+this: the group difference is diffuse and broad, present through the bulk of a typical subject's own
+recording, not concentrated in a tail — consistent with the sleep-spindle deficit being a *trait*
+marker (persistent) rather than a *state* marker (episodic), exactly as the literature already
+describes it. Conclusion: stop pursuing instance-selection schemes for this problem; future
+refinement should focus on denoising/averaging a per-window signal that is genuinely diffuse, not on
+finding "the right windows."
+
+**Concrete validation down to individual errors.** The sigma mechanism explains most of the model's
+specific misclassifications, not just its aggregate accuracy: 5 of 6 misclassified patients (false
+negatives) have unusually high, control-like sigma/spindle values; on the control side the picture is
+a genuine, honestly-reported asymmetry — only 1 of 5 misclassified controls mirrors the pattern in
+reverse, with the other 4 unexplained by sigma.
+
+**Open items, not yet resolved:**
+- Antipsychotic medication as a confound — plausible, especially for the raw-data delta/slow-wave
+  surprise, but untestable without medication metadata.
+- One misclassified patient (GRINS0001) and four misclassified controls have no identified
+  explanation.
+- The pseudo-labeling design (how to threshold/weight pseudo-labels by subject-level confidence) was
+  motivated but never built, once the labeling-scheme thread closed.
+- A CLI/checkpoint-loading consolidation refactor across the `p08b`/`p09`/`p13`–`p23` script family is
+  deferred, tracked separately.
+
+**Where to look for detail**, if a claim above needs the derivation: the sigma mechanism is Chapters
+2–4; the architecture comparison (p85/Option A/B) is Chapters 6–8; Option C's failure is Chapter 9;
+the labeling-scheme closure is Chapters 10–11; the misclassification case study and figures are
+Chapters 12–13; data-cleaning and pipeline rationale are Appendices A–B.
+
+---
+
 ## 1. Motivation
 
 CBraMod-based probing on our EEG cohort produces a subject-level clinical prediction (patient vs.
