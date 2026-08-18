@@ -932,21 +932,21 @@ being subject #1 in cohort order looks like coincidence, not a pipeline bug.
 
 ### 12.2 Misclassified controls (false positives) — an honest asymmetry, not a mirror image
 
-The natural follow-up: do the four misclassified controls (test cohort) mirror the patient-side
+The natural follow-up: do the five misclassified controls (test cohort) mirror the patient-side
 story in reverse — unusually low, patient-like sigma/spindle values within the control group? Only
-partly. **One of the four (#6, subject GRINS0219) matches cleanly**: it has the lowest sigma power
+partly. **One of the five (#6, subject GRINS0219) matches cleanly**: it has the lowest sigma power
 and spindle count of *any* control subject, and is flagged as *confidently* (not marginally)
 misclassified — a strong, clean case of the same mechanism, on the control side, driving a confident
 error rather than a borderline one.
 
-**The other three misclassified controls do not fit the mirrored story at all.** Each has
+**The other four misclassified controls do not fit the mirrored story at all.** Each has
 *higher*-than-average sigma power and spindle count for a control — the opposite of what the sigma
 mechanism would predict for a false positive. Whatever pushed model[0] to score these three subjects
 as patient-like, it isn't the sigma/spindle deficiency the rest of this investigation is built around.
 
 This is recorded here as a genuine, honest asymmetry rather than resolved: the sigma mechanism cleanly
 explains the large majority of misclassified patients (5/6) but only a minority of misclassified
-controls (1/4). What explains the other three false positives is an open question — delta was checked
+controls (1/5). What explains the other four false positives is an open question — delta was checked
 as the natural next candidate for the patient-side exception (Section 12.1) and didn't hold up there
 either, so it isn't assumed to be the answer here without checking; this is left for a future session
 rather than guessed at.
@@ -992,8 +992,8 @@ of them sit at unusually high, control-like sigma/spindle values within the pati
 misclassified *controls* (false positives) are the mirror set, clustering toward the high end of the
 control probability distribution — but checking whether they mirror the patient-side pattern in
 reverse (unusually low, patient-like sigma/spindle values within the control group) turns up a real
-asymmetry rather than a clean mirror image: only one of the four (#6) has the lowest sigma/spindle
-values of any control, matching the mechanism directly. The other three all have *higher*-than-average
+asymmetry rather than a clean mirror image: only one of the five (#6) has the lowest sigma/spindle
+values of any control, matching the mechanism directly. The other four all have *higher*-than-average
 sigma/spindle values for a control — the opposite of what the sigma mechanism would predict for a
 false positive. See Chapter 12.2 for this recorded as an explicit, honest asymmetry rather than folded
 into a tidier story.
