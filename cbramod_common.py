@@ -831,6 +831,35 @@ def compute_pooled_scores(
         raise ValueError(f"Unsupported pooling method: {method}")
 
 
+def macro_ovr_auc(y_true: np.ndarray, scores: np.ndarray, num_classes: int) -> float:
+    """
+    Macro one-vs-rest AUC, computed as a plain average of per-class binary AUCs, NOT via sklearn's
+    built-in `roc_auc_score(..., multi_class="ovr")`. That built-in path enforces a strict runtime
+    check that every row of `scores` sums to ~1.0 (i.e. looks like a genuine softmax) -- a
+    requirement AUC's own math doesn't actually need (AUC is rank-based per column, invariant to any
+    monotonic rescaling), but none of this pipeline's pooling strategies (p85_score/top_10_mean/
+    trimmed_top_10/burden_ratio) produce row-normalized scores in the first place, since they're
+    order-statistic/threshold aggregates, not renormalized probabilities. Calling the built-in
+    wrapper on them raises ValueError every time, which -- if silently caught and defaulted to 0.5 --
+    produces a checkpoint-selection signal that looks like "stuck at chance" even while the model is
+    visibly learning (train/val accuracy and F1 moving), rather than an actual computed AUC. This
+    manual per-class loop sidesteps that spurious check entirely and is mathematically identical to
+    the built-in wrapper's result whenever the built-in wrapper is even applicable.
+
+    A class with only one label value present in y_true has no defined binary AUC; contributes 0.5
+    (chance) for that class specifically -- the same "can't be computed on this split" convention
+    used elsewhere in this pipeline -- and is still included in the macro average.
+    """
+    aucs = []
+    for c in range(num_classes):
+        y_bin = (y_true == c).astype(int)
+        if len(np.unique(y_bin)) < 2:
+            aucs.append(0.5)
+            continue
+        aucs.append(roc_auc_score(y_bin, scores[:, c]))
+    return float(np.mean(aucs))
+
+
 def compute_leave_one_out_contributions(
     window_probs: np.ndarray,
     method: str = "p85_score",
@@ -1121,19 +1150,13 @@ class CBraModTrainer:
 
                 # Macro one-vs-rest AUC over all K classes -- mirrors the binary branch's use of
                 # AUC as the stable, whole-ranking-integrating complement to noisy small-cohort F1
-                # (see is_checkpoint_improvement's docstring). Needs every label to appear at least
-                # once and needs each class's row of `scores` (softmax-like) to sum to ~1 for OVR
-                # AUC to be meaningful; falls back to 0.5 (chance) if either condition isn't met,
-                # same "can't be computed on this split" convention the binary branch already uses.
-                present_classes = np.unique(subject_labels)
-                if len(present_classes) > 1 and scores.shape[1] == self.config.num_classes:
-                    try:
-                        roc_auc = roc_auc_score(
-                            subject_labels, scores, multi_class="ovr", average="macro",
-                            labels=np.arange(self.config.num_classes)
-                        )
-                    except ValueError:
-                        roc_auc = 0.5
+                # (see is_checkpoint_improvement's docstring). Uses macro_ovr_auc() (manual per-class
+                # loop), NOT sklearn's built-in roc_auc_score(..., multi_class="ovr") -- see that
+                # function's docstring for why: the built-in wrapper requires row-normalized scores,
+                # which none of these pooling strategies produce, and silently degrades to a spurious
+                # constant 0.5 (via a caught ValueError) rather than raising or computing a real value.
+                if scores.shape[1] == self.config.num_classes:
+                    roc_auc = macro_ovr_auc(subject_labels, scores, self.config.num_classes)
                 else:
                     roc_auc = 0.5
 

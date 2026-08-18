@@ -23,6 +23,7 @@ from cbramod_common import (
     extract_ckpt_metadata,
     find_optimal_threshold,
     get_operating_threshold,
+    macro_ovr_auc,
     resolve_pooling_config,
     setup_inference_cli_parser,
 )
@@ -247,13 +248,12 @@ def analyze_subject_results(
                 labels=np.arange(num_classes)
             )
 
-            try:
-                auc = roc_auc_score(
-                    ground_truths, scores_arr, multi_class="ovr", average="macro",
-                    labels=np.arange(num_classes)
-                ) if len(np.unique(ground_truths)) > 1 else 0.5
-            except Exception:
-                auc = 0.5
+            # macro_ovr_auc() (manual per-class binary AUC loop), NOT sklearn's built-in
+            # roc_auc_score(..., multi_class="ovr") -- the built-in wrapper requires every row of
+            # `scores_arr` to sum to ~1.0 (like a genuine softmax), which none of this pipeline's
+            # pooling strategies produce, and raises ValueError every time as a result -- see
+            # macro_ovr_auc()'s docstring in cbramod_common.py for the full rationale.
+            auc = macro_ovr_auc(ground_truths, scores_arr, num_classes)
 
             cm = confusion_matrix(ground_truths, eval_preds, labels=np.arange(num_classes))
 
