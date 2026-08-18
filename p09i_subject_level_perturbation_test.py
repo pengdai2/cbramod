@@ -56,7 +56,7 @@ from cbramod_common import (
     BAND_DEFS,
     PANSubjectEEGDataset,
     add_log_filename_argument,
-    build_frozen_e2e_classifier,
+    build_e2e_classifier,
     compute_leave_one_out_contributions,
     compute_pooled_scores,
     extract_ckpt_metadata,
@@ -134,7 +134,7 @@ def main():
         if not (0.0 < f <= 1.0):
             raise ValueError(f"--perturb-fraction values must be in (0, 1], got {f}.")
 
-    model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+    model, ckpt = build_e2e_classifier(args, device, logger)
     ckpt_thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     pooling_strategy, top_percentile, t_window = resolve_pooling_config(

@@ -72,7 +72,7 @@ from cbramod_common import (
     BAND_DEFS,
     PANSubjectEEGDataset,
     add_log_filename_argument,
-    build_frozen_e2e_classifier,
+    build_e2e_classifier,
     extract_ckpt_metadata,
     report_probability_correlations,
     resolve_pooling_config,
@@ -213,7 +213,7 @@ def main():
             "waveform (or normalization metadata) left to work with."
         )
 
-    model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+    model, ckpt = build_e2e_classifier(args, device, logger)
     _thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     pooling_strategy, top_percentile, t_window = resolve_pooling_config(

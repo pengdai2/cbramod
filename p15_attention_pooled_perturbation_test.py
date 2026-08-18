@@ -44,7 +44,7 @@ from cbramod_common import (
     BAND_DEFS,
     PANSubjectEEGDataset,
     add_log_filename_argument,
-    build_frozen_e2e_classifier,
+    build_e2e_classifier,
     compute_pooled_scores,
     extract_ckpt_metadata,
     get_operating_threshold,
@@ -113,7 +113,7 @@ def main():
         if not (0.0 < f <= 1.0):
             raise ValueError(f"--perturb-fraction values must be in (0, 1], got {f}.")
 
-    model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+    model, ckpt = build_e2e_classifier(args, device, logger)
     ckpt_thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     attn_ckpt = torch.load(args.attn_checkpoint, map_location="cpu", weights_only=True)

@@ -54,7 +54,7 @@ from cbramod_common import (
     BAND_DEFS,
     PANSubjectEEGDataset,
     add_log_filename_argument,
-    build_frozen_e2e_classifier,
+    build_e2e_classifier,
     perturb_window_band_power,
     seed_everything,
     setup_inference_cli_parser,
@@ -139,7 +139,7 @@ def main():
               "the reported 'baseline_probability' will still use the true original window, "
               "but the fitted slope won't be anchored at the actual unperturbed point.")
 
-    model, _ckpt = build_frozen_e2e_classifier(args, device, logger)
+    model, _ckpt = build_e2e_classifier(args, device, logger)
 
     subject_filter = [s.strip() for s in args.subject_id.split(",")] if args.subject_id else []
     if args.subjects_json:

@@ -17,7 +17,7 @@ from cbramod_common import (
     CachedFeatureSubjectDataset,
     PANSubjectEEGDataset,
     add_log_filename_argument,
-    build_frozen_e2e_classifier,
+    build_e2e_classifier,
     build_frozen_probe,
     compute_pooled_scores,
     extract_ckpt_metadata,
@@ -100,7 +100,7 @@ def evaluate_clinical_cohort(
     if args.features_pt:
         model, ckpt = build_frozen_probe(args, device, logger)
     else:
-        model, ckpt = build_frozen_e2e_classifier(args, device, logger)
+        model, ckpt = build_e2e_classifier(args, device, logger)
     ckpt_thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     # 2b. Resolve Pooling Config: CLI override > checkpoint's training-time config > hardcoded default

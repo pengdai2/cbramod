@@ -1358,7 +1358,7 @@ def extract_ckpt_metadata(checkpoint: dict) -> Tuple[dict, Union[int, str], Dict
     """
     Pulls (optimal_thresholds, epoch, pooling_params) off a raw checkpoint dict -- the same
     extraction load_model_checkpoint() has always done internally, now also usable directly by
-    callers of build_frozen_e2e_classifier()/build_gated_attention_model() (p09i/p15), which return
+    callers of build_e2e_classifier()/build_gated_attention_model() (p09i/p15), which return
     the raw checkpoint dict instead of this pre-extracted tuple. Only keys actually present are
     included in pooling_params, so older checkpoints saved before this field existed degrade
     gracefully to an empty dict.
@@ -1377,7 +1377,7 @@ def extract_ckpt_metadata(checkpoint: dict) -> Tuple[dict, Union[int, str], Dict
 # catch, fall back to head-only into model.head, catch again, fall back to strict=False) that
 # discovered whether a checkpoint was head-only or full-model by trial and error. Removed once its
 # last callers (p09/p09c/p09e/p10) were retrofitted onto build_frozen_probe()/
-# build_frozen_e2e_classifier(), which decide the same thing deterministically via
+# build_e2e_classifier(), which decide the same thing deterministically via
 # resolve_checkpoint_kind() (explicit "checkpoint_kind" metadata, saved by p08b/p16/p20/
 # p08_finetune_e2e.py -- falling back to state_dict key-prefix inference only for checkpoints that
 # predate that field).
@@ -1435,11 +1435,13 @@ def resolve_checkpoint_kind(ckpt: dict, state_dict: Dict[str, torch.Tensor], che
     return inferred
 
 
-def resolve_probe_architecture(checkpoint_path, config: argparse.Namespace, logger) -> Tuple[Dict[str, object], Dict[str, torch.Tensor], dict]:
+def resolve_checkpoint_architecture(checkpoint_path, config: argparse.Namespace, logger) -> Tuple[Dict[str, object], Dict[str, torch.Tensor], dict]:
     """
-    Resolves a p08b/p20-trained probe checkpoint's ACTUAL architecture -- head_type (and hidden_dim
-    for MLP), plus num_patches/cbra_dim/num_classes/num_channels/sfreq -- NEVER trusting the
-    corresponding CLI flags blindly. Priority order:
+    Resolves a checkpoint's ACTUAL architecture -- head_type (and hidden_dim for MLP), plus
+    num_patches/cbra_dim/num_classes/num_channels/sfreq -- NEVER trusting the corresponding CLI
+    flags blindly. Covers checkpoints from any of p08b/p20 (head-only) or p08_finetune_e2e.py
+    (full model) -- see resolve_checkpoint_kind() for how a caller building the full
+    CBraModE2EClassifier tells which kind it has. Priority order:
       1. Explicit metadata saved IN the checkpoint itself (p08b/p20/p08_finetune_e2e.py all write
          every one of these fields at save time) -- the single source of truth going forward, no
          guessing involved.
@@ -1453,7 +1455,7 @@ def resolve_probe_architecture(checkpoint_path, config: argparse.Namespace, logg
     Either way, CLI flags are only ever a cross-check (mismatch logged loudly) or a last-resort
     fallback for genuinely unrecoverable fields on old checkpoints, never the actual source when the
     checkpoint has an opinion. Shared by build_frozen_probe() (bare head; only needs num_patches/
-    cbra_dim/num_classes/head_type) and build_frozen_e2e_classifier() (full backbone+head; also needs
+    cbra_dim/num_classes/head_type) and build_e2e_classifier() (full backbone+head; also needs
     num_channels/sfreq to reconstruct the exact backbone this checkpoint assumes).
 
     Returns (resolved_architecture, head_state_dict, raw_checkpoint_dict).
@@ -1513,16 +1515,16 @@ def build_frozen_probe(config: argparse.Namespace, device: torch.device, logger)
     Reconstructs the bare probe head architecture and loads frozen weights from
     config.probe_checkpoint -- for scripts operating on already-extracted cached embeddings
     (p13/p14/p20/p21), which only ever need the head, not the CBraMod backbone. See
-    resolve_probe_architecture() for the metadata-first resolution this relies on -- num_patches/
+    resolve_checkpoint_architecture() for the metadata-first resolution this relies on -- num_patches/
     cbra_dim/num_classes now come from the checkpoint's own metadata (when present), not blindly
     from CLI flags.
 
-    Returns (probe, raw_checkpoint_dict) -- consistent with build_frozen_e2e_classifier() and
+    Returns (probe, raw_checkpoint_dict) -- consistent with build_e2e_classifier() and
     build_gated_attention_model(), so callers can read optimal_thresholds/pooling params/etc. off
     the same dict this function already loaded, instead of a second, redundant torch.load() of the
     same file.
     """
-    resolved, state_dict, ckpt = resolve_probe_architecture(config.probe_checkpoint, config, logger)
+    resolved, state_dict, ckpt = resolve_checkpoint_architecture(config.probe_checkpoint, config, logger)
 
     if resolved["head_type"] == "linear":
         probe = LinearProbeHead(num_patches=resolved["num_patches"], emb_dim=resolved["cbra_dim"], num_classes=resolved["num_classes"])
@@ -1540,7 +1542,7 @@ def build_frozen_probe(config: argparse.Namespace, device: torch.device, logger)
     return probe, ckpt
 
 
-def build_frozen_e2e_classifier(config: argparse.Namespace, device: torch.device, logger) -> Tuple[nn.Module, dict]:
+def build_e2e_classifier(config: argparse.Namespace, device: torch.device, logger) -> Tuple[nn.Module, dict]:
     """
     Same metadata-first architecture resolution as build_frozen_probe(), but constructs the full
     CBraModE2EClassifier (backbone + the checkpoint's own head) instead of a bare head -- for scripts
@@ -1558,7 +1560,7 @@ def build_frozen_e2e_classifier(config: argparse.Namespace, device: torch.device
     Returns (model, raw_checkpoint_dict) -- the checkpoint dict is returned too so callers can read
     optimal_thresholds/primary_pooling/etc. off it themselves.
     """
-    resolved, state_dict, ckpt = resolve_probe_architecture(config.probe_checkpoint, config, logger)
+    resolved, state_dict, ckpt = resolve_checkpoint_architecture(config.probe_checkpoint, config, logger)
 
     model = CBraModE2EClassifier(
         num_channels=resolved["num_channels"], sfreq=resolved["sfreq"], num_patches=resolved["num_patches"],

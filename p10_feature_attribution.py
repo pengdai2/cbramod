@@ -75,7 +75,7 @@ try:
 except ImportError:
     HAS_YASA = False
 
-from cbramod_common import add_log_filename_argument, build_frozen_e2e_classifier, seed_everything, setup_inference_cli_parser
+from cbramod_common import add_log_filename_argument, build_e2e_classifier, seed_everything, setup_inference_cli_parser
 from cbramod_utils import setup_logger
 from p09c_clinical_subject_diagnostics import SubjectEEGInspector
 
@@ -980,7 +980,7 @@ def main():
 
     # Metadata-first architecture resolution + deterministic (checkpoint_kind-driven) state dict
     # loading -- same helper as p09/p09c/p09e.
-    model, _ckpt = build_frozen_e2e_classifier(args, device, logger)
+    model, _ckpt = build_e2e_classifier(args, device, logger)
 
     windows_by_subject = resolve_priority_windows(args.priority_windows, args.subject_id, args.tiers)
     total_windows = sum(len(tasks) for tasks in windows_by_subject.values())
