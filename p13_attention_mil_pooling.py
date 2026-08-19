@@ -18,6 +18,22 @@ from "pure" Option A -- it pulls the gate's own capacity/overfitting-risk profil
 Option B's end of the spectrum, even though the pooled target and the frozen probe are unchanged.
 
 --------------------------------------------------------------------------
+K-class generalization
+--------------------------------------------------------------------------
+Originally binary-only (F.binary_cross_entropy on a single pooled P(class=1) scalar). Generalized to
+support any num_classes (resolved from --probe-checkpoint's own saved metadata, never blindly from
+the CLI flag -- see main()): the probe's full per-window softmax ([n_windows, K], via
+frozen_window_class_probs()) is attention-pooled into a [K] subject-level distribution (still sums
+to 1, since it's a convex combination of rows that each already sum to 1 -- see
+AttentionPoolingHead.forward()'s docstring), and the loss is categorical NLL on that distribution
+(`-log(subject_probs[label])`). This isn't a binary/multi-class code fork -- NLL on a 2-class
+distribution is mathematically IDENTICAL to the original BCE loss, so the K=2 case is exactly the
+same computation as before, just expressed in the general form. Evaluation (tune_threshold()) does
+still branch: K=2 keeps the threshold-sweep-based F1/sensitivity/specificity/AUC exactly as before;
+K>2 uses plain argmax + macro one-vs-rest AUC, mirroring cbramod_common.py's evaluate_subject_pooling
+convention.
+
+--------------------------------------------------------------------------
 No fixed number of windows anywhere in this architecture
 --------------------------------------------------------------------------
 A subject's recording is a "bag" of however many windows it has -- this varies subject to subject,
@@ -73,9 +89,10 @@ from cbramod_common import (
     add_log_filename_argument,
     build_frozen_probe,
     compute_pooled_scores,
-    frozen_window_probs,
+    frozen_window_class_probs,
     is_checkpoint_improvement,
     load_subject_ids,
+    macro_ovr_auc,
     seed_everything,
     setup_cache_cli_parser,
     setup_training_cli_parser,
@@ -144,35 +161,57 @@ def parse_cli_args() -> argparse.Namespace:
 # 4. THRESHOLD TUNING (mirrors CBraModTrainer.evaluate_subject_pooling's per-strategy sweep)
 # =====================================================================
 
-def tune_threshold(scores: np.ndarray, labels: np.ndarray, threshold: Optional[float] = None) -> Dict[str, float]:
+def tune_threshold(
+    scores: np.ndarray, labels: np.ndarray, num_classes: int = 2, threshold: Optional[float] = None
+) -> Dict[str, float]:
     """
-    Sweeps 99 thresholds for the macro-F1-optimal subject-level decision boundary -- UNLESS a fixed
-    `threshold` is passed in (one already selected on validation), in which case it's applied as-is
-    with no sweep. This distinction matters: sweeping against a split's own labels and then reporting
-    F1/accuracy/sensitivity/specificity computed at that just-found threshold is legitimate model
-    SELECTION on validation, but doing the same thing on held-out test silently tunes the decision
-    boundary against the very labels being used to report performance -- inflating every
-    threshold-dependent metric. AUC is unaffected either way (it's rank-based, no threshold involved),
-    which is exactly why is_checkpoint_improvement() treats AUC as the more trustworthy of the two.
-    """
-    if threshold is None:
-        best_t, best_f1 = 0.5, 0.0
-        for t in np.linspace(0.01, 0.99, 99):
-            preds = (scores >= t).astype(int)
-            f1 = f1_score(labels, preds, average="macro", zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
-    else:
-        best_t = threshold
+    Binary (num_classes == 2): `scores` is [N] (P(class=1) per subject). Sweeps 99 thresholds for the
+    macro-F1-optimal subject-level decision boundary -- UNLESS a fixed `threshold` is passed in (one
+    already selected on validation), in which case it's applied as-is with no sweep. This distinction
+    matters: sweeping against a split's own labels and then reporting F1/accuracy/sensitivity/
+    specificity computed at that just-found threshold is legitimate model SELECTION on validation, but
+    doing the same thing on held-out test silently tunes the decision boundary against the very
+    labels being used to report performance -- inflating every threshold-dependent metric. AUC is
+    unaffected either way (it's rank-based, no threshold involved), which is exactly why
+    is_checkpoint_improvement() treats AUC as the more trustworthy of the two.
 
-    final_preds = (scores >= best_t).astype(int)
+    Multi-class (num_classes > 2): `scores` is [N, K] (pooled per-class scores per subject, from
+    either attention or p85 pooling). Decision is plain argmax -- there is no threshold to sweep or
+    apply, so `threshold` is ignored and `optimal_threshold` is reported as a 0.5 placeholder purely
+    for log-string/dict-shape compatibility with the binary branch (same convention
+    cbramod_common.py's evaluate_subject_pooling already uses). sensitivity/specificity have no single-
+    number meaning for K>2 and are omitted; roc_auc is macro one-vs-rest (macro_ovr_auc(), NOT
+    sklearn's built-in multi_class="ovr" -- see that function's docstring for why: the built-in
+    wrapper requires row-normalized scores, which these pooled scores may not exactly be after float
+    accumulation, and raises rather than computing a real value).
+    """
+    if num_classes == 2:
+        if threshold is None:
+            best_t, best_f1 = 0.5, 0.0
+            for t in np.linspace(0.01, 0.99, 99):
+                preds = (scores >= t).astype(int)
+                f1 = f1_score(labels, preds, average="macro", zero_division=0)
+                if f1 > best_f1:
+                    best_f1, best_t = f1, t
+        else:
+            best_t = threshold
+
+        final_preds = (scores >= best_t).astype(int)
+        return {
+            "subject_macro_f1": f1_score(labels, final_preds, average="macro", zero_division=0),
+            "optimal_threshold": float(best_t),
+            "subject_accuracy": accuracy_score(labels, final_preds),
+            "subject_sensitivity": recall_score(labels, final_preds),
+            "subject_specificity": recall_score(labels, final_preds, pos_label=0),
+            "roc_auc": roc_auc_score(labels, scores) if len(np.unique(labels)) > 1 else 0.5,
+        }
+
+    preds = np.argmax(scores, axis=1)
     return {
-        "subject_macro_f1": f1_score(labels, final_preds, average="macro", zero_division=0),
-        "optimal_threshold": float(best_t),
-        "subject_accuracy": accuracy_score(labels, final_preds),
-        "subject_sensitivity": recall_score(labels, final_preds),
-        "subject_specificity": recall_score(labels, final_preds, pos_label=0),
-        "roc_auc": roc_auc_score(labels, scores) if len(np.unique(labels)) > 1 else 0.5,
+        "subject_macro_f1": f1_score(labels, preds, average="macro", zero_division=0),
+        "optimal_threshold": 0.5,
+        "subject_accuracy": accuracy_score(labels, preds),
+        "roc_auc": macro_ovr_auc(labels, scores, num_classes),
     }
 
 
@@ -189,6 +228,15 @@ def run_epoch_train(
     sidesteps the variable-bag-size batching problem entirely). Losses are averaged over groups of
     `subjects_per_step` subjects before each optimizer.step() -- gradient accumulation, not batching
     of the underlying tensors, so no bag ever needs to be padded to match another bag's length.
+
+    Loss is categorical negative-log-likelihood on the pooled K-class distribution
+    (`-log(subject_probs[label])`), NOT F.binary_cross_entropy -- this is the K-class generalization
+    of BCE, and is mathematically IDENTICAL to BCE when K=2 (BCE(p, y) is exactly
+    -log([1-p, p][y])), so this isn't a binary/multi-class branch, just one formula that happens to
+    subsume the old binary-only one. Using F.nll_loss on log(subject_probs) rather than
+    F.cross_entropy is deliberate: subject_probs is already a normalized probability distribution
+    (attn_head pools the frozen probe's own per-window softmax outputs, not raw logits), and
+    F.cross_entropy would incorrectly apply a SECOND log_softmax on top of that.
     """
     attn_head.train()
     total_loss, n_subjects = 0.0, 0
@@ -196,11 +244,12 @@ def run_epoch_train(
     for i, subj_idx in enumerate(subject_order):
         bag_feats, label, _subject_id, _stages, _indices = dataset[subj_idx]
         bag_feats = bag_feats.to(device).float()
-        label = label.to(device).float()
+        label = label.to(device).long()
 
-        window_probs = frozen_window_probs(probe, bag_feats, device)
-        subject_prob, _attn_weights = attn_head(bag_feats, window_probs)
-        loss = F.binary_cross_entropy(subject_prob.clamp(1e-6, 1 - 1e-6), label)
+        window_probs = frozen_window_class_probs(probe, bag_feats, device)
+        subject_probs, _attn_weights = attn_head(bag_feats, window_probs)
+        log_probs = torch.log(subject_probs.clamp(1e-6, 1.0)).unsqueeze(0)  # [1, K]
+        loss = F.nll_loss(log_probs, label.view(1))
 
         (loss / subjects_per_step).backward()
         n_subjects += 1
@@ -217,18 +266,25 @@ def run_epoch_train(
 @torch.no_grad()
 def run_epoch_eval(
     attn_head: AttentionPoolingHead, probe: nn.Module, dataset: CachedFeatureSubjectDataset, device: torch.device,
-    fixed_thresholds: Optional[Tuple[float, float]] = None,
+    num_classes: int = 2, fixed_thresholds: Optional[Tuple[Optional[float], Optional[float]]] = None,
 ) -> Tuple[Dict[str, float], Dict[str, float]]:
     """
     Returns (attention_pooling_metrics, baseline_p85_metrics) for direct, apples-to-apples
     comparison -- both computed from the SAME frozen window-level probabilities, differing only in
     how they're aggregated into one subject-level score.
 
-    fixed_thresholds: (attn_threshold, p85_threshold), already selected on validation. Pass this for
-    ANY split that isn't the one doing model selection (i.e. test, or a --eval-only re-check) -- the
-    thresholds are held fixed and simply applied, never re-swept against that split's own labels. Leave
-    None only for the validation split during training, where sweeping IS the legitimate model-selection
-    step (see tune_threshold()'s docstring).
+    Always collects the full [N, K] per-class score matrix for both methods (compute_pooled_scores
+    already handles p85 generically for any K); for num_classes==2, tune_threshold() gets just the
+    P(class=1) column (`[:, 1]`) to keep its threshold-sweep semantics exactly as before, and for
+    num_classes>2 it gets the full matrix for its argmax decision.
+
+    fixed_thresholds: (attn_threshold, p85_threshold), already selected on validation -- meaningless
+    for num_classes>2 (ignored by tune_threshold() there) but still accepted for a uniform call
+    signature across both branches. Pass this for ANY split that isn't the one doing model selection
+    (i.e. test, or a --eval-only re-check) -- the thresholds are held fixed and simply applied, never
+    re-swept against that split's own labels. Leave None only for the validation split during
+    training, where sweeping IS the legitimate model-selection step (see tune_threshold()'s
+    docstring).
     """
     attn_head.eval()
     attn_scores, p85_scores, labels = [], [], []
@@ -236,17 +292,24 @@ def run_epoch_eval(
         bag_feats, label, _subject_id, _stages, _indices = dataset[subj_idx]
         bag_feats = bag_feats.to(device).float()
 
-        window_probs = frozen_window_probs(probe, bag_feats, device)
-        subject_prob, _attn_weights = attn_head(bag_feats, window_probs)
+        window_probs = frozen_window_class_probs(probe, bag_feats, device)
+        subject_probs, _attn_weights = attn_head(bag_feats, window_probs)
 
-        attn_scores.append(subject_prob.item())
+        attn_scores.append(subject_probs.cpu().numpy())
         p85_scores.append(compute_pooled_scores(window_probs.cpu().numpy(), method="p85_score"))
         labels.append(int(label.item()))
 
     labels = np.array(labels)
+    attn_scores = np.array(attn_scores)  # [N, K]
+    p85_scores = np.array(p85_scores)    # [N, K]
     attn_threshold, p85_threshold = fixed_thresholds if fixed_thresholds is not None else (None, None)
-    attn_metrics = tune_threshold(np.array(attn_scores), labels, threshold=attn_threshold)
-    p85_metrics = tune_threshold(np.array(p85_scores), labels, threshold=p85_threshold)
+
+    if num_classes == 2:
+        attn_metrics = tune_threshold(attn_scores[:, 1], labels, num_classes, threshold=attn_threshold)
+        p85_metrics = tune_threshold(p85_scores[:, 1], labels, num_classes, threshold=p85_threshold)
+    else:
+        attn_metrics = tune_threshold(attn_scores, labels, num_classes)
+        p85_metrics = tune_threshold(p85_scores, labels, num_classes)
     return attn_metrics, p85_metrics
 
 
@@ -254,20 +317,32 @@ def run_epoch_eval(
 # 6. MAIN
 # =====================================================================
 
-def log_split_metrics(logger, split_name: str, attn_metrics: Dict[str, float], p85_metrics: Dict[str, float]) -> None:
-    # optimal_threshold is printed explicitly for both methods -- attn and p85 are thresholded
-    # independently (each gets its own value, whether swept fresh on validation or held fixed from
-    # a prior validation sweep for test/eval-only), so an identical F1 between the two is NOT evidence
-    # they secretly shared a threshold; this makes that verifiable directly from the log instead of
-    # requiring anyone to trust that claim.
-    logger.info(
-        f"  [{split_name}] Attn: F1={attn_metrics['subject_macro_f1']:.4f} AUC={attn_metrics['roc_auc']:.4f} "
-        f"thr={attn_metrics['optimal_threshold']:.2f} "
-        f"Acc={attn_metrics['subject_accuracy']:.4f} Sens={attn_metrics['subject_sensitivity']:.4f} "
-        f"Spec={attn_metrics['subject_specificity']:.4f} | "
-        f"p85 (same frozen probs): F1={p85_metrics['subject_macro_f1']:.4f} AUC={p85_metrics['roc_auc']:.4f} "
-        f"thr={p85_metrics['optimal_threshold']:.2f}"
-    )
+def log_split_metrics(
+    logger, split_name: str, attn_metrics: Dict[str, float], p85_metrics: Dict[str, float], num_classes: int = 2
+) -> None:
+    if num_classes == 2:
+        # optimal_threshold is printed explicitly for both methods -- attn and p85 are thresholded
+        # independently (each gets its own value, whether swept fresh on validation or held fixed from
+        # a prior validation sweep for test/eval-only), so an identical F1 between the two is NOT evidence
+        # they secretly shared a threshold; this makes that verifiable directly from the log instead of
+        # requiring anyone to trust that claim.
+        logger.info(
+            f"  [{split_name}] Attn: F1={attn_metrics['subject_macro_f1']:.4f} AUC={attn_metrics['roc_auc']:.4f} "
+            f"thr={attn_metrics['optimal_threshold']:.2f} "
+            f"Acc={attn_metrics['subject_accuracy']:.4f} Sens={attn_metrics['subject_sensitivity']:.4f} "
+            f"Spec={attn_metrics['subject_specificity']:.4f} | "
+            f"p85 (same frozen probs): F1={p85_metrics['subject_macro_f1']:.4f} AUC={p85_metrics['roc_auc']:.4f} "
+            f"thr={p85_metrics['optimal_threshold']:.2f}"
+        )
+    else:
+        # No threshold/sensitivity/specificity for K>2 -- decision is plain argmax (see
+        # tune_threshold()'s docstring).
+        logger.info(
+            f"  [{split_name}] Attn: F1={attn_metrics['subject_macro_f1']:.4f} AUC={attn_metrics['roc_auc']:.4f} "
+            f"Acc={attn_metrics['subject_accuracy']:.4f} | "
+            f"p85 (same frozen probs): F1={p85_metrics['subject_macro_f1']:.4f} AUC={p85_metrics['roc_auc']:.4f} "
+            f"Acc={p85_metrics['subject_accuracy']:.4f}"
+        )
 
 
 def main():
@@ -277,8 +352,18 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     master_cache_path = Path(args.cache_dir) / args.master_cache_name
-    probe, _probe_ckpt = build_frozen_probe(args, device, logger)
-    logger.info(f"Loaded frozen probe from {args.probe_checkpoint} (head_type={args.head_type}); probe parameters are NOT trained here.")
+    probe, probe_ckpt = build_frozen_probe(args, device, logger)
+    # Resolved from the probe checkpoint (which build_frozen_probe() already builds the MODEL with),
+    # not blindly the CLI flag -- same "resolve once, pass explicitly" fix as p09_clinical_inference.py
+    # needed for the exact same reason: everything below this line (loss, tune_threshold, checkpoint
+    # metadata) needs the REAL number of classes, or a 3-class probe checkpoint run with a stale
+    # --num-classes 2 would build the model correctly but silently mis-evaluate it as binary.
+    num_classes = probe_ckpt.get("num_classes", args.num_classes)
+    logger.info(
+        f"Loaded frozen probe from {args.probe_checkpoint} "
+        f"(head_type={probe_ckpt.get('head_type', args.head_type)}, num_classes={num_classes}); "
+        f"probe parameters are NOT trained here."
+    )
 
     best_model_path = Path(args.checkpoint_dir) / args.checkpoint_filename if args.checkpoint_dir else Path(args.checkpoint_filename)
 
@@ -324,12 +409,16 @@ def main():
         fixed_thresholds = (ckpt["attn_metrics"]["optimal_threshold"], ckpt["p85_metrics_same_epoch"]["optimal_threshold"])
         if args.val_manifest:
             val_ds = CachedFeatureSubjectDataset(master_cache_path, filter_subject=load_subject_ids(args.val_manifest))
-            val_attn_metrics, val_p85_metrics = run_epoch_eval(attn_head, probe, val_ds, device)
-            log_split_metrics(logger, "VAL", val_attn_metrics, val_p85_metrics)
+            val_attn_metrics, val_p85_metrics = run_epoch_eval(attn_head, probe, val_ds, device, num_classes=num_classes)
+            log_split_metrics(logger, "VAL", val_attn_metrics, val_p85_metrics, num_classes=num_classes)
             fixed_thresholds = (val_attn_metrics["optimal_threshold"], val_p85_metrics["optimal_threshold"])
         if args.test_manifest:
             test_ds = CachedFeatureSubjectDataset(master_cache_path, filter_subject=load_subject_ids(args.test_manifest))
-            log_split_metrics(logger, "TEST", *run_epoch_eval(attn_head, probe, test_ds, device, fixed_thresholds=fixed_thresholds))
+            log_split_metrics(
+                logger, "TEST",
+                *run_epoch_eval(attn_head, probe, test_ds, device, num_classes=num_classes, fixed_thresholds=fixed_thresholds),
+                num_classes=num_classes,
+            )
         return
 
     if not args.train_manifest or not args.val_manifest:
@@ -367,7 +456,7 @@ def main():
         t0 = time.time()
         subject_order = rng.permutation(len(train_ds))
         train_loss = run_epoch_train(attn_head, probe, train_ds, optimizer, device, args.subjects_per_step, subject_order)
-        attn_metrics, p85_metrics = run_epoch_eval(attn_head, probe, val_ds, device)
+        attn_metrics, p85_metrics = run_epoch_eval(attn_head, probe, val_ds, device, num_classes=num_classes)
         elapsed = time.time() - t0
 
         log_str = (
@@ -391,6 +480,7 @@ def main():
                     "attn_dropout": args.attn_dropout,
                     "num_patches": args.num_patches,
                     "cbra_dim": args.cbra_dim,
+                    "num_classes": num_classes,
                     "best_macro_f1": best_f1,
                     "best_auc": best_auc,
                     "attn_metrics": attn_metrics,
@@ -435,7 +525,11 @@ def main():
             f"validation, using that SAME validation-selected threshold (attn={fixed_thresholds[0]:.2f}, "
             f"p85={fixed_thresholds[1]:.2f}), not re-tuned on test:"
         )
-        log_split_metrics(logger, "TEST", *run_epoch_eval(attn_head, probe, test_ds, device, fixed_thresholds=fixed_thresholds))
+        log_split_metrics(
+            logger, "TEST",
+            *run_epoch_eval(attn_head, probe, test_ds, device, num_classes=num_classes, fixed_thresholds=fixed_thresholds),
+            num_classes=num_classes,
+        )
         logger.info("=" * 125)
 
 

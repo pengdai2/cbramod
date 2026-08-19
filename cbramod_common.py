@@ -636,6 +636,15 @@ class AttentionPoolingHead(nn.Module):
     probability, not the embedding itself -- this keeps the pooled score directly comparable to
     every prior pooling strategy (p85_score, top_10_mean, ...) and keeps the probe head itself
     completely untouched -- unlike GatedAttentionMIL (Option B), which pools the embedding itself.
+
+    Also handles the K-class case (window_probs: [n_windows, K], e.g. from
+    frozen_window_class_probs()): the pooled subject score is then
+    `Σ_i attn_weight_i * window_probs[i, :]`, a [K] vector -- a convex combination of rows that each
+    already sum to 1 is itself guaranteed to sum to 1, so this stays a valid categorical distribution
+    for any K with no extra normalization needed. This is a superset of the binary behavior (K=2
+    reduces to the same weighted-sum arithmetic on a 2-column matrix rather than a single P(class=1)
+    scalar), but the 1D scalar path is kept as its own branch below so existing binary callers
+    (p14/p15) that pass a 1D window_probs and expect a 0-dim subject_prob back keep working unchanged.
     """
     def __init__(self, num_patches: int = 30, emb_dim: int = 200, hidden_dim: int = 64, dropout: float = 0.1):
         super().__init__()
@@ -652,28 +661,47 @@ class AttentionPoolingHead(nn.Module):
         """
         bag_feats:    [n_windows, num_patches, emb_dim] -- ONE subject's windows. n_windows varies
                       call to call; nothing about self.gate's parameters depends on it.
-        window_probs: [n_windows] -- frozen probe's P(class=1) per window, already computed
-                      upstream with no_grad().
+        window_probs: [n_windows] (frozen probe's P(class=1) per window -- binary) or
+                      [n_windows, K] (frozen probe's full per-class softmax per window --
+                      multi-class, from frozen_window_class_probs()), already computed upstream
+                      with no_grad().
 
-        Returns (subject_prob, attn_weights): subject_prob is a 0-dim tensor, attn_weights is
-        [n_windows] (sums to 1) -- exposed for inspection/plotting, same role as the leave-one-out
-        contribution and LOO-influence analyses used to characterize p85 pooling.
+        Returns (subject_score, attn_weights): subject_score is a 0-dim tensor (binary input) or a
+        [K] tensor summing to 1 (multi-class input); attn_weights is [n_windows] (sums to 1) either
+        way -- exposed for inspection/plotting, same role as the leave-one-out contribution and
+        LOO-influence analyses used to characterize p85 pooling.
         """
         n_windows = bag_feats.shape[0]
         flat = bag_feats.reshape(n_windows, -1)          # [n_windows, num_patches * emb_dim]
         scores = self.gate(flat).squeeze(-1)              # [n_windows]
         attn_weights = torch.softmax(scores, dim=0)        # normalizes over THIS bag's actual size
-        subject_prob = (attn_weights * window_probs).sum()
-        return subject_prob, attn_weights
+        if window_probs.dim() == 1:
+            subject_score = (attn_weights * window_probs).sum()
+        else:
+            subject_score = (attn_weights.unsqueeze(1) * window_probs).sum(dim=0)
+        return subject_score, attn_weights
 
 
 @torch.no_grad()
 def frozen_window_probs(probe: nn.Module, bag_feats: torch.Tensor, device: torch.device) -> torch.Tensor:
     """P(class=1) per window, from a frozen probe (build_frozen_probe()'s output), for one subject's
     bag of windows -- shared by Option A's training/eval loop (p13) and its interpretability/
-    perturbation follow-ups (p14/p15)."""
+    perturbation follow-ups (p14/p15). Binary-only (hardcodes [:, 1]) -- see
+    frozen_window_class_probs() for the K-class version."""
     logits = probe(bag_feats.to(device).float())
     return torch.softmax(logits, dim=1)[:, 1]
+
+
+@torch.no_grad()
+def frozen_window_class_probs(probe: nn.Module, bag_feats: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """Full per-class softmax probabilities per window ([n_windows, num_classes]), from a frozen
+    probe (build_frozen_probe()'s output), for one subject's bag of windows -- the K-class
+    generalization of frozen_window_probs() (which hardcodes [:, 1], binary-only), used by p13's
+    multi-class attention pooling path. Kept as a separate function rather than changing
+    frozen_window_probs()'s return shape, since p14/p15 still consume the binary scalar directly and
+    would break if that function's shape changed under them."""
+    logits = probe(bag_feats.to(device).float())
+    return torch.softmax(logits, dim=1)
 
 
 # spearman_corr lives in cbramod_stats.py (pure numpy, no torch/braindecode) -- imported below rather
