@@ -258,7 +258,7 @@ class EndToEndTrainer(CBraModTrainer):
         best_primary_auc = 0.0
         best_thresholds = {}
         patience_counter = 0
-        best_model_path = Path(self.config.checkpoint_dir) / self.config.checkpoint_name
+        best_model_path = Path(self.config.checkpoint_dir) / self.config.checkpoint_filename
 
         self.logger.info(
             f"Starting E2E Training ({self.config.epochs} Epochs | Batch Size: {self.config.batch_size} | "
