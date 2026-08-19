@@ -107,9 +107,6 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else Path("./gated_attention_perturbation_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.num_classes != 2:
-        raise ValueError("This script assumes binary classification.")
-
     low, high = BAND_DEFS[args.band]
     scale_factors = np.array([float(s) for s in args.scale_factors.split(",")])
     lo_scale_idx, hi_scale_idx = int(np.argmin(scale_factors)), int(np.argmax(scale_factors))
@@ -119,6 +116,13 @@ def main():
             raise ValueError(f"--perturb-fraction values must be in (0, 1], got {f}.")
 
     model, ckpt = build_gated_attention_model(args, device, logger)
+    # Checked AFTER build_gated_attention_model(), not against the raw --num-classes flag: that flag
+    # is only ever a cross-check/fallback (same convention as num_channels/sfreq below), so a stale/
+    # default --num-classes 2 alongside an actual 3-class checkpoint would otherwise silently pass
+    # this guard and proceed to compute a meaningless "binary" result from a 3-way output, instead of
+    # loudly rejecting it as this script requires.
+    if ckpt.get("num_classes", args.num_classes) != 2:
+        raise ValueError("This script assumes binary classification.")
     threshold = ckpt.get("optimal_threshold", 0.5)
     print(f"Loaded Option B model from {args.model_checkpoint} (epoch {ckpt.get('epoch', '?')}, "
           f"head_type={ckpt.get('head_type', 'mlp')}), threshold={threshold:.4f}")

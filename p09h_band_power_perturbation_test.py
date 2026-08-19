@@ -129,8 +129,6 @@ def main():
             "This script perturbs the raw waveform directly (--manifest); --cache-dir (pre-extracted "
             "embeddings) has no raw signal left to filter."
         )
-    if args.num_classes != 2:
-        raise ValueError("This script assumes binary classification (softmax[:, 1] as 'the' probability).")
 
     low, high = BAND_DEFS[args.band]
     scale_factors = np.array([float(s) for s in args.scale_factors.split(",")])
@@ -139,7 +137,14 @@ def main():
               "the reported 'baseline_probability' will still use the true original window, "
               "but the fitted slope won't be anchored at the actual unperturbed point.")
 
-    model, _ckpt = build_e2e_classifier(args, device, logger)
+    model, ckpt = build_e2e_classifier(args, device, logger)
+    # Checked AFTER build_e2e_classifier(), not against the raw --num-classes flag: that flag is only
+    # ever a cross-check/fallback (see resolve_checkpoint_architecture()), so a stale/default
+    # --num-classes 2 alongside an actual 3-class checkpoint would otherwise silently pass this guard
+    # and proceed to compute a meaningless softmax[:, 1] "positive probability" from a 3-way output,
+    # instead of loudly rejecting it as this script requires.
+    if ckpt.get("num_classes", args.num_classes) != 2:
+        raise ValueError("This script assumes binary classification (softmax[:, 1] as 'the' probability).")
 
     subject_filter = [s.strip() for s in args.subject_id.split(",")] if args.subject_id else []
     if args.subjects_json:

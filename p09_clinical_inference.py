@@ -120,6 +120,18 @@ def evaluate_clinical_cohort(
         model, ckpt = build_e2e_classifier(args, device, logger)
     ckpt_thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
+    # build_frozen_probe()/build_e2e_classifier() already build the MODEL with the checkpoint's own
+    # num_classes (never blindly the CLI flag -- see resolve_checkpoint_architecture()'s loud mismatch
+    # warning, which fires above this point when they differ). Everything below this line (pooling,
+    # analyze_subject_results, the CSV export) needs that same resolved value, not the raw CLI flag,
+    # or a 3-class checkpoint run with a stale --num-classes 2 builds a 3-logit model yet analyzes it
+    # as binary (recall_score(pos_label=1) on 3 distinct ground-truth labels raises "Target is
+    # multiclass but average='binary'" downstream). Kept as a local variable -- same "resolve once,
+    # pass explicitly" convention resolve_pooling_config() already uses below -- rather than mutating
+    # args.num_classes itself, which would be a hidden side effect on a namespace the rest of this
+    # function still otherwise treats as the untouched CLI input.
+    num_classes = ckpt.get("num_classes", args.num_classes)
+
     # 2b. Resolve Pooling Config: CLI override > checkpoint's training-time config > hardcoded default
     pooling_strategy, top_percentile, t_window = resolve_pooling_config(
         pooling_strategy=args.pooling_strategy,
@@ -151,7 +163,7 @@ def evaluate_clinical_cohort(
         subject_ids.append(subject_id)
 
         for strat in active_strategies:
-            if args.num_classes == 2:
+            if num_classes == 2:
                 # Extract positive class probability array [N] for binary score aggregation
                 pos_probs = window_probs[:, 1]
                 score = compute_pooled_scores(
@@ -178,7 +190,7 @@ def evaluate_clinical_cohort(
         subject_results=subject_results,
         ground_truths=ground_truths,
         subject_ids=subject_ids,
-        num_classes=args.num_classes,
+        num_classes=num_classes,
         operating_thresholds=operating_thresholds,
         output_dir=output_dir
     )

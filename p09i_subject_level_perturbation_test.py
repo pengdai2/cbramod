@@ -123,8 +123,6 @@ def main():
     if args.cache_dir:
         raise ValueError("This script perturbs the raw waveform directly (--manifest); --cache-dir has "
                           "no raw signal left to filter.")
-    if args.num_classes != 2:
-        raise ValueError("This script assumes binary classification (softmax[:, 1] as 'the' probability).")
 
     low, high = BAND_DEFS[args.band]
     scale_factors = np.array([float(s) for s in args.scale_factors.split(",")])
@@ -135,6 +133,13 @@ def main():
             raise ValueError(f"--perturb-fraction values must be in (0, 1], got {f}.")
 
     model, ckpt = build_e2e_classifier(args, device, logger)
+    # Checked AFTER build_e2e_classifier(), not against the raw --num-classes flag: that flag is only
+    # ever a cross-check/fallback (see resolve_checkpoint_architecture()), so a stale/default
+    # --num-classes 2 alongside an actual 3-class checkpoint would otherwise silently pass this guard
+    # and proceed to compute a meaningless softmax[:, 1] "positive probability" from a 3-way output,
+    # instead of loudly rejecting it as this script requires.
+    if ckpt.get("num_classes", args.num_classes) != 2:
+        raise ValueError("This script assumes binary classification (softmax[:, 1] as 'the' probability).")
     ckpt_thresholds, _epoch, ckpt_pooling_params = extract_ckpt_metadata(ckpt)
 
     pooling_strategy, top_percentile, t_window = resolve_pooling_config(
