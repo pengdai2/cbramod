@@ -206,10 +206,10 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else Path("./absolute_band_power_analysis_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.features_pt:
+    if args.cache_dir:
         raise ValueError(
             "This script needs raw EEG (--manifest) to reconstruct real uV and compute band power/YASA "
-            "features from the signal itself; --features-pt (pre-extracted embeddings) has no raw "
+            "features from the signal itself; --cache-dir (pre-extracted embeddings) has no raw "
             "waveform (or normalization metadata) left to work with."
         )
 

@@ -179,7 +179,7 @@ def main():
 
     # 1. Instantiate Model Architecture + load its checkpoint, metadata-first (same helper as
     # p09c/p09/p10), with checkpoint_kind deciding head-only vs. full-model loading deterministically.
-    if args.features_pt:
+    if args.cache_dir:
         model, ckpt = build_frozen_probe(args, device, logger)
     else:
         model, ckpt = build_e2e_classifier(args, device, logger)
@@ -223,8 +223,8 @@ def main():
     subject_filter = subject_filter or None
 
     # 3. Load dataset
-    if args.features_pt:
-        dataset = CachedFeatureSubjectDataset(args.features_pt, filter_subject=subject_filter)
+    if args.cache_dir:
+        dataset = CachedFeatureSubjectDataset(Path(args.cache_dir) / args.master_cache_name, filter_subject=subject_filter)
         print(f"Loaded cached features for {len(dataset)} subjects.")
     else:
         dataset = PANSubjectEEGDataset(

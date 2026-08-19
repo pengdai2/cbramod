@@ -124,9 +124,9 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else Path("./band_power_perturbation_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.features_pt:
+    if args.cache_dir:
         raise ValueError(
-            "This script perturbs the raw waveform directly (--manifest); --features-pt (pre-extracted "
+            "This script perturbs the raw waveform directly (--manifest); --cache-dir (pre-extracted "
             "embeddings) has no raw signal left to filter."
         )
     if args.num_classes != 2:

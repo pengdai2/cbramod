@@ -940,10 +940,13 @@ def parse_cli_args() -> argparse.Namespace:
     add_log_filename_argument(parser, __file__)
 
     args = parser.parse_args()
-    if args.features_pt:
+    if not args.manifest:
+        parser.error("Feature attribution requires --manifest (raw EEG input).")
+    if args.cache_dir:
         parser.error(
-            "Feature attribution requires raw EEG input (--manifest); --features-pt is not supported, "
-            "since Integrated Gradients needs the full CBraModE2EClassifier over the raw waveform."
+            "Feature attribution requires raw EEG input (--manifest only); --cache-dir is not "
+            "supported, since Integrated Gradients needs the full CBraModE2EClassifier over the "
+            "raw waveform."
         )
     return args
 

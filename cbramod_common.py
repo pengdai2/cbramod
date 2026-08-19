@@ -1334,14 +1334,23 @@ def setup_inference_cli_parser(
              "alias for the same flag, matching the naming used by p13/p14/p20/p21."
     )
 
-    # Subject Data
-    data_group = parser.add_mutually_exclusive_group(required=True)
-    data_group.add_argument("--manifest", type=str, help="Path to test_manifest.csv for raw .npy inference")
-    data_group.add_argument("--features-pt", type=str, help="Path to pre-extracted test features (.pt)")
+    # Subject Data. --manifest and --cache-dir are NOT mutually exclusive: p08a's own docstring
+    # describes its master cache as covering EVERY accepted subject, with train/val (or any other
+    # subset) carved out later via CachedFeatureSubjectDataset's subject filter -- p09 supports that
+    # same pattern for test-set evaluation, so passing BOTH together means "use the master cache,
+    # restricted to whichever subjects are listed in this manifest" (see
+    # p09_clinical_inference.py::generate_subject_predictions for how they combine with
+    # --subject-id). --cache-dir/--master-cache-name (rather than a one-off single-path flag) matches
+    # the cache-loading convention used everywhere else in this pipeline (p08a's own writer,
+    # setup_cache_cli_parser()'s p13-p21 readers).
+    data_group = parser.add_argument_group("Subject Data")
+    data_group.add_argument("--manifest", type=str, default=None, help="Path to a manifest CSV. Used for raw .npy inference on its own; when combined with --cache-dir, its subject_id column instead restricts the master cache to that manifest's subjects (e.g. a test_manifest.csv).")
+    data_group.add_argument("--cache-dir", type=str, default=None, help="Directory containing a pre-extracted feature cache (e.g. p08a's master cache, or one built for a single split)")
+    data_group.add_argument("--master-cache-name", type=str, default="cached_master_embeddings.pt", help="Filename of the cache within --cache-dir")
 
     # Subject Filtering
     subject_group = parser.add_argument_group("Subject Filtering")
-    subject_group.add_argument("--subject-id", type=str, default=None, help="Optional comma-separated list of specific Subject IDs to analyze (e.g., GRINS0322,GRINS0038).")
+    subject_group.add_argument("--subject-id", type=str, default=None, help="Optional comma-separated list of specific Subject IDs to analyze (e.g., GRINS0322,GRINS0038). Intersected with --manifest's subject list when both are given alongside --cache-dir.")
 
     # Pooling Strategy
     # Defaults are left as None (rather than a hardcoded value) so

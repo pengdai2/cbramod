@@ -124,10 +124,10 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else Path("./morphology_score_correlation_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.features_pt:
+    if args.cache_dir:
         raise ValueError(
             "This script needs raw EEG (--manifest) to compute band power features from the signal "
-            "itself; --features-pt (pre-extracted embeddings) has no raw waveform left to analyze."
+            "itself; --cache-dir (pre-extracted embeddings) has no raw waveform left to analyze."
         )
 
     model, ckpt = build_e2e_classifier(args, device, logger)

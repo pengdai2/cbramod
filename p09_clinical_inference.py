@@ -59,8 +59,24 @@ def generate_subject_predictions(
     Unified generator streaming (subject_id, ground_truth_label, window_probs)
     for both cached features (.pt) and raw EEG manifest datasets.
     """
-    if args.features_pt:
-        dataset = CachedFeatureSubjectDataset(args.features_pt, filter_subject=args.subject_id)
+    if args.cache_dir:
+        # --manifest, when given alongside --cache-dir, restricts the (typically whole-cohort)
+        # cache to that manifest's subject_id column -- the same "one master cache, carve out a
+        # subset by subject filter" pattern p08a's docstring describes for train/val, applied here
+        # to a test split. Intersected with --subject-id (rather than one silently overriding the
+        # other) so a caller can further narrow an already-manifest-restricted run without it being
+        # ambiguous which filter "wins".
+        filter_subject = args.subject_id
+        if args.manifest:
+            manifest_subject_ids = pd.read_csv(args.manifest)["subject_id"].astype(str).tolist()
+            if filter_subject:
+                cli_ids = {s.strip() for s in filter_subject.split(",")}
+                filter_subject = [s for s in manifest_subject_ids if s in cli_ids]
+            else:
+                filter_subject = manifest_subject_ids
+
+        cache_path = Path(args.cache_dir) / args.master_cache_name
+        dataset = CachedFeatureSubjectDataset(cache_path, filter_subject=filter_subject)
         print(f"Loaded cached features for {len(dataset)} subjects.")
 
         for i in tqdm(range(len(dataset)), desc="Processing Subjects (Cached)"):
@@ -98,7 +114,7 @@ def evaluate_clinical_cohort(
     # checkpoint's own saved metadata when present, not blindly from CLI flags) and with the
     # checkpoint's own explicit checkpoint_kind (head_only vs. full_model) deciding how to load the
     # state dict -- replacing the old try/except-based load_model_checkpoint() guess.
-    if args.features_pt:
+    if args.cache_dir:
         model, ckpt = build_frozen_probe(args, device, logger)
     else:
         model, ckpt = build_e2e_classifier(args, device, logger)
@@ -308,8 +324,7 @@ def analyze_subject_results(
 def parse_cli_args()-> argparse.Namespace:
     parser = setup_inference_cli_parser(description="Multi-Class Patient-Level Clinical Inference")
     add_log_filename_argument(parser, __file__)
-    args = parser.parse_args()
-    return args
+    return parser.parse_args()
 
 
 if __name__ == "__main__":

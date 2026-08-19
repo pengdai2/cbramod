@@ -100,8 +100,8 @@ def main():
     output_dir = Path(args.output_dir) if args.output_dir else Path("./attention_pooled_perturbation_results")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.features_pt:
-        raise ValueError("This script perturbs the raw waveform directly (--manifest); --features-pt has no raw signal left to filter.")
+    if args.cache_dir:
+        raise ValueError("This script perturbs the raw waveform directly (--manifest); --cache-dir has no raw signal left to filter.")
     if args.num_classes != 2:
         raise ValueError("This script assumes binary classification (softmax[:, 1] as 'the' probability).")
 
