@@ -1120,6 +1120,119 @@ arbitrary model errors.
 
 ---
 
+## 14. Cross-Cohort Generalization: Applying model[0] (grins1) to a New Cohort (grins2)
+
+Everything above validated the sigma mechanism on grins1's own held-out data. This section applies
+model[0]'s linear probe, unmodified, to a second, independently-recruited cohort ("grins2": control,
+schizophrenia, and bipolar subjects) with a different recording setup (an earlobe re-referencing fix
+was needed just to get YASA to detect spindles at all) — a genuine out-of-distribution test, not
+another held-out split of the same data. Both patient subtypes are treated as "patient" against
+2-class control comparisons, and separately against each other, using `p24_cross_cohort_relabel.py` to
+pool subjects across cohorts for the band-power comparisons below.
+
+### 14.1 Classification transfer
+
+| | Sens | Spec | AUC | n |
+|---|---|---|---|---|
+| grins1 held-out test | 0.842 | 0.750 | 0.882 | 35 (19 patients / 16 controls) |
+| grins2 bipolar vs. control | 0.729 | 0.816 | 0.843 | 134 (85 patients / 49 controls) |
+| grins2 scz vs. control | 0.667 | 0.816 | 0.799 | 103 (54 patients / 49 controls) |
+
+Specificity *improved* on grins2 relative to grins1's own test; all the degradation is on the
+sensitivity side, and it's worse for scz than for bipolar — the opposite of what schizophrenia's
+well-replicated spindle-deficit literature would predict, and the first sign this cohort would need
+its own investigation rather than an assumption that it would simply transfer.
+
+### 14.2 Band-power group differences reveal a shifted control population
+
+Comparing grins2's patients against grins2's *own* controls initially produced a striking result: an
+apparent *reversal* of the sigma/spindle-deficit direction in bipolar (elevated, not deficient). The
+resolution turned out to be that grins2's own control population is not equivalent to grins1's —
+comparing grins2 subjects against the correct, full grins1 control reference (n=98, not just grins2's
+own 49) tells a different and more consistent story:
+
+| Feature | grins2 controls (n=49) vs. grins1 controls | Bipolar (n=85) vs. grins1 controls | Scz (n=54) vs. grins1 controls |
+|---|---|---|---|
+| sigma | **lower, p=0.010** (survives z-scoring, p=0.024) | not significant (p=0.826) | trend lower (p=0.095) |
+| n_spindles | **lower, p=0.013 / 0.041** | weak (p=0.06 / 0.03) | trend lower (p=0.10) |
+| theta | not significant | **lower, p=0.0002** | trend lower (p=0.05) |
+| delta | not significant | borderline lower | **higher, p=0.032** |
+| alpha | trend lower (n.s.) | not significant | **lower, p=0.015** |
+| n_slow_waves | not significant | not significant | **higher, p=0.0004** |
+
+The key fact: **grins2's own controls are genuinely shifted low on sigma/spindles relative to
+grins1's controls**, and this survives z-scoring, ruling out a pure recording-amplitude-scale
+explanation. Against the *correct* reference, bipolar's apparent sigma reversal disappears entirely
+(p=0.826) — it was an artifact of comparing against an already-shifted control population, not a real
+reversal of the mechanism. Bipolar's one robust, reference-independent finding instead is a theta
+deficit (p=0.0002 regardless of which control population is used). Scz's profile, which looked nearly
+null against grins2's own controls, becomes considerably more grins1-consistent against the correct
+reference (delta up, alpha down, slow-waves up all significant), with sigma/spindles trending in the
+expected deficit direction without reaching significance at n=54.
+
+### 14.3 The sigma-score relationship transfers, but only in absolute terms
+
+Correlating the model's window-level probability against *relative* band power in grins2 showed a
+near-null, sign-flipping sigma relationship — a result that looked like it disconfirmed the mechanism
+entirely on this cohort. Recomputing the same correlation using *absolute* power (already present as
+a column alongside `probability` in `p09k`'s output, no rerun needed) instead showed a real, consistent
+negative within-subject correlation — higher sigma, lower patient-probability — in bipolar, scz, and
+grins2's own controls alike. The earlier null result was an artifact of using the wrong power
+representation, not evidence the mechanism doesn't transfer.
+
+A direct causal perturbation test on all 188 grins2 subjects (`p09h_band_power_perturbation_test.py`,
+sigma scale factors 0.5–1.5) confirmed genuine transfer of the causal channel: 72% of windows show the
+expected negative slope, with a very high per-window fit quality (mean R²=0.92). The slope's magnitude
+scales with each subject's own baseline sigma level (Spearman ≈ −0.36 pooled), and — checked
+separately to rule out the larger patient group driving the pooled number — this baseline-dependence
+replicates within controls alone (joint-OLS β=−1.03, n=49) at essentially the same magnitude as within
+patients (β=−0.90, n=139). Boundary proximity contributes almost nothing in either group. This is a
+real, general property of the classifier's sigma response, not a pooling artifact.
+
+### 14.4 A falsification, and what it actually shows
+
+If sigma level alone determined subject-level classification, grins2's controls — measurably lower in
+sigma than grins1's, in both raw and z-scored terms — should show *worse* specificity than grins1's
+own test. They show *better* (0.816 vs. 0.750). That means some other, currently unidentified factor
+must be compensating for the sigma-driven push toward "patient-like," strongly enough to fully absorb
+it and still land grins2 controls' specificity above grins1's own test.
+
+A slope-based counterfactual made this precise rather than qualitative: using each grins2 control's
+own measured sigma-perturbation slope, what would their subject-level (P85-pooled) score have been at
+grins1-typical sigma instead of their own (lower) baseline? The counterfactual is not designed to flip
+the specificity comparison — it is designed to *remove sigma's effect* and expose the unknown
+compensating factor's effect on its own. Result: predicted specificity at grins1-typical sigma rose
+further, from 0.837 (actual, this subsampled run; officially reported 0.816) to 0.878 (41→43 of 49
+correct). In other words, once sigma's real but modest negative contribution is subtracted out, the
+unknown factor's own effect is *larger*, not smaller — confirming sigma is a genuine, correctly-signed,
+but quantitatively minor contributor, and the unknown factor is the larger, positive one actually
+responsible for grins2 controls' good classification.
+
+### 14.5 Ruling out one candidate explanation: is grins1's own test split just an unlucky sample?
+
+One candidate explanation for grins1's own test specificity (0.750) being the *lowest* number in the
+whole comparison is that its 16 held-out controls are an atypically hard subset of the full 98-control
+population, rather than there being anything to explain about grins2 at all. Checked directly against
+`master_manifest.csv`'s train/val/test split: the 16 test-split controls do **not** look like an
+unfavorable subset on any of the five bands examined — they actually have *higher* sigma than the
+other 82 grins1 controls (37.26 vs. 29.73 abspower, p=0.027), which should make them *easier*, not
+harder, to classify correctly. This rules out "unrepresentative hard subset on band power" as the
+explanation; the most likely account for grins1's test specificity is simple small-sample variance
+(n=16 — one or two atypical individuals move the percentage by 6+ points regardless of the group's
+average band composition).
+
+### 14.6 Open thread
+
+The unknown factor compensating for grins2 controls' sigma deficit and keeping their specificity intact
+has not been identified. Candidates flagged but not yet checked: another band or feature carrying an
+offsetting positive effect (worth the same perturbation-and-counterfactual treatment as sigma), a
+recording/acquisition-level property tied to the earlobe re-referencing that isn't captured by any of
+the five hand-picked bands, or embedding-level structure a feature-attribution pass (`p10`) or
+multivariate comparison would surface but a marginal band-by-band accounting can't. This is left open
+for a future session rather than resolved here.
+
+---
+
 ## Appendix A: Data Preparation & Cleansing
 
 **Referencing.** Recordings are re-referenced (A1/A2 linked-earlobe reference, matching the
