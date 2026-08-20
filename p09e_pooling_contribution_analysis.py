@@ -39,7 +39,7 @@ Different pooling methods have qualitatively different contribution
 
 Usage:
   python p09e_pooling_contribution_analysis.py \
-      --checkpoint model.pt --manifest test_manifest.csv \
+      --probe-checkpoint model.pt --manifest test_manifest.csv \
       --subject-id GRINS0322 --top-k-contributors 5 --output-dir results/
 """
 

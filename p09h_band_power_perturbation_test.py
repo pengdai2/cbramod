@@ -36,7 +36,7 @@ effect.
 
 Usage:
   python p09h_band_power_perturbation_test.py \
-      --checkpoint model.pt --manifest test_manifest.csv \
+      --probe-checkpoint model.pt --manifest test_manifest.csv \
       --band sigma --scale-factors 0.5,0.75,1.0,1.25,1.5 \
       --max-windows-per-subject 40 --output-dir results/
 """

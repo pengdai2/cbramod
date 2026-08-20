@@ -33,7 +33,7 @@ silently defeat the entire point of this script), then:
 
 Usage:
   python p09k_absolute_band_power_analysis.py \
-      --checkpoint model.pt --manifest test_manifest.csv \
+      --probe-checkpoint model.pt --manifest test_manifest.csv \
       --output-dir results/ --max-windows-per-subject 200
 """
 

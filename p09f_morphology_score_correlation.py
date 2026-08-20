@@ -44,7 +44,7 @@ Reports both:
 
 Usage:
   python p09f_morphology_score_correlation.py \
-      --checkpoint model.pt --manifest test_manifest.csv \
+      --probe-checkpoint model.pt --manifest test_manifest.csv \
       --output-dir results/ --max-windows-per-subject 200
 """
 

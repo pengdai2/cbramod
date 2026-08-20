@@ -25,7 +25,7 @@ ever returns the final logits.
 
 Usage:
     python p15_attention_pooled_perturbation_test.py \
-        --checkpoint checkpoints-probe-linear/cbramod_ckpt.pt \
+        --probe-checkpoint checkpoints-probe-linear/cbramod_ckpt.pt \
         --attn-checkpoint checkpoints-attn-head/cbramod_ckpt.pt \
         --manifest test_manifest.csv --band sigma --scale-factors 0.5,0.75,1.0,1.25,1.5
 """

@@ -38,7 +38,7 @@ Also reports, per subject:
 
 Usage:
   python p09i_subject_level_perturbation_test.py \
-      --checkpoint model.pt --manifest test_manifest.csv \
+      --probe-checkpoint model.pt --manifest test_manifest.csv \
       --band sigma --scale-factors 0.5,0.75,1.0,1.25,1.5 \
       --subjects-json key_subjects.json --output-dir results/
 """
