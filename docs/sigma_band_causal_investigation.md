@@ -1233,6 +1233,95 @@ for a future session rather than resolved here.
 
 ---
 
+## 15. A Combined 3-Class Model (grins1 + grins2), and a Cohort Confound It Exposes
+
+Section 14 characterized how model[0]'s 2-class probe transfers to grins2. This section covers a
+different, follow-on model: a fresh 3-way classifier (control / patient[scz] / bipolar) trained on
+grins1 and grins2 *combined*, rather than transferring a grins1-only probe.
+
+### 15.1 Cohort composition, and why grins2's control and scz were excluded
+
+`p25_build_combined_manifest.py` builds the combined manifest; `p26_merge_feature_caches.py` merges
+the corresponding p08a feature caches. Given Section 14's findings — grins2's own control population
+is measurably shifted low on sigma/spindles relative to grins1's, and grins2's scz signal is the
+weakest, least significant signal in the whole cross-cohort comparison — grins2's control and scz
+subjects were deliberately excluded from the combined cohort for this first pass. The resulting
+3-way training population is **control (grins1 only, n=98) / patient-scz (grins1 only, n=123) /
+bipolar (grins2 only, n=85)**, split 213/44/49 (train/val/test) preserving each cohort's original
+per-subject split membership.
+
+### 15.2 Held-out test performance
+
+An MLP head (`--head-type mlp --head-dim 256`, burden-ratio pooling at `--t-window 0.3`, class-weighted
+loss) trained for 60 epochs, best checkpoint at epoch 45 (val subject accuracy 70.45%, macro F1
+0.6943, macro OvR AUC 0.8439 — no early stop triggered; window-level train/val accuracy diverged
+substantially by the end while subject-level metrics stayed stable, consistent with pooling absorbing
+window-level overfitting throughout this whole investigation). Held-out test (n=49: 35 grins1 + 14
+grins2 bipolar):
+
+| Truth (n) | → control | → patient/scz | → bipolar | Recall |
+|---|---|---|---|---|
+| control (16) | 13 | 0 | 3 | 0.8125 |
+| patient/scz (19) | 2 | 13 | 4 | 0.6842 |
+| bipolar (14) | 1 | 3 | 10 | 0.7143 |
+
+Subject accuracy 0.7347, macro F1 0.7335, macro OvR AUC 0.849 — a real, substantially-better-than-chance
+result (majority-class baseline ≈39%). Notably, control is never confused with patient/scz (0/16), only
+with bipolar (3/16); patient/scz confuses in both directions; bipolar's errors lean toward patient/scz
+(3) more than control (1).
+
+### 15.3 The cohort confound: bipolar is the only grins2-sourced class
+
+Because control and patient/scz are drawn entirely from grins1 and bipolar entirely from grins2 — two
+cohorts already shown to differ at the acquisition level (the earlobe re-referencing fix; the
+demonstrated control-population baseline shift) — every bipolar prediction is consistent with either
+"the model learned bipolar pathology" or "the model learned to detect grins2's recording pipeline,"
+and the confusion matrix above cannot distinguish the two.
+
+This was tested directly by running the trained model on grins2's *excluded* control and scz subjects
+(true labels known, never seen in training):
+
+| Held out on grins2, true label | → control | → patient/scz | → bipolar |
+|---|---|---|---|
+| scz (n=54) | 8 (14.8%) | 17 (31.5%) | **29 (53.7%)** |
+| control (n=49) | 33 (67.3%) | 5 (10.2%) | 11 (22.4%) |
+
+(`ROC-AUC (OVR macro) = 0.5` on both — a degenerate-evaluation artifact of every subject in the set
+sharing one true label, not a real signal; the confusion counts are the informative part.)
+
+Baseline expectation from the real held-out test set (grins1-sourced classes only): patient/scz→bipolar
+21.1% (4/19), control→bipolar 18.75% (3/16). Grins2's excluded controls land close to that baseline
+(22.4% vs. 18.75%, plausibly noise at n=49). **Grins2's excluded scz subjects do not** — 53.7% called
+bipolar is more than double the 21.1% baseline, on a comparable sample size (n=54 vs. 19). This
+confirms the cohort confound is real, and it is asymmetric in a mechanistically sensible way: grins2's
+own scz signal was already the weakest, least-significant signal anywhere in Section 14's cross-cohort
+comparisons, while grins2's controls carry a comparatively clearer control-like signature. When the
+genuine diagnostic signal is faint (scz), the model falls back harder on whatever residual
+cohort/acquisition signature correlates with "bipolar" in training — because bipolar is the *only*
+grins2-sourced class, that signature and the bipolar label are currently inseparable.
+
+**Practical implication:** this model's bipolar-related numbers (both the 71.4% test recall and the
+control/scz-vs-bipolar confusion pattern in 15.2) cannot currently be trusted as evidence of genuine,
+cohort-independent bipolar detection. A meaningful part of what drives "bipolar" predictions is
+plausibly "recorded on grins2's pipeline," not bipolar pathology specifically.
+
+### 15.4 Open thread: fixing the confound reopens the sigma-baseline problem
+
+The direct fix — giving the model within-grins2 contrastive examples for the other two classes by
+including grins2's own control (and/or scz) subjects in training, so grins2-acquisition-pattern is no
+longer a perfect proxy for bipolar — runs straight back into Section 14.2's finding: grins2's control
+population is not equivalent to grins1's, measurably shifted low on sigma/spindles even after
+z-scoring. Mixing grins2 controls into a combined training set doesn't just add more control examples;
+it adds control examples whose baseline on the specific feature this whole investigation is built
+around differs from grins1's controls. Whether that's tolerable (the classifier already showed some
+robustness to this shift when just transferring model[0], per Section 14.4's counterfactual) or a real
+problem for training a model whose control class is itself now cohort-heterogeneous on sigma is not
+yet known, and left open here rather than resolved. The other option floated — explicit cohort/domain
+adjustment before the classification head — sidesteps this specific tension but is more involved and
+also unexplored.
+
+---
+
 ## Appendix A: Data Preparation & Cleansing
 
 **Referencing.** Recordings are re-referenced (A1/A2 linked-earlobe reference, matching the
