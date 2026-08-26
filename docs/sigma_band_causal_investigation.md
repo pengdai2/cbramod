@@ -1595,6 +1595,16 @@ suppression effect, independently confirmed a second way, now visible even witho
 
 ### 16.10 The subject-level causal counterfactual: the real effect has no ambiguity anywhere
 
+This section answers a different, prerequisite question from 16.9 and 16.11. 16.9 and 16.11 both
+ask *does feature-space displacement direction agree with the probability-change direction*, i.e.
+a question about geometry — comparing a perturbed point's position to other subjects or group
+centroids. 16.10 asks something that has to be settled first: *is the real, subject-level causal
+effect itself even well-defined and consistent* — with no reference to geometry, other subjects,
+or any fitted model at all. If the answer here had been "no, some subjects' pooled effect flips
+sign depending on which windows dominate," then 16.9 and 16.11 would be trying to align feature-space
+geometry with a moving target. The clean 100% result below is what makes it meaningful to ask, as
+16.9 and 16.11 do, whether *anything* geometric predicts that effect's direction.
+
 Both explanations above concerned *approximations* to the real causal effect (a linear coefficient
 sum; a raw-but-still-observational projection). The real effect can be checked directly: for each
 subject, apply their own measured per-window slope to their own baseline probability at the tested
