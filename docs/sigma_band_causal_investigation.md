@@ -1547,7 +1547,7 @@ modeling approaches (regularized linear regression and gradient-boosted-tree SHA
 a genuine, if minor, mismatch for any future work relying on this model's beta sensitivity as a proxy
 for the real clinical signal.
 
-### 16.8 Geometric confirmation
+### 16.8 Geometric confirmation, and a "virtual subject" reframing of perturbation
 
 Projecting all 22 test subjects onto the (134-subject-derived) data direction confirms the mental
 picture directly: bipolar group mean projection +0.271, control group mean −0.471, and the three
@@ -1557,15 +1557,130 @@ model errors; these subjects' own joint spectral profile genuinely resembles the
 typical region along the specific axis that governs both the real clinical distinction and the
 model's own decision.
 
-The same geometry reframes perturbation usefully, without rehabilitating the disentangling attempt:
-a total-energy-preserving perturbation moves a subject's feature vector along a specific,
-exactly-computable displacement in this same space — a "virtual subject" with no ground truth.
-Dot-producting the sigma perturbation's displacement (scale=1.5) against each model's `w_model`
-predicts the *same sign* as the actually-measured sigma perturbation slope in all three models,
-though not the same magnitude (the two measure different things: one is variation across real
-subjects' natural differences, the other a synthetic single-subject manipulation). This is a
-within-regime check (k=1.5, inside the originally-tested range) — it does not rehabilitate the
-linear-additive framing for the extreme, out-of-regime broadband case already falsified in 16.4.
+This suggests a natural reframing of perturbation itself: a total-energy-preserving perturbation
+moves a subject's feature vector along a specific, exactly-computable displacement in this same
+space — a "virtual subject" with no ground truth. If the multivariate framework in 16.6-16.7 is
+internally coherent, the direction this virtual subject moves relative to the real bipolar/control
+groups ought to agree with the direction the model's actual, measured probability moves. Checking
+this rigorously — and correcting several wrong turns along the way — is the subject of 16.9-16.11.
+
+### 16.9 Extending the check to all five bands: a real disagreement, and two wrong explanations
+
+Dot-producting each band's perturbation displacement (scale=1.5) against `w_model` (the same
+per-feature coefficients from 16.6) gives the *same sign* as the actually-measured slope for theta,
+alpha, sigma, and beta — theta and alpha agree closely even in magnitude, not just sign. **Delta
+disagrees**: the dot product predicts a positive shift; the actually-measured slope is negative, in
+all three models.
+
+Two explanations were tried and both were checked directly and rejected, worth recording so they
+aren't retried:
+
+- *"Delta's displacement is unusually large, outside the model's fitted region."* Checked in standard-deviation units of each band's own natural cross-subject variation: delta's own displacement (+1.3 SD) was in fact the *smallest* of the five bands' own-perturbation displacements — theta's own displacement (+3.9 SD) was three times larger, and theta still matched. Rejected.
+- *"The resulting virtual subject — high delta, low theta — doesn't correspond to anything real."* This rested on delta and theta correlating *positively* (+0.54) in absolute power, making a low-theta/high-delta combination look unrealistic. But `w_model` is fit on *relative* power, and relative power's delta-theta correlation is **−0.81** — the opposite sign, a compositional artifact of dividing by a delta-dominated total (delta is ~77-79% of total power). A real bipolar subject (`GRINS2047`) sits within 0.16 SD of the exact virtual-subject location. Rejected.
+
+The actual mechanism, found by decomposing the dot product term-by-term: theta's coefficient
+(large, and only meaningful as the *conditional* quantity established in 16.7) multiplied by
+theta's large forced displacement produces a single term large enough to flip the total sign,
+overwhelming the four correctly-signed contributions from delta, alpha, sigma, and beta combined.
+This is the same failure mode as the broadband falsification in 16.4: summing independently-fit,
+"hold-everything-else-fixed" coefficients across a displacement that moves every feature
+simultaneously is only valid under exact linear additivity, which broadband already disproved.
+Bypassing that sum — projecting real subjects' raw feature vectors directly onto the raw
+displacement direction, no coefficients at all — makes delta agree. Theta now disagrees instead:
+its own between-subject correlation with model probability is the *positive*, unconditioned quantity
+from 16.7, not its true negative causal role, so a projection dominated by theta's own change
+recovers the confounded, not the causal, direction. This is not a new problem — it is the 16.7
+suppression effect, independently confirmed a second way, now visible even without going through
+`w_model` at all.
+
+### 16.10 The subject-level causal counterfactual: the real effect has no ambiguity anywhere
+
+Both explanations above concerned *approximations* to the real causal effect (a linear coefficient
+sum; a raw-but-still-observational projection). The real effect can be checked directly: for each
+subject, apply their own measured per-window slope to their own baseline probability at the tested
+scale factor, then pool via the model's actual decision rule (the 85th percentile across windows,
+matching `p85_score`) to get a genuine subject-level prediction — no `w_model`, no linear surrogate,
+no additive assumption anywhere in the calculation.
+
+Result: **100% of subjects, all five bands, all three architectures, agree in sign with no
+exceptions** — delta and theta uniformly negative, alpha/sigma/beta uniformly positive, subject by
+subject. The real, measured, subject-level causal effect was never ambiguous. Every disagreement
+found in 16.9 belonged entirely to a specific approximation tool (the additive coefficient sum for
+delta; the confounded marginal projection for theta) — never to the underlying phenomenon.
+
+### 16.11 The question actually worth asking, verified rigorously
+
+Stripped of both approximations, the real question is: does the virtual subject's displacement move
+it toward the side of real-subject space consistent with the real, measured probability change —
+checked in a way that assumes nothing about any feature being held fixed? The right tool is a
+non-additive discriminant: distance to the real bipolar and control group centroids,
+`disc(x) = ‖(x−control_centroid)/σ‖ − ‖(x−bipolar_centroid)/σ‖` (σ = per-feature standard deviation,
+so no single feature's raw scale dominates). This is provably a hyperplane too — expanding the
+squared-distance difference algebraically, the quadratic terms cancel exactly, leaving a linear
+function of `x` with normal vector proportional to `(bipolar_centroid − control_centroid)/σ²` — but
+one whose weight on each feature is that feature's own simple, *marginal* difference between the
+groups, never adjusted for correlation with the others, unlike `w_model`'s jointly-fit, conditional
+coefficients.
+
+This was verified end to end rather than assumed correct:
+
+1. **Circularity check.** The population used to build the centroids (134 subjects) fully contained the 22-subject test set. Rebuilt centroids from the 112 subjects with zero overlap.
+2. **Metric validity.** Applied to the 22 held-out test subjects (never used to build the centroids): bipolar averaged disc=+0.102, control averaged disc=−0.354; `sign(disc)` alone classifies 15/22 (68%) correctly — close to the actual model's own 73% test accuracy, confirming the metric captures something real.
+3. **Displacement formula.** Verified by hand at k=0.5/1.0/1.5 on a worked example: fractions always sum to exactly 1, the perturbed band moves the expected direction, every other band moves oppositely.
+4. **Full five-band result**, using each subject's own baseline composition (not a cohort average) and the corrected, non-circular centroids: delta, theta, alpha, sigma, and beta **all agree in the direction of the average shift** with the real measured slope, replicated identically across linear, mlp-128, and mlp-256.
+5. **Robustness.** Held at a second perturbation size (k=1.25). Removing the per-feature std-normalization broke theta specifically — diagnosed as delta's raw scale (~0.8) swamping the Euclidean distance relative to theta's (~0.09), a known artifact of skipping normalization, not a new finding, which if anything increases confidence in the normalized version.
+
+One remaining honest caveat: agreement holds at the *average* level across the cohort, not with the
+same 100% per-subject consistency as the direct causal measurement in 16.10 (e.g. only 32% of
+subjects individually move closer to bipolar than control for delta, even though the average
+direction is correct). The centroid-distance metric is a real, validated, but noisier instrument at
+the individual level than directly measuring the model's own output.
+
+### 16.12 Two hyperplanes, not one: what each can and cannot answer
+
+`w_model` (logistic/ridge regression) and `w_centroid` (the discriminant in 16.11) are both
+hyperplanes, mathematically — the distinction is entirely in how the weight vector is derived, and
+that distinction turns out to explain every disagreement found in this investigation, not just
+delta's. Checked directly on sigma/beta (the pair with the most correlated, and most divergent,
+coefficients): cosine similarity between the two weight vectors is only **+0.39** (full 5-feature
+case) to **+0.81** (2-feature sigma/beta case) — genuinely different directions, not two views of
+the same thing. Beta has the *largest* magnitude in `w_centroid` but a small, opposite-signed weight
+in `w_data` — the same marginal-vs-conditional mechanism that produced theta's suppression effect in
+16.7, now shown to be the same underlying phenomenon behind two findings that had looked separate.
+
+`w_model`'s coefficients are each *conditional*: "this feature's contribution, holding the others
+fixed." `w_centroid`'s are each *marginal*: "this feature's own simple difference between the
+groups, unadjusted for correlation with the rest." Both are legitimate, well-defined quantities — but
+only one of them describes something that can exist as an input to this model. Relative-power
+features are compositional (they sum to 1, so changing one requires at least one other to change too
+— true independent of Z-scoring); Z-scoring stacks a second constraint on top, fixing total energy
+itself for every valid input. Together, there is no signal — real or synthetic — in which one band
+moves and literally nothing else does. `w_model`'s "hold everything else fixed" premise describes an
+input that cannot be constructed, under either constraint alone or both together.
+
+What `w_model` *does* legitimately answer is a population-level, associative question about real,
+naturally-varying subjects: controlling for the other bands' typical levels, does the part of band
+X's variation that isn't explainable by them associate with diagnosis? That is exactly the same kind
+of claim as a clinical regression reporting "controlling for age and BMI, smoking is associated with
+heart disease" — a true, useful statement about people who already exist, not a promise about
+constructing someone with that exact isolated combination of traits. It is the right tool for
+Section 16.6-16.7's question (does the model track the same real distinction that separates real
+patients from real controls) and the wrong tool for predicting a mechanistic, within-recording
+perturbation's effect, which is what 16.9's delta failure demonstrated directly. `w_centroid` is the
+reverse: it never assumes any feature is held fixed, so it stays coherent for a perturbed point
+exactly as well as a real one — which is why it, not `w_model`, is the right instrument for the
+virtual-subject check in 16.11.
+
+Framed this way, 16.11's multivariate discriminant is not a different technique from the original,
+pre-entanglement instinct ("did sigma move closer to the bipolar or control mean") — it is that same
+one-dimensional proximity check, generalized to however many dimensions the perturbation's effect
+actually occupies. Restricting `disc(x)` to a single feature collapses it to exactly that one-band
+comparison; nothing about the underlying concept (closeness to a group's typical profile) changed
+between Sections 3-4 and Section 16. What changed is the recognition, forced by the entanglement
+discovery in 16.3, that a single perturbed band's own coordinate stopped being a complete description
+of where the virtual subject actually landed once every other band was shown to move with it — so
+the same proximity question had to be asked in the space the point actually moved through, not
+projected down onto the one axis that happened to be perturbed.
 
 ---
 
