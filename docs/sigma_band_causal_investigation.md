@@ -20,6 +20,24 @@ shift, which is similarly broad rather than tail-concentrated — this rules out
 the raw finding or the model's behavior is being driven by a handful of unusual windows. This is
 causal evidence, not just correlational, and it converges across every measurement approach tried.
 
+**A methodological correction, discovered in Section 16 and applying retroactively to every
+perturbation result in this document, including the one above.** Every perturbation here used
+*total-energy-preserving* rescaling — scale one band, then renormalize the whole window back to its
+original standard deviation — specifically to keep the perturbed window inside the model's
+Z-score-normalized training distribution. Section 16 establishes that this renormalization is not a
+free implementation choice: because the model's input is Z-scored per channel per window (confirmed
+directly in `p02_slice_eeg_dataset.py`), total signal variance is fixed for every valid input, so
+changing one band's share of that fixed budget *necessarily* changes every other band's share too,
+proportionally — "perturbing sigma power, and nothing else" is not achievable in principle while
+staying inside the training distribution, not merely difficult in practice. The directional,
+dose-proportional response reported above is real and reproducible — that part hasn't changed — but
+it should be read as "raising sigma's share of the power budget, necessarily alongside a proportional
+decrease in every other band, causally shifts the prediction," not as isolating sigma's own
+independent contribution from delta/theta/alpha/beta's. Section 16 also shows that the natural next
+step — algebraically solving for each band's isolated coefficient from several such perturbations —
+fails a direct out-of-sample check, and describes the multivariate framework that supersedes
+single-band causal claims for explaining model behavior going forward.
+
 **What was tried to improve on the p85 baseline, and what's recommended.** The original pipeline
 produces a subject-level prediction by scoring every window individually, then taking the 85th
 percentile of those scores as the subject's pooled result ("p85") — a fixed, hand-chosen aggregation
@@ -65,7 +83,10 @@ reverse, with the other 4 unexplained by sigma.
 **Where to look for detail**, if a claim above needs the derivation: the sigma mechanism is Chapters
 2–4; the architecture comparison (p85/Option A/B) is Chapters 6–8; Option C's failure is Chapter 9;
 the labeling-scheme closure is Chapters 10–11; the misclassification case study and figures are
-Chapters 12–13; data-cleaning and pipeline rationale are Appendices A–B.
+Chapters 12–13; cross-cohort transfer to grins2 and the combined-model confound are Chapters 14–15;
+the dedicated grins2 model, the entanglement/identifiability correction to every perturbation claim
+in this document, and the multivariate alternative are Chapter 16; data-cleaning and pipeline
+rationale are Appendices A–B.
 
 ---
 
@@ -84,6 +105,10 @@ to move together with the prediction. The goal of this investigation was to walk
 subject-level decision to a causal claim: does deliberately perturbing sigma power, and nothing
 else, change what the model predicts — and does that effect survive at the level pooling actually
 operates at (a whole subject's recording), not just at the level of an individual window?
+
+*(Section 16 revisits and corrects the "nothing else" premise stated here: total-energy-preserving
+perturbation, used throughout this investigation to keep windows inside the model's training
+distribution, cannot in principle touch only one band — see Section 16.5.)*
 
 ## 2. Technical Background
 
@@ -156,6 +181,12 @@ window inside the model's training distribution (avoiding a "went out of distrib
 This established that scaling sigma power up moves individual window-level probabilities down in a
 consistent, dose-proportional way — a direct causal effect, not just a correlation.
 
+*(Correction, see Section 16.5: "total signal energy preserved" means every other band's power is
+also mechanically, proportionally changed by the same renormalization step — not an incidental
+detail, but an unavoidable consequence of keeping the window inside the model's Z-score-normalized
+training distribution. The effect reported here is real, but it is sigma's power share moving
+together with a forced, proportional change in delta/theta/alpha/beta, not sigma in isolation.)*
+
 **Subject-level causal test (does pooling preserve or destroy this effect?).** The window-level
 result doesn't guarantee anything at the subject level, since p85 pooling could in principle be
 insensitive to a change that doesn't land near the percentile rank. Perturbing *all* windows of a
@@ -217,6 +248,13 @@ learned to treat elevated sigma-band power as evidence against the patient class
 relationship is not an artifact of the specific "perturb everything at once" setup, and that
 percentile pooling does not silently discard this signal on its way from window-level to
 subject-level decisions.
+
+*(See Section 16 for an important correction: this causal effect is real, but — as later discovered
+while extending this same methodology to a different model — it cannot be attributed to sigma in
+isolation. Total-energy preservation necessarily changes every other band proportionally too;
+algebraically disentangling sigma's own share from delta/theta/alpha/beta's requires assumptions
+Section 16.5 shows do not hold, and the properly-caveated multivariate framework in Section 16.6-16.7
+supersedes this single-band framing for explaining model behavior.)*
 
 ## 5. Next Steps
 
@@ -1319,6 +1357,215 @@ problem for training a model whose control class is itself now cohort-heterogene
 yet known, and left open here rather than resolved. The other option floated — explicit cohort/domain
 adjustment before the classification head — sidesteps this specific tension but is more involved and
 also unexplored.
+
+---
+
+## 16. A Dedicated Grins2 Control-vs-Bipolar Model: Better Performance, and a Methodological Correction That Applies to the Whole Document
+
+Sections 14-15 studied how model[0] (trained on grins1) transfers to grins2, and how a combined
+grins1+grins2 model behaves. This section studies a third, different model: a classifier trained and
+evaluated *entirely within grins2*, on control vs. bipolar only. That choice was deliberate, for three
+reasons already established: it avoids Section 15's cohort confound (bipolar was the only
+grins2-sourced class in the combined model, so "bipolar" and "recorded on grins2's pipeline" were
+inseparable); it avoids grins2's scz signal, shown throughout Section 14 to be the weakest and least
+reliable of the three groups; and training and evaluating purely within grins2 sidesteps Section 14's
+grins2-control-vs-grins1-control baseline-shift question entirely, since this model never needs to
+compare against grins1 at all.
+
+### 16.1 Setup and performance
+
+Three head architectures were trained on frozen CBraMod embeddings: a linear probe, and two MLPs
+(hidden dim 128 and 256), using `p27_filter_grins2_ctl_bipolar_manifest.py` to filter grins2's own
+manifest to control+bipolar only (93/19/22 train/val/test, reusing grins2's existing per-subject
+split) and the existing, unmodified grins2 feature cache (no relabeling needed, unlike the combined
+model in Section 15 — control=0/bipolar=1 is already grins2's own encoding).
+
+5-fold stratified group k-fold cross-validation:
+
+| | subject macro F1 | subject accuracy | sensitivity | specificity | ROC-AUC |
+|---|---|---|---|---|---|
+| linear | 0.865 ± 0.060 | 0.867 ± 0.060 | 0.804 ± 0.080 | 0.978 ± 0.044 | 0.888 ± 0.039 |
+| mlp-128 | 0.872 ± 0.031 | 0.876 ± 0.031 | 0.817 ± 0.033 | 0.978 ± 0.044 | 0.895 ± 0.039 |
+| mlp-256 | 0.872 ± 0.031 | 0.876 ± 0.031 | 0.817 ± 0.033 | 0.978 ± 0.044 | 0.898 ± 0.037 |
+
+Held-out test (n=22: 14 bipolar/8 control) tracked CV closely (AUC ~0.9, macro F1 ~0.86, no
+overfitting cliff), and all three models scored a perfect 8/8 on specificity. mlp-128 and mlp-256
+produce *identical* confusion matrices (only AUC/threshold differ slightly) — a sign of diminishing
+returns from head capacity rather than mlp-256 genuinely separating the classes better. Even the bare
+linear probe reaches 0.865 F1/0.888 AUC, close behind both MLPs — most of the separating power here
+comes from the frozen CBraMod embeddings themselves, not head capacity, a notably cleaner property
+than the original grins1 investigation's more architecture-sensitive results.
+
+### 16.2 A cross-architecture-consistent misclassification, explained geometrically
+
+All three models missed exactly the same three bipolar subjects (`GRINS2039`, `GRINS2119`,
+`GRINS2254`) and largely agreed on which subjects were most/least confident — strong evidence these
+are genuinely atypical in the shared embedding space, not head-specific noise. Their band-power
+profile (absolute power) showed severely depressed alpha/sigma/beta/n_spindles — below even the
+grins2 control mean for two of the three — while delta and n_slow_waves were mixed/near-typical,
+ruling out a generic broadband-suppression (recording-quality) explanation in favor of a specific,
+selective absence of fast-frequency/spindle activity. Rejection rates for these three (11.4%, 7.2%,
+4.2%) were not uniformly elevated relative to the bipolar group's ~5.7% average, further ruling out a
+clean data-quality account. Section 16.8 confirms this geometrically: projected onto the joint
+discriminant direction, two of the three sit further into control territory than the average control
+subject.
+
+### 16.3 Band-power perturbation: clean per-band signals, and the entanglement they can't escape
+
+Perturbing each of sigma, theta, delta, alpha, and beta individually (total-energy-preserving,
+scale factors 0.5-1.5) produced clean, high-confidence, consistently-signed responses in all three
+models (sigma positive, theta and delta negative, R² typically >0.93, sign agreement 99-100% of
+windows) — as clean as, or cleaner than, anything in Sections 3-4's original sigma investigation.
+
+But a direct question — does increasing sigma via this method change *only* sigma? — exposes a
+problem. `preserve_total_energy` renormalizes the whole window back to its original standard
+deviation after rescaling the target band; it does not redistribute energy from the target band
+specifically, it divides the *entire* signal (target band and everything else) by one global factor.
+Analytically, perturbing band X by scale `k` moves every other band Y's power by exactly
+`ΔY = p_Y · (g(k) − 1)`, where `g(k) = 1/(k²p_X + (1−p_X))` and `p_X`/`p_Y` are baseline power
+fractions — the *same* factor `g(k)` applies to every band other than X, so they all move together,
+proportionally, whether you intend it or not. The size of this forced side effect scales with the
+perturbed band's own power share: negligible for sigma (~6% of total power, ~7% forced shift in
+everything else at scale 1.5) or beta (~1%, ~0.7%), but severe for delta (~76-79%, a ~49% forced
+*reduction* in sigma alone at scale 1.5 — more than three times delta's own net effective change
+after the same renormalization eats most of the intended boost).
+
+### 16.4 An attempted fix, and why it fails: identifiability, and a falsified extrapolation
+
+Given each perturbation experiment's cross-band displacement is *exactly* computable (the formula
+above), the natural next step is to solve a linear system: assume
+`Δprobability = Σ c_band · Δ(band power)`, fixed coefficients, and use five single-band experiments
+to solve for five unknowns. This works arithmetically but fails two independent ways:
+
+- **Identifiability.** Under `preserve_total_energy`, all bands' power fractions always sum to
+  exactly 1, so their *changes* always sum to exactly 0, for every experiment. Shifting every
+  coefficient by the same constant leaves every equation unchanged — the 5×5 system is exactly
+  rank-4 (confirmed: `A @ ones ≈ 0`, condition number ~10^16). Only *differences* between
+  coefficients are anchor-invariant; absolute values require an external anchor (e.g. one band
+  perturbed *without* preserving total energy — beta was chosen for this since it's small enough
+  that skipping preservation barely disturbs overall amplitude, ~0.7% at scale 1.5).
+- **Falsification.** Using that anchor to solve the full system, then testing the result against an
+  independent, never-before-used experiment (`--band broadband`: uniformly scaling the *entire*
+  signal, `perturb_window_uniform_scale()`, added to `p09h` specifically for this check) — the
+  additive model predicted a large positive slope (+6 to +8.6 depending on model); the actual
+  measured broadband slope was **−0.51, wrong sign, off by more than an order of magnitude**, with a
+  far lower fit quality (R²=0.66 vs. >0.93 for every single-band experiment). The model's response to
+  power reallocation has real cross-band structure a simple per-band-additive model cannot capture.
+
+One reassuring result survived this: the anchor's *sign* wasn't contaminated by generic
+off-distribution sensitivity — broadband's effect is negative while beta's own anchor was positive,
+opposite signs, so if anything the true beta effect is understated, not manufactured, by the small
+energy shift its own anchor experiment required.
+
+### 16.5 Why this is structural, not a tooling gap
+
+Confirmed directly in `p02_slice_eeg_dataset.py`: normalization statistics are computed via
+`.mean(axis=-1)`/`.std(axis=-1)` on each channel's own window-length time axis — per-channel,
+per-window Z-scoring, exactly as the original investigation's docstrings state. Every window the
+model has ever been trained or evaluated on has variance fixed to std≈1. Since frequency bands are
+components of a decomposition of that one fixed quantity, moving one band's share *necessarily* means
+something else changes to compensate — there is no way to hold "everything else" fixed while
+respecting the constraint. This holds even at the infinitesimal/gradient level (the identifiability
+gap in 16.4 is a *local* fact, not an artifact of using finite perturbation steps), so switching to a
+different measurement technique (e.g. autograd-based attribution evaluated at the real, unperturbed
+point) does not avoid it — any method that respects total-energy preservation for every measurement
+inherits the same rank deficiency. The only way to break it is to step off the Z-score-respecting
+manifold for at least one measurement, which is exactly what the beta-anchor and broadband
+experiments did — and 16.4 already showed that stepping off-manifold is not free: it trades the
+entanglement confound for a demonstrated, large, non-linear off-distribution one.
+
+**Conclusion: per-band causal disentanglement is unavailable in principle, not just impractical,
+while every measurement must respect the model's own training distribution.** This applies to every
+single-band perturbation claim in this document, including Sections 3-4's original sigma finding
+(see the corrections inserted there) — the *directional* results are real and reproducible, but none
+of them isolate one band's independent contribution from its entangled fellow-travelers.
+
+### 16.6 The multivariate alternative: joint discriminant alignment
+
+Rather than asking "what is band X's isolated effect," ask a differently-posed, answerable question:
+does the direction in feature space that separates real bipolar from real control subjects align with
+the direction the model's own score moves along? Both are fit on real, observed data — no synthetic
+perturbation, so the entanglement problem above does not apply.
+
+Feature choice matters here: per-window Z-scoring erases absolute scale, so the model's actual input
+can only encode *relative* spectral shape, not absolute power in physical units. Absolute power
+(used throughout Sections 14-15 for describing the clinical data itself) remains valid for that
+purpose, but the model-sensitivity side of this comparison uses **relative power** specifically,
+since that is what the model's input can mechanistically represent.
+
+Two directions were fit on 5 relpower bands + `n_slow_waves` (`n_spindles` excluded: r=0.91 with
+sigma, near-duplicate rather than independent information, and its coefficient sign-flips across
+regularization strengths — a direct symptom of that near-redundancy):
+
+- **Data direction**: L2-regularized logistic regression of ground truth on features, fit on the
+  full 134-subject grins2 control+bipolar cohort (not just the 22-subject test set, for statistical
+  power — an unregularized fit on either population produces implausibly extreme coefficients due to
+  severe multicollinearity among the bands, confirming regularization is necessary here, not optional).
+- **Model direction**: Ridge regression of predicted probability on the same features, fit
+  separately per architecture on the 22-subject held-out test set.
+
+Cosine similarity between the two: **linear 0.899, mlp-128 0.925, mlp-256 0.907** — strong,
+consistent alignment across all three independently-trained architectures. Repeating this with
+gradient-boosted trees and SHAP (a genuinely different model class, handling correlated features via
+random split sampling rather than one global linear coefficient) gave **0.81-0.84** — broadly
+confirming the result while correctly tempering one specific claim (see below).
+
+### 16.7 What's robust and what isn't
+
+| feature | marginal correlation | joint/multivariate coefficient | verdict |
+|---|---|---|---|
+| alpha | r=+0.262, p=0.0022 (ground truth); r=+0.70-0.75 (model prob.) | strongly positive, both sides, all methods | **robust** |
+| sigma | r=+0.288, p=0.0008 (ground truth); r=+0.70-0.73 (model prob.) | strongly positive, both sides, all methods | **robust** |
+| theta | r=−0.117, p=0.178 (ground truth, not significant); r=+0.20 to +0.25 (model prob., positive!) | negative, often the largest-magnitude term | **conditional-only — see caveat** |
+| delta | near-zero, sign-unstable across regularization | near-zero, sign-unstable | **not a real finding either way** |
+| beta | small | data: consistently negative; model: consistently positive (both linear and GBM+SHAP) | **genuine, reproducible mismatch** |
+
+Alpha and sigma are straightforward: strong, significant, same-signed in simple correlation and in
+the joint model — the relative ranking between the two isn't itself robust (linear regression favors
+alpha, GBM+SHAP favors sigma), but that either is a real, substantial, positively-associated driver is
+not in question.
+
+Theta requires a caveat that must travel with the claim every time it's made: its negative role is a
+**suppression effect**, visible only after conditioning on alpha (r=+0.51-0.58 with theta) and delta
+(r=+0.54-0.60) in a joint model. Theta's own simple, unconditional relationship with ground truth is
+not statistically significant, and its simple relationship with model probability is *positive*, the
+opposite sign. Reporting "theta is negatively associated with the model's decision" without this
+qualification is actively misleading — it is true only in the specific, conditional,
+after-controlling-for-alpha-and-delta sense established here. (This also reconciles with Sections
+14-15: theta's robust, highly-significant group difference there was measured in *absolute* power —
+plausibly a real effect the model's relative-power-only input cannot directly represent, which would
+explain why its simple relative-power correlation is weak while its absolute-power group difference
+was one of the most robust findings in the whole investigation.)
+
+Delta is not a real finding in either direction — its data-side coefficient crosses zero across
+plausible regularization strengths.
+
+Beta is the one clear, reproducible case of the models learning something that runs opposite to the
+actual clinical difference: small in magnitude, but negative in the data and positive in the model,
+consistently, across every regularization strength tested and across two structurally different
+modeling approaches (regularized linear regression and gradient-boosted-tree SHAP). Worth flagging as
+a genuine, if minor, mismatch for any future work relying on this model's beta sensitivity as a proxy
+for the real clinical signal.
+
+### 16.8 Geometric confirmation
+
+Projecting all 22 test subjects onto the (134-subject-derived) data direction confirms the mental
+picture directly: bipolar group mean projection +0.271, control group mean −0.471, and the three
+consistently-missed bipolar subjects from 16.2 project at −1.259, −0.998, and −0.288 — two of three
+land *past* the average control subject, not just short of the bipolar mean. These are not arbitrary
+model errors; these subjects' own joint spectral profile genuinely resembles the control group's
+typical region along the specific axis that governs both the real clinical distinction and the
+model's own decision.
+
+The same geometry reframes perturbation usefully, without rehabilitating the disentangling attempt:
+a total-energy-preserving perturbation moves a subject's feature vector along a specific,
+exactly-computable displacement in this same space — a "virtual subject" with no ground truth.
+Dot-producting the sigma perturbation's displacement (scale=1.5) against each model's `w_model`
+predicts the *same sign* as the actually-measured sigma perturbation slope in all three models,
+though not the same magnitude (the two measure different things: one is variation across real
+subjects' natural differences, the other a synthetic single-subject manipulation). This is a
+within-regime check (k=1.5, inside the originally-tested range) — it does not rehabilitate the
+linear-additive framing for the extreme, out-of-regime broadband case already falsified in 16.4.
 
 ---
 
