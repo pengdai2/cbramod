@@ -56,6 +56,7 @@ from cbramod_common import (
     add_log_filename_argument,
     build_e2e_classifier,
     perturb_window_band_power,
+    perturb_window_uniform_scale,
     seed_everything,
     setup_inference_cli_parser,
     setup_perturbation_cli_parser,
@@ -130,7 +131,16 @@ def main():
             "embeddings) has no raw signal left to filter."
         )
 
-    low, high = BAND_DEFS[args.band]
+    is_broadband = (args.band == "broadband")
+    if is_broadband and args.preserve_total_energy:
+        raise ValueError(
+            "--band broadband requires --no-preserve-total-energy: renormalizing a uniformly-scaled "
+            "signal back to its original std is an exact no-op (it just divides back out the scale "
+            "factor you applied), which would silently defeat this test's entire purpose -- measuring "
+            "the model's sensitivity to pure overall energy, which only exists if the energy is "
+            "actually allowed to change. See perturb_window_uniform_scale()'s docstring."
+        )
+    low, high = (0.5, 30.0) if is_broadband else BAND_DEFS[args.band]
     scale_factors = np.array([float(s) for s in args.scale_factors.split(",")])
     if 1.0 not in scale_factors:
         print("  [Warning] --scale-factors doesn't include 1.0 (the unperturbed original) -- "
@@ -158,7 +168,11 @@ def main():
         filter_subject=subject_filter, memory_map=True
     )
     print(f"Loaded raw EEG recording dataset for {len(dataset)} subjects.")
-    print(f"Perturbing band: {args.band} ({low}-{high} Hz). Scale factors: {scale_factors.tolist()}")
+    if is_broadband:
+        print(f"Perturbing: broadband (uniform whole-signal scaling, no filtering). "
+              f"Scale factors: {scale_factors.tolist()}")
+    else:
+        print(f"Perturbing band: {args.band} ({low}-{high} Hz). Scale factors: {scale_factors.tolist()}")
 
     all_rows: List[Dict] = []
     for idx in tqdm(range(len(dataset)), desc="Process Subjects"):
@@ -176,10 +190,17 @@ def main():
 
         # This subject's own baseline band-power level (mean across ALL their windows), for the
         # between-subject check -- computed once per subject, independent of which windows get perturbed.
-        subject_band_powers = np.array([
-            compute_relative_band_power(raw_np[i].mean(axis=0), args.sfreq, low, high)
-            for i in range(num_windows)
-        ])
+        # For broadband, "band power" isn't a meaningful concept (relpower over the full 0.5-30Hz
+        # range is trivially ~1.0 for every window) -- the analogous baseline-dependence question is
+        # instead "how loud was this window overall", so we use each window's own std (the same
+        # quantity perturb_window_band_power's preserve_total_energy renormalizes against elsewhere).
+        if is_broadband:
+            subject_band_powers = np.array([raw_np[i].mean(axis=0).std() for i in range(num_windows)])
+        else:
+            subject_band_powers = np.array([
+                compute_relative_band_power(raw_np[i].mean(axis=0), args.sfreq, low, high)
+                for i in range(num_windows)
+            ])
         subject_mean_band_power = float(subject_band_powers.mean())
 
         window_order = np.arange(num_windows)
@@ -188,13 +209,16 @@ def main():
 
         for f_idx in window_order:
             window = raw_np[f_idx]  # [C, T]
-            perturbed_batch = np.stack([
-                perturb_window_band_power(
-                    window, args.sfreq, low, high, s, order=args.filter_order,
-                    preserve_total_energy=args.preserve_total_energy
-                )
-                for s in scale_factors
-            ])
+            if is_broadband:
+                perturbed_batch = np.stack([perturb_window_uniform_scale(window, s) for s in scale_factors])
+            else:
+                perturbed_batch = np.stack([
+                    perturb_window_band_power(
+                        window, args.sfreq, low, high, s, order=args.filter_order,
+                        preserve_total_energy=args.preserve_total_energy
+                    )
+                    for s in scale_factors
+                ])
             with torch.no_grad():
                 logits = model(torch.from_numpy(perturbed_batch).to(device))
                 probs = torch.softmax(logits, dim=1)[:, 1].cpu().numpy()

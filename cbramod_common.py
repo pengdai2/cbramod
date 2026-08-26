@@ -990,6 +990,23 @@ def perturb_window_band_power(
     return new_sig.astype(window_CT.dtype)
 
 
+def perturb_window_uniform_scale(window_CT: np.ndarray, scale_factor: float) -> np.ndarray:
+    """
+    Scales the ENTIRE window (every band, uniformly) by `scale_factor` -- no bandpass filtering,
+    no band-vs-residual split. This is the control experiment for the band-power perturbation
+    tests above: it isolates the model's sensitivity to pure overall signal energy, independent
+    of spectral SHAPE, which none of the per-band tests can measure on their own.
+
+    There's no `preserve_total_energy` option here, deliberately -- renormalizing a uniformly
+    scaled signal back to its original std is an exact no-op (dividing out exactly the scale
+    factor you just applied), which would defeat the entire point of this test. Testing pure
+    energy sensitivity REQUIRES letting the overall amplitude actually move; p09h enforces this
+    by requiring --no-preserve-total-energy whenever --band broadband is selected, rather than
+    silently ignoring that flag.
+    """
+    return (window_CT * scale_factor).astype(window_CT.dtype)
+
+
 def rank_leave_one_out_contributions(
     window_probs: np.ndarray,
     method: str = "p85_score",
@@ -1268,8 +1285,11 @@ def setup_perturbation_cli_parser(
     dose-response sweep) is intentionally NOT included here -- add it separately where needed."""
     group = parser.add_argument_group("Perturbation Test")
     group.add_argument(
-        "--band", type=str, default="sigma", choices=list(BAND_DEFS.keys()),
-        help="Which frequency band to perturb."
+        "--band", type=str, default="sigma", choices=list(BAND_DEFS.keys()) + ["broadband"],
+        help="Which frequency band to perturb. 'broadband' is not a real band -- it uniformly scales "
+             "the whole signal (see perturb_window_uniform_scale()) as a control for pure overall-"
+             "energy sensitivity, independent of any band's spectral shape; requires "
+             "--no-preserve-total-energy (see that flag's help)."
     )
     group.add_argument(
         "--scale-factors", type=str, default="0.5,0.75,1.0,1.25,1.5",
