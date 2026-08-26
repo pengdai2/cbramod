@@ -1563,8 +1563,43 @@ space — a "virtual subject" with no ground truth. If the multivariate framewor
 internally coherent, the direction this virtual subject moves relative to the real bipolar/control
 groups ought to agree with the direction the model's actual, measured probability moves. Checking
 this rigorously — and correcting several wrong turns along the way — is the subject of 16.9-16.11.
+16.9 first establishes a prerequisite the other two depend on; 16.10-16.11 then ask the geometric
+question itself.
 
-### 16.9 Extending the check to all five bands: a real disagreement, and two wrong explanations
+### 16.9 Prerequisite: is the subject-level causal effect itself well-defined?
+
+The question this whole line of investigation is trying to answer is stated at the subject level on
+*both* sides — the model's actual decision is a subject-level, P85-pooled probability, and the
+"virtual subject" displacement below is also a subject-level quantity (a perturbed version of a
+subject's mean composition across all their real windows, moved as one point). But perturbation is
+only directly measurable at the window level: `p09h` perturbs one window at a time and fits a slope
+per window, because that is the unit the perturbation is literally applied to and re-scored at.
+Treating a window-level slope as a stand-in for the subject-level causal effect we actually care
+about is therefore an inferential step, not a given — and it would be unjustified if pooling could
+distort or dilute the window-level signal on its way to the subject-level score, the same kind of
+aggregation gap that caused real problems elsewhere in this investigation (compositional
+entanglement, the additive-coefficient failure in 16.4). This section checks that step directly
+rather than assuming it, before 16.10-16.11 build on it.
+
+The check: for each subject, apply their own measured per-window slope to their own baseline
+probability at the tested scale factor, then pool via the model's actual decision rule (the 85th
+percentile across windows, matching `p85_score`) to get a genuine subject-level prediction — no
+`w_model`, no linear surrogate, no additive assumption anywhere in the calculation.
+
+Result: **100% of subjects, all five bands, all three architectures, agree in sign with no
+exceptions** — delta and theta uniformly negative, alpha/sigma/beta uniformly positive, subject by
+subject. The window-level effect propagates through P85 pooling to the subject level faithfully,
+with no sign flips or dilution anywhere — the same kind of "does pooling preserve or destroy the
+effect" check as the propagation-ratio analysis in Sections 3-4 (there: 95% consistency for sigma on
+model[0]/grins1), now re-run for the new grins2-only models across all five bands, with an even
+cleaner result. This licenses treating the window-level measurement as a faithful stand-in for the
+subject-level causal quantity 16.10-16.11 actually need — not by assumption, but because the
+propagation step was checked and holds. It also means the real, measured, subject-level causal
+effect was never ambiguous: any disagreement found below (16.10) belongs entirely to whichever
+approximation tool was used to relate that effect to feature-space geometry, never to the underlying
+phenomenon itself.
+
+### 16.10 Extending the check to all five bands: a real disagreement, and two wrong explanations
 
 Dot-producting each band's perturbation displacement (scale=1.5) against `w_model` (the same
 per-feature coefficients from 16.6) gives the *same sign* as the actually-measured slope for theta,
@@ -1593,31 +1628,6 @@ recovers the confounded, not the causal, direction. This is not a new problem �
 suppression effect, independently confirmed a second way, now visible even without going through
 `w_model` at all.
 
-### 16.10 The subject-level causal counterfactual: the real effect has no ambiguity anywhere
-
-This section answers a different, prerequisite question from 16.9 and 16.11. 16.9 and 16.11 both
-ask *does feature-space displacement direction agree with the probability-change direction*, i.e.
-a question about geometry — comparing a perturbed point's position to other subjects or group
-centroids. 16.10 asks something that has to be settled first: *is the real, subject-level causal
-effect itself even well-defined and consistent* — with no reference to geometry, other subjects,
-or any fitted model at all. If the answer here had been "no, some subjects' pooled effect flips
-sign depending on which windows dominate," then 16.9 and 16.11 would be trying to align feature-space
-geometry with a moving target. The clean 100% result below is what makes it meaningful to ask, as
-16.9 and 16.11 do, whether *anything* geometric predicts that effect's direction.
-
-Both explanations above concerned *approximations* to the real causal effect (a linear coefficient
-sum; a raw-but-still-observational projection). The real effect can be checked directly: for each
-subject, apply their own measured per-window slope to their own baseline probability at the tested
-scale factor, then pool via the model's actual decision rule (the 85th percentile across windows,
-matching `p85_score`) to get a genuine subject-level prediction — no `w_model`, no linear surrogate,
-no additive assumption anywhere in the calculation.
-
-Result: **100% of subjects, all five bands, all three architectures, agree in sign with no
-exceptions** — delta and theta uniformly negative, alpha/sigma/beta uniformly positive, subject by
-subject. The real, measured, subject-level causal effect was never ambiguous. Every disagreement
-found in 16.9 belonged entirely to a specific approximation tool (the additive coefficient sum for
-delta; the confounded marginal projection for theta) — never to the underlying phenomenon.
-
 ### 16.11 The question actually worth asking, verified rigorously
 
 Stripped of both approximations, the real question is: does the virtual subject's displacement move
@@ -1641,7 +1651,7 @@ This was verified end to end rather than assumed correct:
 5. **Robustness.** Held at a second perturbation size (k=1.25). Removing the per-feature std-normalization broke theta specifically — diagnosed as delta's raw scale (~0.8) swamping the Euclidean distance relative to theta's (~0.09), a known artifact of skipping normalization, not a new finding, which if anything increases confidence in the normalized version.
 
 One remaining honest caveat: agreement holds at the *average* level across the cohort, not with the
-same 100% per-subject consistency as the direct causal measurement in 16.10 (e.g. only 32% of
+same 100% per-subject consistency as the direct causal measurement in 16.9 (e.g. only 32% of
 subjects individually move closer to bipolar than control for delta, even though the average
 direction is correct). The centroid-distance metric is a real, validated, but noisier instrument at
 the individual level than directly measuring the model's own output.
@@ -1676,7 +1686,7 @@ heart disease" — a true, useful statement about people who already exist, not 
 constructing someone with that exact isolated combination of traits. It is the right tool for
 Section 16.6-16.7's question (does the model track the same real distinction that separates real
 patients from real controls) and the wrong tool for predicting a mechanistic, within-recording
-perturbation's effect, which is what 16.9's delta failure demonstrated directly. `w_centroid` is the
+perturbation's effect, which is what 16.10's delta failure demonstrated directly. `w_centroid` is the
 reverse: it never assumes any feature is held fixed, so it stays coherent for a perturbed point
 exactly as well as a real one — which is why it, not `w_model`, is the right instrument for the
 virtual-subject check in 16.11.

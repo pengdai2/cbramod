@@ -4,7 +4,9 @@ p28_verify_perturbation_hyperplane_alignment.py
 Verifies whether a band-power perturbation's feature-space displacement moves a subject's "virtual"
 position toward the side of real bipolar/control space consistent with the model's own, actually
 measured probability change -- the methodology worked out (through several wrong turns, recorded in
-docs/sigma_band_causal_investigation.md Section 16.9-16.12) for checking this rigorously rather than
+docs/sigma_band_causal_investigation.md Section 16.9-16.12; see 16.9 for the window-to-subject
+propagation prerequisite, 16.10 for why a naive dot-product against w_model fails on delta) for
+checking this rigorously rather than
 asserting it.
 
 WHY NOT JUST DOT-PRODUCT THE DISPLACEMENT AGAINST A FITTED LOGISTIC/RIDGE MODEL (`w_model`)?
@@ -189,7 +191,7 @@ def main():
             "actual_slope": actual_slope, "agree": agree,
         })
         print(f"  {band:6s}: mean_shift={shifts.mean():+.4f}  frac_toward_bipolar={float((shifts>0).mean()):.2f}  "
-              f"actual_slope={actual_slope:+.4f}  {'AGREE' if agree else 'DISAGREE -- see Section 16.9 before trusting w_model here'}")
+              f"actual_slope={actual_slope:+.4f}  {'AGREE' if agree else 'DISAGREE -- see Section 16.10 before trusting w_model here'}")
 
     results_df = pd.DataFrame(results)
     if args.output_csv:
