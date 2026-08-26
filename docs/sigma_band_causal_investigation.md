@@ -1650,11 +1650,19 @@ This was verified end to end rather than assumed correct:
 4. **Full five-band result**, using each subject's own baseline composition (not a cohort average) and the corrected, non-circular centroids: delta, theta, alpha, sigma, and beta **all agree in the direction of the average shift** with the real measured slope, replicated identically across linear, mlp-128, and mlp-256.
 5. **Robustness.** Held at a second perturbation size (k=1.25). Removing the per-feature std-normalization broke theta specifically — diagnosed as delta's raw scale (~0.8) swamping the Euclidean distance relative to theta's (~0.09), a known artifact of skipping normalization, not a new finding, which if anything increases confidence in the normalized version.
 
-One remaining honest caveat: agreement holds at the *average* level across the cohort, not with the
-same 100% per-subject consistency as the direct causal measurement in 16.9 (e.g. only 32% of
-subjects individually move closer to bipolar than control for delta, even though the average
-direction is correct). The centroid-distance metric is a real, validated, but noisier instrument at
-the individual level than directly measuring the model's own output.
+One remaining honest caveat, stated precisely: this is not two answers to the same question being
+compared against each other — 16.9 and 16.11 ask different things, and 16.11's agreement figures
+above are not computed by checking against 16.9's number. Rather, 16.9 establishes what the cleanest
+possible individual-consistency result looks like when the real effect is measured directly (real
+per-subject slope, real P85 pooling, no proxy of any kind): 100%, no exceptions. 16.11 asks a
+structurally similar question — what fraction of individual subjects show a correctly-directed
+signal — but using a geometric proxy (centroid-distance) instead of the real slope, checked against
+the same population-level reference direction. That fraction is far lower (e.g. only 32% of subjects
+individually move closer to bipolar than control for delta), even though the *cohort-average*
+direction is correct. Since 16.9 already rules out the real phenomenon itself being the source of
+that noise, the gap must be in `disc(x)` as an individual-level predictor — it is a real, validated,
+but structurally noisier instrument at the subject level than directly measuring the model's own
+output, consistent with it being a marginal (not conditional/causal) construct (16.12).
 
 ### 16.12 Two hyperplanes, not one: what each can and cannot answer
 
